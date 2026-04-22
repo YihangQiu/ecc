@@ -4,4 +4,4 @@
 	url = https://github.com/openecos-projects/ecc-tools.git
 [submodule "chipcompiler/thirdparty/ecc-dreamplace"]
 	path = chipcompiler/thirdparty/ecc-dreamplace
-	url = https://github.com/openecos-projects/ecc-dreamplace.git
+	url = https://github.com/YihangQiu/ecc-dreamplace.git
