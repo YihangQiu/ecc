@@ -27,7 +27,7 @@ python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.11")
 use_repo(python, "python_3_11")
 
-uv_export = use_repo_rule("@ecos-bazel//rules:uv_export.bzl", "uv_export")
+uv_export = use_repo_rule("//bazel:uv_export.bzl", "uv_export")
 uv_export(
     name = "uv_requirements",
     uv_lock = "//:uv.lock",

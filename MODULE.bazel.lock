@@ -321,8 +321,8 @@
     },
     "@@ecc-dreamplace+//bazel:pkg_config.bzl%pkg_config": {
       "general": {
-        "bzlTransitiveDigest": "+o3CK4RUhO1SdBQfANsq+5fwAL3SIoDoB1rxinpQ4dQ=",
-        "usagesDigest": "5IhqWTEkfVT3uNjCF0smTptjmt9c+1PPDSqRZnVbask=",
+        "bzlTransitiveDigest": "q+Lh4cUA2ALls8PpOVC4jm5BRyA89tYBMt9caemJ7Ic=",
+        "usagesDigest": "vtFumn3zz3TNtXk5/q0szNLUqmC1G3ndOIKXrsmAehE=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
