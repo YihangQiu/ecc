@@ -19,7 +19,12 @@ def _write_csv(path: Path, rows: list[list[object]]) -> None:
         writer.writerows(rows)
 
 
-def _make_workspace(tmp_path: Path, *, include_route_maps: bool = True) -> Path:
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, include_route_maps: bool = True) -> Path:
     ws = tmp_path / "sample-ws"
     _write_json(
         ws / "home" / "flow.json",
@@ -96,6 +101,69 @@ def _make_workspace(tmp_path: Path, *, include_route_maps: bool = True) -> Path:
                 }
             },
         )
+    if include_route_artifacts:
+        _write_text(
+            ws / "route_ecc" / "output" / "gcd_route.def",
+            """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+TRACKS Y 50 DO 1 STEP 100 LAYER MET2 ;
+TRACKS X 50 DO 1 STEP 100 LAYER MET3 ;
+GCELLGRID X 0 DO 3 STEP 100 ;
+GCELLGRID Y 0 DO 3 STEP 100 ;
+VIAS 1 ;
+- VIA23 + LAYERS MET2 VIA2 MET3 ;
+END VIAS
+COMPONENTS 1 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( U1 A ) ( PIN OUT )
+  + ROUTED MET2 ( 0 50 ) ( 200 * )
+    NEW MET2 ( 0 60 ) ( 200 * )
+    NEW MET3 ( 50 0 ) ( * 200 )
+    NEW MET3 ( 60 0 ) ( * 200 )
+    NEW MET3 ( 60 60 ) VIA23
+  ;
+- n2 ( U1 B ) ( U1 Y ) ;
+END NETS
+END DESIGN
+""".strip()
+            + "\n",
+        )
+        _write_text(
+            ws / "route_ecc" / "data" / "rt" / "rt.log",
+            """
+[RT Info printDatabase]     idx:0 order:9 name:MET2 prefer_direction:horizontal
+[RT Info printDatabase]     idx:1 order:11 name:MET3 prefer_direction:vertical
+[RT Info printTableList] |      total_demand |       8 |
+[RT Info printTableList] |    total_overflow |       4 |
+[RT Info printTableList] | total_wire_length |   800.0 |
+[RT Info printTableList] | routing | demand | prop | | routing | overflow | prop | | routing | wire_length | prop | | cut | #via | prop |
+[RT Info printTableList] | MET2 | 4 | 50.00% | | MET2 | 2 | 50.00% | | MET2 | 400.0 | 50.00% | | VIA2 | 1 | 100.00% |
+[RT Info printTableList] | MET3 | 4 | 50.00% | | MET3 | 2 | 50.00% | | MET3 | 400.0 | 50.00% | | Total | 1 | 100.00% |
+[RT Info printTableList] | Total | 8 | 100.00% | | Total | 4 | 100.00% | | Total | 800.0 | 100.00% | | Total | 1 | 100.00% |
+""".strip()
+            + "\n",
+        )
+        _write_json(
+            ws / "route_ecc" / "data" / "sta" / "gcd.rpt.json",
+            {
+                "summary": [{"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "max", "path_delay": "1.0", "path_required": "2.0", "slack": "1.0"}],
+                "slack": [{"clock": "clk", "delay_type": "max", "TNS": "0.0", "WNS": "1.0"}],
+            },
+        )
+        _write_json(
+            ws / "route_ecc" / "data" / "sta" / "wire_paths" / "wire_path_1.json",
+            [{"node_0": {"Point": "U1/A", "Capacitance": 0.1, "slew": 0.2}}],
+        )
     return ws
 
 
@@ -116,6 +184,14 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "views/agent/run_summary.json",
         "labels/route_patch_overflow.jsonl",
         "vectors/instances/place-00000.jsonl",
+        "vectors/tech/layers.json",
+        "vectors/tech/cells.json",
+        "vectors/tech/vias.json",
+        "vectors/nets/route-00000.jsonl",
+        "vectors/pins/route-00000.jsonl",
+        "vectors/wires/route-00000.jsonl",
+        "vectors/routing_graphs/route-00000.jsonl",
+        "vectors/timing_paths/route-00000.jsonl",
         "vectors/patches/place-00000.jsonl",
         "maps/canonical/place/density.json",
         "maps/canonical/route/egr_overflow.json",
@@ -136,16 +212,33 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert any(item["is_macro"] for item in instances)
 
     labels = [json.loads(line) for line in (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text().splitlines()]
+    assert {item["source"] for item in labels} == {"route_true_overflow"}
     assert labels[0]["horizontal_overflow"] == 1.0
-    assert labels[1]["vertical_overflow"] == 4.0
+    assert labels[0]["vertical_overflow"] == 1.0
+
+    nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route-00000.jsonl").read_text().splitlines()]
+    pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route-00000.jsonl").read_text().splitlines()]
+    wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route-00000.jsonl").read_text().splitlines()]
+    timing_paths = [json.loads(line) for line in (foundation_dir / "vectors" / "timing_paths" / "route-00000.jsonl").read_text().splitlines()]
+    assert nets[0]["name"] == "n1"
+    assert any(pin["pin_name"] == "OUT" for pin in pins)
+    assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
+    assert timing_paths and timing_paths[0]["slack"] == 1.0
+
+    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
+    assert patches[0]["net_count"] >= 1
+    assert patches[0]["wire_length_by_layer"]["MET2"] > 0
+    assert patches[0]["route_true_overflow"]["union"] == 1.0
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert quality["profile"] == "iccd_full_v1"
     assert quality["availability"]["instances"]["place"] == "available"
+    assert quality["availability"]["labels"]["route_patch_overflow"] == "available"
+    assert "null_reason" in quality
 
 
-def test_iccd_full_v1_marks_labels_missing_without_route_maps(tmp_path: Path):
-    ws = _make_workspace(tmp_path, include_route_maps=False)
+def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path: Path):
+    ws = _make_workspace(tmp_path, include_route_artifacts=False, include_route_maps=True)
 
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
@@ -159,6 +252,7 @@ def test_iccd_full_v1_marks_labels_missing_without_route_maps(tmp_path: Path):
     assert candidate["available"] is False
     assert candidate["score"] is None
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
+    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_true_route_artifacts"
     assert summary["labels"]["route_patch_overflow_count"] == 0
 
 
