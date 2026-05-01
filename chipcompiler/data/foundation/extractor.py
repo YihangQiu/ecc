@@ -11,6 +11,7 @@ from .grid.canonical_grid import build_patch_grid, resize_nearest
 from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.def_parser import DefData, DefWire, parse_def
 from .parsers.map_csv import read_numeric_csv, shape
+from .parsers.route_overflow import parse_route_overflow_artifacts
 from .parsers.rt_log import parse_rt_log
 from .parsers.sta_parser import parse_sta_artifacts
 from .schema import ExtractionResult
@@ -66,8 +67,10 @@ class FoundationExtractor:
         die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox)
         canonical_maps = self._write_maps(raw_maps, canonical_grid)
-        route_labels = self._route_true_overflow_labels(canonical_grid, def_data.get("route"), rt_logs.get("route"))
-        labels = self._write_labels(canonical_grid, route_labels, rt_logs.get("route"))
+        route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
+        native_route_overflow = parse_route_overflow_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
+        reconstructed_congestion = self._route_reconstructed_congestion(canonical_grid, def_data.get("route"), rt_logs.get("route"))
+        labels = self._write_labels(canonical_grid, native_route_overflow.get("labels", []), reconstructed_congestion, rt_logs.get("route"))
         self._write_tech(def_data, rt_logs)
         entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
@@ -340,6 +343,9 @@ class FoundationExtractor:
         route_labels_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_patch_overflow_records", [])
         }
+        reconstructed_by_patch = {
+            item["patch_id"]: item for item in labels.get("_route_reconstructed_congestion_records", [])
+        }
         for stage in stages:
             instances = self._parse_instances(stage)
             parsed_def = def_data.get(stage.name)
@@ -368,6 +374,7 @@ class FoundationExtractor:
                 pins,
                 wires,
                 route_labels_by_patch if stage.name == "route" else {},
+                reconstructed_by_patch if stage.name == "route" else {},
                 timing_paths,
                 drc_reports.get(stage.name),
             )
@@ -589,6 +596,7 @@ class FoundationExtractor:
         pins: list[dict[str, Any]],
         wires: list[dict[str, Any]],
         route_labels_by_patch: dict[int, dict[str, Any]],
+        reconstructed_by_patch: dict[int, dict[str, Any]],
         timing_paths: list[dict[str, Any]],
         drc_report: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
@@ -609,6 +617,7 @@ class FoundationExtractor:
                 layer = str(wire.get("layer"))
                 wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
             label = route_labels_by_patch.get(int(patch["patch_id"]), {})
+            reconstructed = reconstructed_by_patch.get(int(patch["patch_id"]), {})
             patch_drc = _drc_for_patch(drc_report, bbox)
             record = {
                 "patch_id": patch["patch_id"],
@@ -627,6 +636,12 @@ class FoundationExtractor:
                     "vertical": label.get("vertical_overflow"),
                     "union": label.get("union_overflow"),
                     "by_layer": label.get("by_layer", {}),
+                },
+                "route_reconstructed_congestion": {
+                    "horizontal": reconstructed.get("horizontal_overflow"),
+                    "vertical": reconstructed.get("vertical_overflow"),
+                    "union": reconstructed.get("union_overflow"),
+                    "by_layer": reconstructed.get("by_layer", {}),
                 },
                 "drc": patch_drc,
                 "timing": _timing_for_patch(timing_paths),
@@ -647,9 +662,16 @@ class FoundationExtractor:
             records.append(record)
         return records
 
-    def _write_labels(self, canonical_grid: dict, route_labels: list[dict[str, Any]], rt_log: dict[str, Any] | None) -> dict[str, Any]:
+    def _write_labels(self, canonical_grid: dict, route_labels: list[dict[str, Any]], reconstructed_congestion: list[dict[str, Any]], rt_log: dict[str, Any] | None) -> dict[str, Any]:
         rows = int(canonical_grid["rows"])
         cols = int(canonical_grid["cols"])
+        write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_congestion.jsonl", reconstructed_congestion)
+        self._mark(
+            "labels",
+            "route_reconstructed_congestion",
+            "available" if reconstructed_congestion else "missing",
+            "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
+        )
         if not route_labels:
             write_jsonl(self.foundation_dir / "labels" / "route_patch_overflow.jsonl", [])
             for percent in (5, 10, 20):
@@ -662,9 +684,15 @@ class FoundationExtractor:
                 "score": None,
             }
             write_json(self.foundation_dir / "labels" / "candidate_qor_summary.json", candidate_summary)
-            self._mark("labels", "route_patch_overflow", "missing", "missing_true_route_artifacts")
-            self._quality.setdefault("warnings", []).append("true route artifacts missing/incomplete; route labels were not generated")
-            return {"route_patch_overflow_count": 0, "candidate_qor_summary": candidate_summary, "_route_patch_overflow_records": []}
+            self._mark("labels", "route_patch_overflow", "missing", "missing_router_native_route_overflow_artifact")
+            self._quality.setdefault("warnings", []).append("router-native route overflow artifact missing/incomplete; true route labels were not generated")
+            return {
+                "route_patch_overflow_count": 0,
+                "route_reconstructed_congestion_count": len(reconstructed_congestion),
+                "candidate_qor_summary": candidate_summary,
+                "_route_patch_overflow_records": [],
+                "_route_reconstructed_congestion_records": reconstructed_congestion,
+            }
 
         write_jsonl(self.foundation_dir / "labels" / "route_patch_overflow.jsonl", route_labels)
         for percent in (5, 10, 20):
@@ -674,7 +702,7 @@ class FoundationExtractor:
         candidate_summary = {
             "available": True,
             "score_kind": "route_true_overflow_plus_guardrails",
-            "source": "route_true_artifacts",
+            "source": "router_native_overflow",
             "top_average": top_average,
             "patch_count": rows * cols,
             "route_totals": totals,
@@ -682,9 +710,15 @@ class FoundationExtractor:
         candidate_summary["score"] = float(top_average.get("horizontal") or 0.0) + float(top_average.get("vertical") or 0.0) + float(totals.get("total_overflow") or 0.0)
         write_json(self.foundation_dir / "labels" / "candidate_qor_summary.json", candidate_summary)
         self._mark("labels", "route_patch_overflow", "available")
-        return {"route_patch_overflow_count": len(route_labels), "candidate_qor_summary": candidate_summary, "_route_patch_overflow_records": route_labels}
+        return {
+            "route_patch_overflow_count": len(route_labels),
+            "route_reconstructed_congestion_count": len(reconstructed_congestion),
+            "candidate_qor_summary": candidate_summary,
+            "_route_patch_overflow_records": route_labels,
+            "_route_reconstructed_congestion_records": reconstructed_congestion,
+        }
 
-    def _route_true_overflow_labels(self, canonical_grid: dict, parsed_def: DefData | None, rt_log: dict[str, Any] | None) -> list[dict[str, Any]]:
+    def _route_reconstructed_congestion(self, canonical_grid: dict, parsed_def: DefData | None, rt_log: dict[str, Any] | None) -> list[dict[str, Any]]:
         if not parsed_def or not rt_log or "total_overflow" not in rt_log.get("totals", {}):
             return []
         routed_wires = [wire for net in parsed_def.nets for wire in net.wires if wire.length > 0]
@@ -737,7 +771,7 @@ class FoundationExtractor:
                     "vertical_overflow": v,
                     "union_overflow": max(h, v),
                     "by_layer": by_layer_overflow,
-                    "source": "route_true_overflow",
+                    "source": "routed_def_tracks_reconstruction",
                     "source_artifacts": {
                         "def": str(parsed_def.path.relative_to(self.workspace_dir)),
                         "rt_log": str(Path(rt_log["source"]).relative_to(self.workspace_dir)) if Path(rt_log["source"]).is_relative_to(self.workspace_dir) else rt_log["source"],

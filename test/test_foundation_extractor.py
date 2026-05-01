@@ -24,7 +24,7 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, include_route_maps: bool = True) -> Path:
+def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, include_route_maps: bool = True, include_native_route_overflow: bool = True) -> Path:
     ws = tmp_path / "sample-ws"
     _write_json(
         ws / "home" / "flow.json",
@@ -155,6 +155,33 @@ END DESIGN
 """.strip()
             + "\n",
         )
+        if include_native_route_overflow:
+            _write_json(
+                ws / "route_ecc" / "data" / "rt" / "patch_overflow.json",
+                {
+                    "source": "router_native_overflow",
+                    "patches": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "layer": "MET2",
+                            "direction": "horizontal",
+                            "capacity": 1,
+                            "demand": 3,
+                            "overflow": 2,
+                        },
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "layer": "MET3",
+                            "direction": "vertical",
+                            "capacity": 1,
+                            "demand": 4,
+                            "overflow": 3,
+                        },
+                    ],
+                },
+            )
         _write_json(
             ws / "route_ecc" / "data" / "sta" / "gcd.rpt.json",
             {
@@ -237,9 +264,9 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert any(item["is_macro"] for item in instances)
 
     labels = [json.loads(line) for line in (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text().splitlines()]
-    assert {item["source"] for item in labels} == {"route_true_overflow"}
-    assert labels[0]["horizontal_overflow"] == 1.0
-    assert labels[0]["vertical_overflow"] == 1.0
+    assert {item["source"] for item in labels} == {"router_native_overflow"}
+    assert labels[0]["horizontal_overflow"] == 2.0
+    assert labels[0]["vertical_overflow"] == 3.0
 
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route-00000.jsonl").read_text().splitlines()]
     pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route-00000.jsonl").read_text().splitlines()]
@@ -257,7 +284,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
     assert patches[0]["net_count"] >= 1
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
-    assert patches[0]["route_true_overflow"]["union"] == 1.0
+    assert patches[0]["route_true_overflow"]["union"] == 3.0
+    assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
     assert patches[0]["timing"]["worst_slack"] == 1.0
     assert patches[0]["electrical"]["capacitance_sum"] == 0.5
     assert patches[0]["electrical"]["max_slew"] == 0.6
@@ -291,8 +319,37 @@ def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path
     assert candidate["available"] is False
     assert candidate["score"] is None
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
-    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_true_route_artifacts"
+    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
     assert summary["labels"]["route_patch_overflow_count"] == 0
+
+
+def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(tmp_path: Path):
+    ws = _make_workspace(tmp_path, include_native_route_overflow=False)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    true_labels = (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text(encoding="utf-8")
+    reconstructed = [
+        json.loads(line)
+        for line in (foundation_dir / "labels" / "route_reconstructed_congestion.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    candidate = json.loads((foundation_dir / "labels" / "candidate_qor_summary.json").read_text(encoding="utf-8"))
+    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
+
+    assert true_labels == ""
+    assert reconstructed
+    assert {item["source"] for item in reconstructed} == {"routed_def_tracks_reconstruction"}
+    assert reconstructed[0]["horizontal_overflow"] == 1.0
+    assert reconstructed[0]["vertical_overflow"] == 1.0
+    assert patches[0]["route_true_overflow"]["union"] is None
+    assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
+    assert candidate["available"] is False
+    assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
+    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
+    assert quality["availability"]["labels"]["route_reconstructed_congestion"] == "available"
 
 
 def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
@@ -329,7 +386,7 @@ def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
     assert evidence["raw_refs"] is None
     assert evidence["raw_refs_disabled"] is True
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
-    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_true_route_artifacts"
+    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
 
 
 def test_iccd_full_v1_rejects_unknown_stage_filter(tmp_path: Path):
