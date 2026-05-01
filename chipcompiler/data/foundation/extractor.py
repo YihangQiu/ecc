@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .grid.canonical_grid import build_patch_grid, resize_nearest
+from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.def_parser import DefData, DefWire, parse_def
 from .parsers.map_csv import read_numeric_csv, shape
 from .parsers.rt_log import parse_rt_log
+from .parsers.sta_parser import parse_sta_artifacts
 from .schema import ExtractionResult
 from .writers import write_json, write_jsonl
 
@@ -57,6 +59,8 @@ class FoundationExtractor:
         stages = self._stage_infos(flow)
         def_data = self._collect_def_data(stages)
         rt_logs = self._collect_rt_logs(stages)
+        sta_reports = self._collect_sta_reports(stages)
+        drc_reports = self._collect_drc_reports(stages)
         raw_maps = self._collect_raw_maps(stages)
         die_bbox = self._discover_die_bbox(stages) or self._discover_def_die_bbox(def_data)
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox)
@@ -64,7 +68,7 @@ class FoundationExtractor:
         route_labels = self._route_true_overflow_labels(canonical_grid, def_data.get("route"), rt_logs.get("route"))
         labels = self._write_labels(canonical_grid, route_labels, rt_logs.get("route"))
         self._write_tech(def_data, rt_logs)
-        entity_counts = self._write_vectors(stages, canonical_grid, canonical_maps, def_data, labels)
+        entity_counts = self._write_vectors(stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
         stage_index = self._build_stage_index(stages)
         metrics = self._collect_metrics(stages)
@@ -128,6 +132,38 @@ class FoundationExtractor:
                 self._record_raw_ref(stage, Path(parsed["source"]), "rt_log", {"totals": parsed.get("totals", {})})
             else:
                 self._mark("rt_log", stage.name, "missing", "missing_rt_log")
+        return out
+
+    def _collect_sta_reports(self, stages: list[StageInfo]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            parsed = parse_sta_artifacts(stage.directory)
+            if parsed.get("available"):
+                out[stage.name] = parsed
+                self._mark("sta", stage.name, "available")
+                source = Path(str(parsed.get("source", "")))
+                if source.exists():
+                    self._record_raw_ref(stage, source, "sta_report_json", {"paths": len(parsed.get("records", []))})
+                for wire_source in parsed.get("wire_path_sources", []):
+                    wire_path = Path(str(wire_source))
+                    if wire_path.exists():
+                        self._record_raw_ref(stage, wire_path, "sta_wire_path", {})
+            else:
+                self._mark("sta", stage.name, "missing", "missing_sta_report")
+        return out
+
+    def _collect_drc_reports(self, stages: list[StageInfo]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            parsed = parse_drc_artifacts(stage.directory)
+            if parsed.get("available"):
+                out[stage.name] = parsed
+                self._mark("drc", stage.name, "available")
+                source = Path(str(parsed.get("source", "")))
+                if source.exists():
+                    self._record_raw_ref(stage, source, "drc_violation_map", {"count": parsed.get("count", 0)})
+            else:
+                self._mark("drc", stage.name, "missing", "missing_drc_artifacts")
         return out
 
     def _collect_raw_maps(self, stages: list[StageInfo]) -> dict[str, dict[str, dict[str, list[list[float]]]]]:
@@ -267,7 +303,16 @@ class FoundationExtractor:
         self._mark("tech", "cells", "available" if cells_by_name else "missing", "" if cells_by_name else "missing_def_components")
         self._mark("tech", "vias", "available" if vias_by_name else "missing", "" if vias_by_name else "missing_def_vias")
 
-    def _write_vectors(self, stages: list[StageInfo], canonical_grid: dict, canonical_maps: dict, def_data: dict[str, DefData], labels: dict[str, Any]) -> dict[str, dict[str, int]]:
+    def _write_vectors(
+        self,
+        stages: list[StageInfo],
+        canonical_grid: dict,
+        canonical_maps: dict,
+        def_data: dict[str, DefData],
+        labels: dict[str, Any],
+        sta_reports: dict[str, dict[str, Any]],
+        drc_reports: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, int]]:
         counts: dict[str, dict[str, int]] = {entity: {} for entity in _ENTITY_NAMES}
         route_labels_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_patch_overflow_records", [])
@@ -279,7 +324,7 @@ class FoundationExtractor:
             pins = self._pin_records(stage, parsed_def)
             wires = self._wire_records(stage, parsed_def)
             routing_graphs = self._routing_graph_records(stage, parsed_def)
-            timing_paths = self._timing_path_records(stage)
+            timing_paths = self._timing_path_records(stage, sta_reports.get(stage.name))
             counts["instances"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "instances" / f"{stage.name}-00000.jsonl", instances)
             stage_vectors = {
                 "nets": nets,
@@ -291,7 +336,18 @@ class FoundationExtractor:
             for entity, records in stage_vectors.items():
                 counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}-00000.jsonl", records)
                 self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
-            patches = self._patch_records(stage.name, canonical_grid, canonical_maps.get(stage.name, {}), instances, nets, pins, wires, route_labels_by_patch if stage.name == "route" else {})
+            patches = self._patch_records(
+                stage.name,
+                canonical_grid,
+                canonical_maps.get(stage.name, {}),
+                instances,
+                nets,
+                pins,
+                wires,
+                route_labels_by_patch if stage.name == "route" else {},
+                timing_paths,
+                drc_reports.get(stage.name),
+            )
             counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}-00000.jsonl", patches)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
         return counts
@@ -442,7 +498,20 @@ class FoundationExtractor:
             )
         return records
 
-    def _timing_path_records(self, stage: StageInfo) -> list[dict[str, Any]]:
+    def _timing_path_records(self, stage: StageInfo, sta_report: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if sta_report:
+            records = []
+            for idx, item in enumerate(sta_report.get("records", [])):
+                record = {**item, "id": idx, "stage": stage.name}
+                for key in ("source", "wire_path_source"):
+                    value = record.get(key)
+                    if value:
+                        try:
+                            record[key] = str(Path(str(value)).relative_to(self.workspace_dir))
+                        except ValueError:
+                            record[key] = str(value)
+                records.append(record)
+            return records
         records = []
         rpt = self._read_json(stage.directory / "data" / "sta" / "gcd.rpt.json")
         for idx, item in enumerate(rpt.get("summary", []) if isinstance(rpt.get("summary"), list) else []):
@@ -497,6 +566,8 @@ class FoundationExtractor:
         pins: list[dict[str, Any]],
         wires: list[dict[str, Any]],
         route_labels_by_patch: dict[int, dict[str, Any]],
+        timing_paths: list[dict[str, Any]],
+        drc_report: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         records = []
         density_maps = stage_maps.get("density", {})
@@ -515,6 +586,7 @@ class FoundationExtractor:
                 layer = str(wire.get("layer"))
                 wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
             label = route_labels_by_patch.get(int(patch["patch_id"]), {})
+            patch_drc = _drc_for_patch(drc_report, bbox)
             record = {
                 "patch_id": patch["patch_id"],
                 "stage": stage,
@@ -533,6 +605,9 @@ class FoundationExtractor:
                     "union": label.get("union_overflow"),
                     "by_layer": label.get("by_layer", {}),
                 },
+                "drc": patch_drc,
+                "timing": _timing_for_patch(timing_paths),
+                "electrical": _electrical_for_patch(timing_paths),
                 "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col),
                 "pin_density": _value_from_named_map(density_maps, "pin_density", row, col),
                 "net_density": _value_from_named_map(density_maps, "net_density", row, col),
@@ -787,6 +862,77 @@ def _value_from_named_map(maps: dict[str, list[list[float]]], token: str, row: i
         if token in name:
             return _matrix_value(matrix, row, col)
     return None
+
+
+def _drc_for_patch(drc_report: dict[str, Any] | None, bbox: dict[str, Any]) -> dict[str, Any]:
+    if not drc_report or not drc_report.get("available"):
+        return {"count": None, "by_type": {}, "by_layer": {}, "unlocalized_count": None, "availability": "missing"}
+    violations = drc_report.get("violations", [])
+    if not violations:
+        total = int(drc_report.get("count") or 0)
+        return {"count": 0 if total == 0 else None, "by_type": {}, "by_layer": {}, "unlocalized_count": total or 0, "availability": "available"}
+    count = 0
+    by_type: dict[str, int] = {}
+    by_layer: dict[str, int] = {}
+    unlocalized = 0
+    for violation in violations:
+        amount = int(violation.get("count") or 1)
+        violation_bbox = violation.get("bbox")
+        if not violation_bbox:
+            unlocalized += amount
+            continue
+        if not _bbox_intersects_bbox(violation_bbox, bbox):
+            continue
+        count += amount
+        violation_type = str(violation.get("type") or "unknown")
+        by_type[violation_type] = by_type.get(violation_type, 0) + amount
+        layer = violation.get("layer")
+        if layer:
+            layer_name = str(layer)
+            by_layer[layer_name] = by_layer.get(layer_name, 0) + amount
+    return {"count": count, "by_type": by_type, "by_layer": by_layer, "unlocalized_count": unlocalized, "availability": "available"}
+
+
+def _timing_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
+    slacks = [float(item["slack"]) for item in timing_paths if item.get("slack") is not None]
+    return {
+        "worst_slack": min(slacks) if slacks else None,
+        "path_count": len(timing_paths) if timing_paths else 0,
+        "availability": "available" if timing_paths else "missing",
+        "scope": "stage",
+    }
+
+
+def _electrical_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
+    caps: list[float] = []
+    slews: list[float] = []
+    resistances: list[float] = []
+    incrs: list[float] = []
+    for path in timing_paths:
+        electrical = path.get("wire_electrical", {})
+        if not isinstance(electrical, dict):
+            continue
+        caps.extend(float(value) for value in electrical.get("capacitance_list", []) if value is not None)
+        slews.extend(float(value) for value in electrical.get("slew_list", []) if value is not None)
+        resistances.extend(float(value) for value in electrical.get("resistance_list", []) if value is not None)
+        incrs.extend(float(value) for value in electrical.get("incr_delay_list", []) if value is not None)
+    return {
+        "capacitance_sum": sum(caps) if caps else None,
+        "max_slew": max(slews) if slews else None,
+        "resistance_sum": sum(resistances) if resistances else None,
+        "incr_delay_sum": sum(incrs) if incrs else None,
+        "availability": "available" if caps or slews or resistances or incrs else "missing",
+        "scope": "stage",
+    }
+
+
+def _bbox_intersects_bbox(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return not (
+        float(a["urx"]) < float(b["llx"])
+        or float(a["llx"]) > float(b["urx"])
+        or float(a["ury"]) < float(b["lly"])
+        or float(a["lly"]) > float(b["ury"])
+    )
 
 
 def _hotspot_records(labels: list[dict[str, Any]], percent: int) -> list[dict[str, Any]]:

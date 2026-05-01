@@ -33,6 +33,7 @@ def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, inc
                 {"name": "Floorplan", "tool": "ecc", "state": "Success"},
                 {"name": "place", "tool": "dreamplace", "state": "Success"},
                 {"name": "route", "tool": "ecc", "state": "Success"},
+                {"name": "drc", "tool": "ecc", "state": "Success"},
             ]
         },
     )
@@ -41,6 +42,7 @@ def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, inc
         ("Floorplan_ecc", "Floorplan"),
         ("place_dreamplace", "place"),
         ("route_ecc", "route"),
+        ("drc_ecc", "drc"),
     ]:
         _write_json(ws / stage_dir / "analysis" / f"{stage_name}_metrics.json", {"Tool": "ecc", "max_WNS": "1.0"})
         _write_json(ws / stage_dir / "checklist.json", {"state": "Success"})
@@ -162,8 +164,31 @@ END DESIGN
         )
         _write_json(
             ws / "route_ecc" / "data" / "sta" / "wire_paths" / "wire_path_1.json",
-            [{"node_0": {"Point": "U1/A", "Capacitance": 0.1, "slew": 0.2}}],
+            [
+                {"node_0": {"Point": "U1/A", "Capacitance": 0.1, "slew": 0.2, "trans_type": "rise"}},
+                {"net_arc_0": {"Incr": 0.3, "Resistance": 1.5}},
+                {"node_1": {"Point": "U1/Y", "Capacitance": 0.4, "slew": 0.6, "trans_type": "fall"}},
+            ],
         )
+        _write_json(
+            ws / "drc_ecc" / "data" / "drc" / "violation_map.json",
+            [
+                {
+                    "type": "short",
+                    "rule": "M2.SHORT",
+                    "layer": "MET2",
+                    "bbox": {"llx": 20, "lly": 20, "urx": 80, "ury": 80},
+                    "count": 2,
+                },
+                {
+                    "type": "spacing",
+                    "rule": "M3.SPACE",
+                    "layer": "MET3",
+                    "bbox": [120, 120, 180, 180],
+                },
+            ],
+        )
+        _write_json(ws / "drc_ecc" / "analysis" / "drc_metrics.json", {"Tool": "ecc", "drc_num": 3})
     return ws
 
 
@@ -224,16 +249,30 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert any(pin["pin_name"] == "OUT" for pin in pins)
     assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
     assert timing_paths and timing_paths[0]["slack"] == 1.0
+    assert timing_paths[0]["arc_sequence"][0]["name"] == "U1/A"
+    assert timing_paths[0]["wire_electrical"]["capacitance_sum"] == 0.5
+    assert timing_paths[0]["wire_electrical"]["max_slew"] == 0.6
+    assert timing_paths[0]["wire_electrical"]["resistance_sum"] == 1.5
 
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
     assert patches[0]["net_count"] >= 1
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
     assert patches[0]["route_true_overflow"]["union"] == 1.0
+    assert patches[0]["timing"]["worst_slack"] == 1.0
+    assert patches[0]["electrical"]["capacitance_sum"] == 0.5
+    assert patches[0]["electrical"]["max_slew"] == 0.6
+
+    drc_patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "drc-00000.jsonl").read_text().splitlines()]
+    assert drc_patches[0]["drc"]["count"] == 2
+    assert drc_patches[0]["drc"]["by_type"] == {"short": 2}
+    assert drc_patches[-1]["drc"]["count"] == 1
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert quality["profile"] == "iccd_full_v1"
     assert quality["availability"]["instances"]["place"] == "available"
     assert quality["availability"]["labels"]["route_patch_overflow"] == "available"
+    assert quality["availability"]["drc"]["drc"] == "available"
+    assert quality["availability"]["timing_paths"]["route"] == "available"
     assert "null_reason" in quality
 
 
