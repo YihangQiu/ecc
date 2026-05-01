@@ -305,3 +305,39 @@ def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     assert not stale.exists()
+
+
+
+def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"], include_raw_refs=False)
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    evidence = json.loads((foundation_dir / "views" / "agent" / "evidence_index.json").read_text(encoding="utf-8"))
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+
+    assert [item["name"] for item in summary["stages"]] == ["place"]
+    assert (foundation_dir / "vectors" / "instances" / "place-00000.jsonl").exists()
+    assert not (foundation_dir / "vectors" / "instances" / "route-00000.jsonl").exists()
+    assert not (foundation_dir / "raw_refs" / "artifacts.json").exists()
+    assert manifest["options"]["stages"] == ["place"]
+    assert manifest["options"]["include_raw_refs"] is False
+    assert "raw_refs" not in manifest["artifacts"]
+    assert evidence["raw_refs"] is None
+    assert evidence["raw_refs_disabled"] is True
+    assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
+    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_true_route_artifacts"
+
+
+def test_iccd_full_v1_rejects_unknown_stage_filter(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    try:
+        FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["missing_stage"])
+    except ValueError as exc:
+        assert "unknown foundation extraction stage" in str(exc)
+    else:
+        raise AssertionError("expected unknown stage to fail")

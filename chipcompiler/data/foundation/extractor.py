@@ -50,38 +50,40 @@ class FoundationExtractor:
         self._quality: dict[str, Any] = {"profile": profile, "availability": {}, "null_reason": {}, "warnings": []}
         self._raw_refs: list[dict[str, Any]] = []
 
-    def extract(self, *, force: bool = False) -> ExtractionResult:
+    def extract(self, *, force: bool = False, stages: Any = "all", include_raw_refs: bool = True) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
         flow = self._read_json(self.workspace_dir / "home" / "flow.json")
         parameters = self._read_json(self.workspace_dir / "home" / "parameters.json")
-        stages = self._stage_infos(flow)
-        def_data = self._collect_def_data(stages)
-        rt_logs = self._collect_rt_logs(stages)
-        sta_reports = self._collect_sta_reports(stages)
-        drc_reports = self._collect_drc_reports(stages)
-        raw_maps = self._collect_raw_maps(stages)
-        die_bbox = self._discover_die_bbox(stages) or self._discover_def_die_bbox(def_data)
+        selected_stages = self._filter_stages(self._stage_infos(flow), stages)
+        options = {"stages": [stage.name for stage in selected_stages], "include_raw_refs": bool(include_raw_refs)}
+        def_data = self._collect_def_data(selected_stages)
+        rt_logs = self._collect_rt_logs(selected_stages)
+        sta_reports = self._collect_sta_reports(selected_stages)
+        drc_reports = self._collect_drc_reports(selected_stages)
+        raw_maps = self._collect_raw_maps(selected_stages)
+        die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox)
         canonical_maps = self._write_maps(raw_maps, canonical_grid)
         route_labels = self._route_true_overflow_labels(canonical_grid, def_data.get("route"), rt_logs.get("route"))
         labels = self._write_labels(canonical_grid, route_labels, rt_logs.get("route"))
         self._write_tech(def_data, rt_logs)
-        entity_counts = self._write_vectors(stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
+        entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
-        stage_index = self._build_stage_index(stages)
-        metrics = self._collect_metrics(stages)
-        summary = self._build_summary(flow, parameters, stages, metrics, entity_counts, public_labels)
-        manifest = self._build_manifest(stages, raw_maps, summary)
+        stage_index = self._build_stage_index(selected_stages)
+        metrics = self._collect_metrics(selected_stages)
+        summary = self._build_summary(flow, parameters, selected_stages, metrics, entity_counts, public_labels)
+        manifest = self._build_manifest(selected_stages, raw_maps, summary, options=options)
 
         write_json(self.foundation_dir / "canonical_grid.json", canonical_grid)
         write_json(self.foundation_dir / "stage_index.json", stage_index)
         write_json(self.foundation_dir / "summary.json", summary)
-        write_json(self.foundation_dir / "raw_refs" / "artifacts.json", {"artifacts": self._raw_refs})
+        if include_raw_refs:
+            write_json(self.foundation_dir / "raw_refs" / "artifacts.json", {"artifacts": self._raw_refs})
         write_json(self.foundation_dir / "quality.json", self._quality)
         write_json(self.foundation_dir / "manifest.json", manifest)
-        self._write_views(summary, metrics, stage_index, public_labels)
+        self._write_views(summary, metrics, stage_index, public_labels, include_raw_refs=bool(include_raw_refs))
 
         return ExtractionResult(
             workspace_dir=self.workspace_dir,
@@ -103,6 +105,27 @@ class FoundationExtractor:
             directory = self.workspace_dir / _STAGE_DIR_OVERRIDES.get((name, tool), f"{name}_{tool}")
             stages.append(StageInfo(name=name, tool=tool, state=str(item.get("state", "")), directory=directory))
         return stages
+
+    @staticmethod
+    def _filter_stages(stages: list[StageInfo], requested: Any) -> list[StageInfo]:
+        if requested is None:
+            return stages
+        if isinstance(requested, str):
+            normalized = requested.strip()
+            if not normalized or normalized.lower() == "all":
+                return stages
+            requested_names = [item.strip() for item in normalized.split(",") if item.strip()]
+        elif isinstance(requested, list | tuple | set):
+            requested_names = [str(item).strip() for item in requested if str(item).strip()]
+        else:
+            raise ValueError("stages must be 'all', a stage name, or a list of stage names")
+        if not requested_names:
+            return stages
+        by_name = {stage.name: stage for stage in stages}
+        unknown = [name for name in requested_names if name not in by_name]
+        if unknown:
+            raise ValueError(f"unknown foundation extraction stage: {', '.join(unknown)}")
+        return [by_name[name] for name in requested_names]
 
     def _collect_def_data(self, stages: list[StageInfo]) -> dict[str, DefData]:
         out: dict[str, DefData] = {}
@@ -780,7 +803,7 @@ class FoundationExtractor:
             "labels": labels,
         }
 
-    def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict) -> dict[str, Any]:
+    def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict, *, options: dict[str, Any]) -> dict[str, Any]:
         del stages, raw_maps
         artifacts = {
             "summary": str(self.foundation_dir / "summary.json"),
@@ -790,9 +813,12 @@ class FoundationExtractor:
             "ml_view": str(self.foundation_dir / "views" / "ml" / "dataset_index.json"),
             "agent_view": str(self.foundation_dir / "views" / "agent" / "run_summary.json"),
         }
+        if options.get("include_raw_refs"):
+            artifacts["raw_refs"] = str(self.foundation_dir / "raw_refs" / "artifacts.json")
         return {
             "version": 2,
             "profile": self.profile,
+            "options": options,
             "workspace": str(self.workspace_dir),
             "created_at": summary["created_at"],
             "sources": self._source_signature(),
@@ -810,7 +836,7 @@ class FoundationExtractor:
                     paths.extend(path for path in root.rglob("*") if path.is_file())
         return {str(path): path.stat().st_mtime for path in sorted(set(paths)) if path.exists()}
 
-    def _write_views(self, summary: dict, metrics: dict, stage_index: dict, labels: dict) -> None:
+    def _write_views(self, summary: dict, metrics: dict, stage_index: dict, labels: dict, *, include_raw_refs: bool) -> None:
         write_json(
             self.foundation_dir / "views" / "ml" / "dataset_index.json",
             {
@@ -836,7 +862,14 @@ class FoundationExtractor:
             },
         )
         write_json(self.foundation_dir / "views" / "agent" / "qor_snapshot.json", {"metrics": metrics, "labels": labels})
-        write_json(self.foundation_dir / "views" / "agent" / "evidence_index.json", {"stage_index": stage_index, "raw_refs": "raw_refs/artifacts.json"})
+        write_json(
+            self.foundation_dir / "views" / "agent" / "evidence_index.json",
+            {
+                "stage_index": stage_index,
+                "raw_refs": "raw_refs/artifacts.json" if include_raw_refs else None,
+                "raw_refs_disabled": not include_raw_refs,
+            },
+        )
 
     def _record_raw_ref(self, stage: StageInfo, path: Path, artifact_type: str, metadata: dict[str, Any]) -> None:
         try:
