@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resize_nearest
-from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.def_parser import DefData, DefWire, parse_def
+from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.gcell import parse_gcell_info
 from .parsers.map_csv import read_numeric_csv, shape
+from .parsers.route_native_demand_capacity import parse_route_native_demand_capacity_artifacts
 from .parsers.route_overflow import parse_route_overflow_artifacts
 from .parsers.rt_log import parse_rt_log
 from .parsers.sta_parser import parse_sta_artifacts
@@ -71,8 +72,9 @@ class FoundationExtractor:
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_route_overflow = parse_route_overflow_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
+        native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         reconstructed_congestion = self._route_reconstructed_congestion(canonical_grid, def_data.get("route"), rt_logs.get("route"))
-        labels = self._write_labels(canonical_grid, native_route_overflow.get("labels", []), reconstructed_congestion, rt_logs.get("route"))
+        labels = self._write_labels(canonical_grid, native_route_overflow.get("labels", []), native_demand_capacity.get("labels", []), reconstructed_congestion, rt_logs.get("route"))
         self._write_tech(def_data, rt_logs)
         entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
@@ -428,6 +430,9 @@ class FoundationExtractor:
         route_labels_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_patch_overflow_records", [])
         }
+        native_demand_capacity_by_patch = {
+            item["patch_id"]: item for item in labels.get("_route_native_demand_capacity_records", [])
+        }
         reconstructed_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_reconstructed_congestion_records", [])
         }
@@ -459,6 +464,7 @@ class FoundationExtractor:
                 pins,
                 wires,
                 route_labels_by_patch if stage.name == "route" else {},
+                native_demand_capacity_by_patch if stage.name == "route" else {},
                 reconstructed_by_patch if stage.name == "route" else {},
                 timing_paths,
                 drc_reports.get(stage.name),
@@ -675,6 +681,7 @@ class FoundationExtractor:
         pins: list[dict[str, Any]],
         wires: list[dict[str, Any]],
         route_labels_by_patch: dict[int, dict[str, Any]],
+        native_demand_capacity_by_patch: dict[int, dict[str, Any]],
         reconstructed_by_patch: dict[int, dict[str, Any]],
         timing_paths: list[dict[str, Any]],
         drc_report: dict[str, Any] | None,
@@ -696,6 +703,7 @@ class FoundationExtractor:
                 layer = str(wire.get("layer"))
                 wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
             label = route_labels_by_patch.get(int(patch["patch_id"]), {})
+            native_demand_capacity = native_demand_capacity_by_patch.get(int(patch["patch_id"]), {})
             reconstructed = reconstructed_by_patch.get(int(patch["patch_id"]), {})
             patch_drc = _drc_for_patch(drc_report, bbox)
             record = {
@@ -721,7 +729,9 @@ class FoundationExtractor:
                     "union": reconstructed.get("union_overflow"),
                     "by_layer": reconstructed.get("by_layer", {}),
                 },
-                "route_demand_capacity": _demand_capacity_label(_demand_capacity_source(label, reconstructed)),
+                "route_native_demand_capacity": _demand_capacity_label(native_demand_capacity),
+                "route_reconstructed_demand_capacity": _demand_capacity_label(reconstructed),
+                "route_demand_capacity": _demand_capacity_label(_demand_capacity_source(native_demand_capacity, reconstructed)),
                 "drc": patch_drc,
                 "timing": _timing_for_patch(timing_paths),
                 "electrical": _electrical_for_patch(timing_paths),
@@ -740,13 +750,34 @@ class FoundationExtractor:
             records.append(record)
         return records
 
-    def _write_labels(self, canonical_grid: dict, route_labels: list[dict[str, Any]], reconstructed_congestion: list[dict[str, Any]], rt_log: dict[str, Any] | None) -> dict[str, Any]:
+    def _write_labels(
+        self,
+        canonical_grid: dict,
+        route_labels: list[dict[str, Any]],
+        native_demand_capacity: list[dict[str, Any]],
+        reconstructed_congestion: list[dict[str, Any]],
+        rt_log: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         rows = int(canonical_grid["rows"])
         cols = int(canonical_grid["cols"])
+        write_jsonl(self.foundation_dir / "labels" / "route_native_demand_capacity.jsonl", native_demand_capacity)
+        self._mark(
+            "labels",
+            "route_native_demand_capacity",
+            "available" if native_demand_capacity else "missing",
+            "" if native_demand_capacity else "missing_irt_space_router_native_demand_capacity_artifact",
+        )
         write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_congestion.jsonl", reconstructed_congestion)
+        write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl", reconstructed_congestion)
         self._mark(
             "labels",
             "route_reconstructed_congestion",
+            "available" if reconstructed_congestion else "missing",
+            "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
+        )
+        self._mark(
+            "labels",
+            "route_reconstructed_demand_capacity",
             "available" if reconstructed_congestion else "missing",
             "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
         )
@@ -766,9 +797,12 @@ class FoundationExtractor:
             self._quality.setdefault("warnings", []).append("router-native route overflow artifact missing/incomplete; true route labels were not generated")
             return {
                 "route_patch_overflow_count": 0,
+                "route_native_demand_capacity_count": len(native_demand_capacity),
+                "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
                 "route_reconstructed_congestion_count": len(reconstructed_congestion),
                 "candidate_qor_summary": candidate_summary,
                 "_route_patch_overflow_records": [],
+                "_route_native_demand_capacity_records": native_demand_capacity,
                 "_route_reconstructed_congestion_records": reconstructed_congestion,
             }
 
@@ -790,9 +824,12 @@ class FoundationExtractor:
         self._mark("labels", "route_patch_overflow", "available")
         return {
             "route_patch_overflow_count": len(route_labels),
+            "route_native_demand_capacity_count": len(native_demand_capacity),
+            "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
             "route_reconstructed_congestion_count": len(reconstructed_congestion),
             "candidate_qor_summary": candidate_summary,
             "_route_patch_overflow_records": route_labels,
+            "_route_native_demand_capacity_records": native_demand_capacity,
             "_route_reconstructed_congestion_records": reconstructed_congestion,
         }
 

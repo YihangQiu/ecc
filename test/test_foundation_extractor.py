@@ -39,7 +39,14 @@ def _write_sample_gcell_info(stage_dir: Path) -> None:
     )
 
 
-def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, include_route_maps: bool = True, include_native_route_overflow: bool = True) -> Path:
+def _make_workspace(
+    tmp_path: Path,
+    *,
+    include_route_artifacts: bool = True,
+    include_route_maps: bool = True,
+    include_native_route_overflow: bool = True,
+    include_native_demand_capacity: bool = True,
+) -> Path:
     ws = tmp_path / "sample-ws"
     _write_json(
         ws / "home" / "flow.json",
@@ -239,6 +246,66 @@ END DESIGN
                     ],
                 },
             )
+        if include_native_demand_capacity:
+            _write_text(
+                ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.jsonl",
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "row": 0,
+                                "col": 0,
+                                "gcell": {"x": 0, "y": 0},
+                                "layer": "MET2",
+                                "layer_idx": 0,
+                                "direction": "horizontal",
+                                "demand": 6.0,
+                                "capacity": 3.0,
+                                "demand_capacity": 3.0,
+                                "utilization": 2.0,
+                                "overflow": 3.0,
+                                "source": "irt_space_router_native",
+                                "stage": "space_router_final",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "row": 0,
+                                "col": 0,
+                                "gcell": {"x": 0, "y": 0},
+                                "layer": "MET3",
+                                "layer_idx": 1,
+                                "direction": "vertical",
+                                "demand": 4.0,
+                                "capacity": 2.0,
+                                "demand_capacity": 2.0,
+                                "utilization": 2.0,
+                                "overflow": 2.0,
+                                "source": "irt_space_router_native",
+                                "stage": "space_router_final",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "row": 1,
+                                "col": 1,
+                                "gcell": {"x": 1, "y": 1},
+                                "layer": "MET2",
+                                "layer_idx": 0,
+                                "direction": "horizontal",
+                                "demand": 1.0,
+                                "capacity": 5.0,
+                                "demand_capacity": -4.0,
+                                "utilization": 0.2,
+                                "overflow": 0.0,
+                                "source": "irt_space_router_native",
+                                "stage": "space_router_final",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+            )
         _write_json(
             ws / "route_ecc" / "data" / "sta" / "gcd.rpt.json",
             {
@@ -292,6 +359,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "views/ml/dataset_index.json",
         "views/agent/run_summary.json",
         "labels/route_patch_overflow.jsonl",
+        "labels/route_native_demand_capacity.jsonl",
+        "labels/route_reconstructed_demand_capacity.jsonl",
         "vectors/instances/place.jsonl",
         "vectors/tech/layers.json",
         "vectors/tech/cells.json",
@@ -366,6 +435,18 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert labels[0]["horizontal_utilization"] == 3.0
     assert labels[3]["horizontal_overflow"] == 1.0
 
+    native_demand_capacity = [
+        json.loads(line)
+        for line in (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {item["source"] for item in native_demand_capacity} == {"irt_space_router_native"}
+    assert native_demand_capacity[0]["horizontal_demand"] == 6.0
+    assert native_demand_capacity[0]["horizontal_capacity"] == 3.0
+    assert native_demand_capacity[0]["horizontal_demand_capacity"] == 3.0
+    assert native_demand_capacity[0]["vertical_demand_capacity"] == 2.0
+    assert native_demand_capacity[0]["union_demand_capacity"] == 3.0
+
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
     pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route.jsonl").read_text().splitlines()]
     wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route.jsonl").read_text().splitlines()]
@@ -387,8 +468,13 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
     assert patches[0]["route_true_overflow"]["union"] == 3.0
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
-    assert patches[0]["route_demand_capacity"]["horizontal"] == 2.0
-    assert patches[0]["route_demand_capacity"]["vertical"] == 3.0
+    assert patches[0]["route_native_demand_capacity"]["horizontal"] == 3.0
+    assert patches[0]["route_native_demand_capacity"]["vertical"] == 2.0
+    assert patches[0]["route_reconstructed_demand_capacity"]["horizontal"] == 1.0
+    assert patches[0]["route_reconstructed_demand_capacity"]["vertical"] == 1.0
+    assert patches[0]["route_demand_capacity"]["horizontal"] == 3.0
+    assert patches[0]["route_demand_capacity"]["vertical"] == 2.0
+    assert patches[0]["route_demand_capacity"]["source"] == "irt_space_router_native"
     assert patches[0]["timing"]["worst_slack"] == 1.0
     assert patches[0]["electrical"]["capacitance_sum"] == 0.5
     assert patches[0]["electrical"]["max_slew"] == 0.6
@@ -401,6 +487,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert "profile" not in quality
     assert quality["availability"]["instances"]["place"] == "available"
+    assert quality["availability"]["labels"]["route_native_demand_capacity"] == "available"
+    assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
     assert quality["availability"]["labels"]["route_patch_overflow"] == "available"
     assert quality["availability"]["drc"]["drc"] == "available"
     assert quality["availability"]["timing_paths"]["route"] == "available"
@@ -422,12 +510,15 @@ def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path
     assert candidate["available"] is False
     assert candidate["score"] is None
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
+    assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
     assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
+    assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
     assert summary["labels"]["route_patch_overflow_count"] == 0
+    assert summary["labels"]["route_native_demand_capacity_count"] == 0
 
 
 def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(tmp_path: Path):
-    ws = _make_workspace(tmp_path, include_native_route_overflow=False)
+    ws = _make_workspace(tmp_path, include_native_route_overflow=False, include_native_demand_capacity=False)
 
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
@@ -451,14 +542,22 @@ def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(t
     assert reconstructed[0]["horizontal_capacity"] == 1.0
     assert reconstructed[0]["horizontal_demand_capacity"] == 1.0
     assert reconstructed[0]["horizontal_utilization"] == 2.0
+    native = (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8")
     assert patches[0]["route_true_overflow"]["union"] is None
+    assert patches[0]["route_native_demand_capacity"]["union"] is None
+    assert patches[0]["route_reconstructed_demand_capacity"]["union"] == 1.0
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
     assert patches[0]["route_demand_capacity"]["horizontal"] == 1.0
     assert patches[0]["route_demand_capacity"]["vertical"] == 1.0
+    assert patches[0]["route_demand_capacity"]["source"] == "routed_def_tracks_reconstruction"
     assert candidate["available"] is False
+    assert native == ""
+    assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
+    assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
     assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
     assert quality["availability"]["labels"]["route_reconstructed_congestion"] == "available"
+    assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
 
 
 def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
