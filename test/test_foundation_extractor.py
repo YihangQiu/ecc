@@ -83,7 +83,27 @@ def _make_workspace(
         _write_json(ws / stage_dir / "analysis" / f"{stage_name}_metrics.json", {"Tool": "ecc", "max_WNS": "1.0"})
         _write_json(ws / stage_dir / "config" / "fp_default_config.json", {"Floorplan": {"Tap distance": 58}})
         _write_json(ws / stage_dir / "config" / "pl_default_config.json", {"PL": {"GP": {"global_right_padding": 0}}})
-        _write_json(ws / stage_dir / "config" / "rt_default_config.json", {"RT": {"-bottom_routing_layer": "MET2", "-top_routing_layer": "MET5"}})
+        _write_json(
+            ws / stage_dir / "config" / "rt_default_config.json",
+            {"RT": {"-bottom_routing_layer": "MET2", "-top_routing_layer": "MET5", "-thread_number": "50", "-enable_timing": "0"}},
+        )
+        if "dreamplace" in stage_dir:
+            _write_json(
+                ws / stage_dir / "config" / "dreamplace.json",
+                {
+                    "num_bins_x": 32,
+                    "num_bins_y": 32,
+                    "global_place_stages": [{"iteration": 3000}],
+                    "target_density": 0.3,
+                    "density_weight": 0.00085,
+                    "random_seed": 3000,
+                    "route_num_bins_x": 512,
+                    "route_num_bins_y": 512,
+                    "unit_horizontal_capacity": 1.5625,
+                    "unit_vertical_capacity": 1.45,
+                    "max_route_opt_adjust_rate": 2.0,
+                },
+            )
         _write_json(ws / stage_dir / "checklist.json", {"state": "Success"})
         _write_json(
             ws / stage_dir / "output" / f"gcd_{stage_name}.json",
@@ -381,17 +401,37 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "profile" not in summary
     assert "created_at" not in summary
     assert all("info" not in step for step in summary["flow"]["steps"])
-    assert summary["parameters"]["Die"]["Size"] == [200.0, 200.0]
-    assert summary["parameters"]["Die"]["Area"] == 40000.0
-    assert summary["parameters"]["Core"]["Size"] == [196.0, 196.0]
-    assert summary["parameters"]["Core"]["Area"] == 38416.0
-    assert summary["parameters"]["Core"]["Bounding box"] == "(2.0 , 2.0) (198.0 , 198.0)"
-    assert summary["parameters"]["control_knobs"]["source"] == "home_parameters_plus_stage_configs"
-    assert summary["parameters"]["control_knobs"]["placement"]["target_density"] == 0.3
-    assert summary["parameters"]["control_knobs"]["routing"]["top_routing_layer"] == "MET5"
-    assert summary["metrics"]["route"]["derived"]["wire_count"] > 0
-    assert "route_patch_overflow_count" not in summary["metrics"]["route"]["derived"]
-    assert "route.step.json" in summary["metrics"]["route"].get("features", {})
+    assert "Die" not in summary["parameters"]
+    assert summary["parameters"]["Core"] == {
+        "Utilitization": 0.5,
+        "Margin": [2, 2],
+        "Aspect ratio": 1,
+    }
+    assert "PDK Root" not in summary["parameters"]
+    control_knobs = summary["parameters"]["control_knobs"]
+    assert control_knobs["source"] == "effective_tool_flow_configs"
+    assert "base" not in control_knobs
+    assert "stage_configs" not in control_knobs
+    assert "database_inputs" not in control_knobs
+    assert "drc" not in control_knobs
+    assert "pnp" not in control_knobs
+    assert set(control_knobs) == {"source", "floorplan", "dreamplace", "route"}
+    assert control_knobs["floorplan"] == {"tap_distance": 58}
+    assert control_knobs["dreamplace"]["num_bins_x"] == 32
+    assert control_knobs["dreamplace"]["global_place_stages"][0]["iteration"] == 3000
+    assert "target_density" not in control_knobs["dreamplace"]
+    assert control_knobs["route"] == {"thread_number": "50", "enable_timing": "0"}
+    assert "Max fanout" in summary["parameters"]
+    assert "Target density" in summary["parameters"]
+    assert "Top layer" in summary["parameters"]
+    metrics = summary["metrics"]
+    assert metrics["route"]["wire_count"] > 0
+    assert metrics["route"]["wire_length"] > 0
+    assert metrics["route"]["route_via_count"] > 0
+    assert "route_patch_overflow_count" not in metrics["route"]
+    assert "features" not in metrics["route"]
+    assert "route.step.json" not in metrics["route"]
+    assert all(all("path" not in key.lower() for key in stage_metrics) for stage_metrics in metrics.values())
 
     manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest) == {"options", "workspace", "sources", "artifacts"}
