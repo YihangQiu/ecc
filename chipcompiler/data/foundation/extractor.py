@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +79,8 @@ class FoundationExtractor:
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
         stage_index = self._build_stage_index(selected_stages)
         metrics = self._collect_metrics(selected_stages)
-        summary = self._build_summary(flow, parameters, selected_stages, metrics, entity_counts, public_labels)
+        summary_parameters = self._build_summary_parameters(parameters, selected_stages, def_data)
+        summary = self._build_summary(flow, summary_parameters, selected_stages, metrics, entity_counts, public_labels, def_data, sta_reports, drc_reports)
         manifest = self._build_manifest(selected_stages, raw_maps, summary, options=options)
 
         write_json(self.foundation_dir / "canonical_grid.json", canonical_grid)
@@ -788,9 +788,11 @@ class FoundationExtractor:
             candidate_summary = {
                 "available": False,
                 "score_kind": "route_true_overflow_plus_guardrails",
+                "score_semantics": "Lower is better; combines top-average router-native true overflow and route guardrail totals for candidate strategy ranking.",
                 "top_average": {"horizontal": None, "vertical": None, "union": None},
                 "patch_count": rows * cols,
                 "score": None,
+                "null_reason": "missing_router_native_route_overflow_artifact",
             }
             write_json(self.foundation_dir / "labels" / "candidate_qor_summary.json", candidate_summary)
             self._mark("labels", "route_patch_overflow", "missing", "missing_router_native_route_overflow_artifact")
@@ -814,6 +816,7 @@ class FoundationExtractor:
         candidate_summary = {
             "available": True,
             "score_kind": "route_true_overflow_plus_guardrails",
+            "score_semantics": "Lower is better; combines top-average router-native true overflow and route guardrail totals for candidate strategy ranking.",
             "source": "router_native_overflow",
             "top_average": top_average,
             "patch_count": rows * cols,
@@ -936,12 +939,25 @@ class FoundationExtractor:
     def _collect_metrics(self, stages: list[StageInfo]) -> dict[str, Any]:
         metrics = {}
         for stage in stages:
-            stage_metrics = {}
+            stage_metrics: dict[str, Any] = {}
             for path in sorted((stage.directory / "analysis").glob("*.json")):
                 stage_metrics[path.name] = self._read_json(path)
                 self._record_raw_ref(stage, path, "metrics_json", {})
+            feature_metrics = self._collect_feature_metric_files(stage)
+            if feature_metrics:
+                stage_metrics["features"] = feature_metrics
             metrics[stage.name] = stage_metrics
         return metrics
+
+    def _collect_feature_metric_files(self, stage: StageInfo) -> dict[str, Any]:
+        feature_metrics = {}
+        for path in sorted((stage.directory / "feature").glob("*.json")):
+            payload = self._read_json(path)
+            if not payload:
+                continue
+            feature_metrics[path.name] = payload
+            self._record_raw_ref(stage, path, "feature_summary_json", {})
+        return feature_metrics
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -953,19 +969,275 @@ class FoundationExtractor:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _build_summary(self, flow: dict, parameters: dict, stages: list[StageInfo], metrics: dict, entity_counts: dict, labels: dict) -> dict[str, Any]:
+    def _build_summary(
+        self,
+        flow: dict,
+        parameters: dict,
+        stages: list[StageInfo],
+        metrics: dict,
+        entity_counts: dict,
+        labels: dict,
+        def_data: dict[str, DefData],
+        sta_reports: dict[str, dict[str, Any]],
+        drc_reports: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        enriched_metrics = self._enrich_summary_metrics(metrics, stages, entity_counts, labels, def_data, sta_reports, drc_reports)
         return {
-            "profile": self.profile,
             "workspace": str(self.workspace_dir),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "flow": flow,
+            "flow": _strip_empty_info(flow),
             "parameters": parameters,
             "stage_count": len(stages),
             "stages": [{"name": item.name, "tool": item.tool, "state": item.state} for item in stages],
-            "metrics": metrics,
+            "metrics": enriched_metrics,
             "entity_counts": entity_counts,
             "labels": labels,
         }
+
+    def _build_summary_parameters(self, parameters: dict[str, Any], stages: list[StageInfo], def_data: dict[str, DefData]) -> dict[str, Any]:
+        normalized = json.loads(json.dumps(parameters))
+        layout_bbox = self._discover_layout_bbox(stages) or self._discover_def_die_bbox(def_data)
+        if layout_bbox is not None:
+            normalized["Die"] = _merge_geometry(normalized.get("Die"), layout_bbox)
+        core_bbox = self._infer_core_bbox(normalized, def_data)
+        if core_bbox is not None:
+            normalized["Core"] = _merge_geometry(normalized.get("Core"), core_bbox)
+        normalized["control_knobs"] = self._collect_control_knobs(normalized, stages)
+        return normalized
+
+    def _discover_layout_bbox(self, stages: list[StageInfo]) -> dict[str, float] | None:
+        for stage in stages:
+            for layout_path in sorted((stage.directory / "output").glob("*.json")):
+                payload = self._read_json(layout_path)
+                bbox = self._die_bbox_from_layout(payload)
+                if bbox is not None:
+                    return _scale_bbox(bbox, _layout_unit_scale(payload))
+        return None
+
+    def _infer_core_bbox(self, parameters: dict[str, Any], def_data: dict[str, DefData]) -> dict[str, float] | None:
+        for parsed in def_data.values():
+            if parsed.rows:
+                scale = _def_unit_scale(parsed)
+                llx = min(row.x for row in parsed.rows)
+                lly = min(row.y for row in parsed.rows)
+                urx = max(row.x + max(row.count_x - 1, 0) * row.step_x for row in parsed.rows)
+                ury = max(row.y + max(row.count_y - 1, 0) * row.step_y for row in parsed.rows)
+                return _scale_bbox({"llx": llx, "lly": lly, "urx": urx, "ury": ury}, scale)
+        die = parameters.get("Die") if isinstance(parameters.get("Die"), dict) else {}
+        core = parameters.get("Core") if isinstance(parameters.get("Core"), dict) else {}
+        die_size = die.get("Size") if isinstance(die, dict) else None
+        margin = core.get("Margin") if isinstance(core, dict) else None
+        if isinstance(die_size, list) and len(die_size) >= 2 and isinstance(margin, list) and len(margin) >= 2:
+            width = _to_float(die_size[0])
+            height = _to_float(die_size[1])
+            mx = _to_float(margin[0]) or 0.0
+            my = _to_float(margin[1]) or 0.0
+            if width is not None and height is not None and width > 2 * mx and height > 2 * my:
+                return {"llx": mx, "lly": my, "urx": width - mx, "ury": height - my}
+        return None
+
+    def _collect_control_knobs(self, parameters: dict[str, Any], stages: list[StageInfo]) -> dict[str, Any]:
+        knobs: dict[str, Any] = {
+            "source": "home_parameters_plus_stage_configs",
+            "base": {
+                key: parameters.get(key)
+                for key in (
+                    "PDK",
+                    "Design",
+                    "Top module",
+                    "Clock",
+                    "Frequency max [MHz]",
+                    "Max fanout",
+                    "Target density",
+                    "Target overflow",
+                    "Global right padding",
+                    "Cell padding x",
+                    "Routability opt flag",
+                    "Bottom layer",
+                    "Top layer",
+                )
+                if key in parameters
+            },
+        }
+        core = parameters.get("Core") if isinstance(parameters.get("Core"), dict) else {}
+        if core:
+            knobs["floorplan"] = {
+                "core_utilization": core.get("Utilitization"),
+                "margin": core.get("Margin"),
+                "aspect_ratio": core.get("Aspect ratio"),
+                **self._first_config_values(stages, "fp_default_config.json", {"tap_distance": ("Floorplan", "Tap distance")}),
+            }
+        placement = {
+            "target_density": parameters.get("Target density"),
+            "target_overflow": parameters.get("Target overflow"),
+            "global_right_padding": parameters.get("Global right padding"),
+            "cell_padding_x": parameters.get("Cell padding x"),
+            "routability_opt_flag": parameters.get("Routability opt flag"),
+        }
+        placement.update(
+            self._first_config_values(
+                stages,
+                "dreamplace.json",
+                {
+                    "num_bins_x": ("num_bins_x",),
+                    "num_bins_y": ("num_bins_y",),
+                    "global_place_stages": ("global_place_stages",),
+                    "density_weight": ("density_weight",),
+                    "random_seed": ("random_seed",),
+                    "route_num_bins_x": ("route_num_bins_x",),
+                    "route_num_bins_y": ("route_num_bins_y",),
+                    "unit_horizontal_capacity": ("unit_horizontal_capacity",),
+                    "unit_vertical_capacity": ("unit_vertical_capacity",),
+                    "max_route_opt_adjust_rate": ("max_route_opt_adjust_rate",),
+                },
+            )
+        )
+        placement.update(
+            self._first_config_values(
+                stages,
+                "pl_default_config.json",
+                {
+                    "ignore_net_degree": ("PL", "ignore_net_degree"),
+                    "num_threads": ("PL", "num_threads"),
+                    "gp_density": ("PL", "GP", "Density"),
+                    "gp_nesterov": ("PL", "GP", "Nesterov"),
+                    "lg": ("PL", "LG"),
+                    "dp": ("PL", "DP"),
+                },
+            )
+        )
+        knobs["placement"] = placement
+        knobs["fix_fanout"] = {
+            "max_fanout": parameters.get("Max fanout"),
+            **self._first_config_values(stages, "no_default_config_fixfanout.json", {"insert_buffer": ("insert_buffer",), "config_max_fanout": ("max_fanout",)}),
+        }
+        knobs["cts"] = self._first_config_values(
+            stages,
+            "cts_default_config.json",
+            {
+                "router_type": ("router_type",),
+                "cluster_type": ("cluster_type",),
+                "skew_bound": ("skew_bound",),
+                "max_buf_tran": ("max_buf_tran",),
+                "max_sink_tran": ("max_sink_tran",),
+                "max_cap": ("max_cap",),
+                "max_fanout": ("max_fanout",),
+                "routing_layer": ("routing_layer",),
+                "buffer_type": ("buffer_type",),
+                "root_buffer_type": ("root_buffer_type",),
+            },
+        )
+        knobs["routing"] = {
+            "bottom_routing_layer": parameters.get("Bottom layer"),
+            "top_routing_layer": parameters.get("Top layer"),
+            **self._first_config_values(
+                stages,
+                "rt_default_config.json",
+                {
+                    "thread_number": ("RT", "-thread_number"),
+                    "enable_timing": ("RT", "-enable_timing"),
+                    "output_csv": ("RT", "-output_csv"),
+                    "output_inter_result": ("RT", "-output_inter_result"),
+                    "config_bottom_routing_layer": ("RT", "-bottom_routing_layer"),
+                    "config_top_routing_layer": ("RT", "-top_routing_layer"),
+                },
+            ),
+        }
+        knobs["drc"] = self._first_config_values(stages, "drc_default_config.json", {"input": ("INPUT",), "output": ("OUTPUT",)})
+        pnp = self._first_config_values(stages, "pnp_default_config.json", {"egr": ("egr",), "grid": ("grid",), "simulated_annealing": ("simulated_annealing",), "templates": ("templates",)})
+        if pnp:
+            knobs["pnp"] = pnp
+        db_inputs = self._first_config_values(stages, "db_default_config.json", {"input": ("INPUT",), "layer_settings": ("LayerSettings",)})
+        if db_inputs:
+            knobs["database_inputs"] = db_inputs
+        stage_configs = self._collect_stage_configs(stages)
+        if stage_configs:
+            knobs["stage_configs"] = stage_configs
+        return knobs
+
+    def _collect_stage_configs(self, stages: list[StageInfo]) -> dict[str, Any]:
+        configs: dict[str, Any] = {}
+        for stage in stages:
+            stage_configs = {}
+            for path in sorted((stage.directory / "config").glob("*.json")):
+                payload = self._read_json(path)
+                if payload:
+                    stage_configs[path.name] = payload
+            if stage_configs:
+                configs[stage.name] = stage_configs
+        return configs
+
+    def _first_config_values(self, stages: list[StageInfo], filename: str, paths: dict[str, tuple[str, ...]]) -> dict[str, Any]:
+        for stage in stages:
+            config_path = stage.directory / "config" / filename
+            payload = self._read_json(config_path)
+            if not payload:
+                continue
+            values = {name: _get_nested(payload, path) for name, path in paths.items()}
+            return {name: value for name, value in values.items() if value is not None}
+        return {}
+
+    def _enrich_summary_metrics(
+        self,
+        metrics: dict[str, Any],
+        stages: list[StageInfo],
+        entity_counts: dict[str, dict[str, int]],
+        labels: dict[str, Any],
+        def_data: dict[str, DefData],
+        sta_reports: dict[str, dict[str, Any]],
+        drc_reports: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        enriched = json.loads(json.dumps(metrics))
+        for stage in stages:
+            stage_metrics = enriched.setdefault(stage.name, {})
+            stage_metrics["derived"] = self._stage_derived_metrics(stage, entity_counts, labels, def_data.get(stage.name), sta_reports.get(stage.name), drc_reports.get(stage.name))
+        return enriched
+
+    def _stage_derived_metrics(
+        self,
+        stage: StageInfo,
+        entity_counts: dict[str, dict[str, int]],
+        labels: dict[str, Any],
+        parsed_def: DefData | None,
+        sta_report: dict[str, Any] | None,
+        drc_report: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        derived = {f"{entity}_count": counts.get(stage.name, 0) for entity, counts in entity_counts.items()}
+        if parsed_def:
+            scale = _def_unit_scale(parsed_def)
+            derived.update(
+                {
+                    "def_units": parsed_def.units,
+                    "die_area": _bbox_area(_scale_bbox(parsed_def.diearea, scale) if parsed_def.diearea else None),
+                    "track_count": sum(track.count for track in parsed_def.tracks),
+                    "row_count": len(parsed_def.rows),
+                    "component_count": len(parsed_def.components),
+                    "pin_count_def": len(parsed_def.pins),
+                    "net_count_def": len(parsed_def.nets),
+                    "wire_count": sum(len(net.wires) for net in parsed_def.nets),
+                    "wire_length": sum(wire.length for net in parsed_def.nets for wire in net.wires) * scale,
+                    "via_count": sum(1 for net in parsed_def.nets for wire in net.wires if wire.via),
+                }
+            )
+        if sta_report:
+            slacks = [_to_float(record.get("slack")) for record in sta_report.get("records", []) if isinstance(record, dict)]
+            slacks = [value for value in slacks if value is not None]
+            derived["timing_path_count"] = len(sta_report.get("records", []))
+            derived["worst_slack"] = min(slacks) if slacks else None
+        if drc_report:
+            derived["drc_violation_count"] = drc_report.get("count", 0)
+        if stage.name == "route":
+            for key in (
+                "route_patch_overflow_count",
+                "route_native_demand_capacity_count",
+                "route_reconstructed_demand_capacity_count",
+                "route_reconstructed_congestion_count",
+            ):
+                derived[key] = labels.get(key, 0)
+            candidate = labels.get("candidate_qor_summary")
+            if isinstance(candidate, dict):
+                derived["candidate_qor_score"] = candidate.get("score")
+                derived["candidate_qor_available"] = candidate.get("available")
+        return derived
 
     def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict, *, options: dict[str, Any]) -> dict[str, Any]:
         del stages, raw_maps, summary
@@ -1172,6 +1444,64 @@ def _demand_capacity_source(label: dict[str, Any], reconstructed: dict[str, Any]
     if any(label.get(key) is not None for key in ("horizontal_demand_capacity", "vertical_demand_capacity", "union_demand_capacity")):
         return label
     return reconstructed
+
+
+def _strip_empty_info(flow: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(flow))
+    steps = normalized.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if isinstance(step, dict) and step.get("info") == {}:
+                step.pop("info", None)
+    return normalized
+
+
+def _merge_geometry(raw: Any, bbox: dict[str, float]) -> dict[str, Any]:
+    item = dict(raw) if isinstance(raw, dict) else {}
+    llx = float(bbox["llx"])
+    lly = float(bbox["lly"])
+    urx = float(bbox["urx"])
+    ury = float(bbox["ury"])
+    width = max(0.0, urx - llx)
+    height = max(0.0, ury - lly)
+    item["Size"] = [width, height]
+    item["Area"] = width * height
+    item["Bounding box"] = f"({llx} , {lly}) ({urx} , {ury})"
+    return item
+
+
+def _scale_bbox(bbox: dict[str, float] | None, scale: float) -> dict[str, float] | None:
+    if bbox is None:
+        return None
+    return {key: float(value) * scale for key, value in bbox.items()}
+
+
+def _layout_unit_scale(payload: dict[str, Any]) -> float:
+    raw_units = str(payload.get("units", "")).split()
+    if raw_units:
+        unit = _to_float(raw_units[0])
+        if unit is not None and unit > 0:
+            return unit
+    return 1.0
+
+
+def _def_unit_scale(parsed_def: DefData) -> float:
+    return 1.0 / float(parsed_def.units) if parsed_def.units else 1.0
+
+
+def _bbox_area(bbox: dict[str, Any] | None) -> float | None:
+    if not bbox:
+        return None
+    return max(0.0, float(bbox["urx"]) - float(bbox["llx"])) * max(0.0, float(bbox["ury"]) - float(bbox["lly"]))
+
+
+def _get_nested(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
+    value: Any = payload
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
 
 
 def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:

@@ -52,14 +52,29 @@ def _make_workspace(
         ws / "home" / "flow.json",
         {
             "steps": [
-                {"name": "Floorplan", "tool": "ecc", "state": "Success"},
+                {"name": "Floorplan", "tool": "ecc", "state": "Success", "info": {}},
                 {"name": "place", "tool": "dreamplace", "state": "Success"},
                 {"name": "route", "tool": "ecc", "state": "Success"},
                 {"name": "drc", "tool": "ecc", "state": "Success"},
             ]
         },
     )
-    _write_json(ws / "home" / "parameters.json", {"Core": {"Utilitization": 0.5}})
+    _write_json(
+        ws / "home" / "parameters.json",
+        {
+            "PDK": "ics55",
+            "Design": "gcd",
+            "Die": {"Size": [], "Area": 0},
+            "Core": {"Size": [], "Area": 0, "Utilitization": 0.5, "Margin": [2, 2], "Aspect ratio": 1},
+            "Max fanout": 20,
+            "Target density": 0.3,
+            "Target overflow": 0.1,
+            "Cell padding x": 600,
+            "Routability opt flag": 1,
+            "Bottom layer": "MET2",
+            "Top layer": "MET5",
+        },
+    )
     for stage_dir, stage_name in [
         ("Floorplan_ecc", "Floorplan"),
         ("place_dreamplace", "place"),
@@ -67,6 +82,9 @@ def _make_workspace(
         ("drc_ecc", "drc"),
     ]:
         _write_json(ws / stage_dir / "analysis" / f"{stage_name}_metrics.json", {"Tool": "ecc", "max_WNS": "1.0"})
+        _write_json(ws / stage_dir / "config" / "fp_default_config.json", {"Floorplan": {"Tap distance": 58}})
+        _write_json(ws / stage_dir / "config" / "pl_default_config.json", {"PL": {"GP": {"global_right_padding": 0}}})
+        _write_json(ws / stage_dir / "config" / "rt_default_config.json", {"RT": {"-bottom_routing_layer": "MET2", "-top_routing_layer": "MET5"}})
         _write_json(ws / stage_dir / "checklist.json", {"state": "Success"})
         _write_json(
             ws / stage_dir / "output" / f"gcd_{stage_name}.json",
@@ -307,6 +325,10 @@ END DESIGN
                 + "\n",
             )
         _write_json(
+            ws / "route_ecc" / "feature" / "route.step.json",
+            {"route": {"DR": [{"iter": 1, "total_wire_length": 800.0, "total_violation_num": 4, "total_via_num": 1}]}},
+        )
+        _write_json(
             ws / "route_ecc" / "data" / "sta" / "gcd.rpt.json",
             {
                 "summary": [{"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "max", "path_delay": "1.0", "path_required": "2.0", "slack": "1.0"}],
@@ -375,6 +397,22 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "maps/canonical/route/egr_overflow.json",
     ]:
         assert (foundation_dir / rel).exists(), rel
+
+    summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
+    assert "profile" not in summary
+    assert "created_at" not in summary
+    assert all("info" not in step for step in summary["flow"]["steps"])
+    assert summary["parameters"]["Die"]["Size"] == [200.0, 200.0]
+    assert summary["parameters"]["Die"]["Area"] == 40000.0
+    assert summary["parameters"]["Core"]["Size"] == [196.0, 196.0]
+    assert summary["parameters"]["Core"]["Area"] == 38416.0
+    assert summary["parameters"]["Core"]["Bounding box"] == "(2.0 , 2.0) (198.0 , 198.0)"
+    assert summary["parameters"]["control_knobs"]["source"] == "home_parameters_plus_stage_configs"
+    assert summary["parameters"]["control_knobs"]["placement"]["target_density"] == 0.3
+    assert summary["parameters"]["control_knobs"]["routing"]["top_routing_layer"] == "MET5"
+    assert summary["metrics"]["route"]["derived"]["wire_count"] > 0
+    assert summary["metrics"]["route"]["derived"]["route_patch_overflow_count"] == 4
+    assert "route.step.json" in summary["metrics"]["route"].get("features", {})
 
     manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest) == {"options", "workspace", "sources", "artifacts"}

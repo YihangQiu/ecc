@@ -17,6 +17,19 @@ class DefTrack:
 
 
 @dataclass(frozen=True)
+class DefRow:
+    name: str
+    site: str
+    x: float
+    y: float
+    orient: str
+    count_x: int
+    count_y: int
+    step_x: float
+    step_y: float
+
+
+@dataclass(frozen=True)
 class DefWire:
     net: str
     layer: str
@@ -54,6 +67,7 @@ class DefData:
     diearea: dict[str, float] | None
     gcell_x: list[float]
     gcell_y: list[float]
+    rows: list[DefRow]
     tracks: list[DefTrack]
     vias: list[dict[str, Any]]
     components: list[dict[str, Any]]
@@ -78,6 +92,7 @@ def parse_def(path: Path) -> DefData:
         diearea=diearea,
         gcell_x=_parse_gcell_axis(lines, "X"),
         gcell_y=_parse_gcell_axis(lines, "Y"),
+        rows=_parse_rows(lines),
         tracks=_parse_tracks(lines),
         vias=_parse_vias(lines),
         components=_parse_components(lines),
@@ -144,6 +159,30 @@ def _parse_tracks(lines: list[str]) -> list[DefTrack]:
                 )
             )
     return tracks
+
+
+def _parse_rows(lines: list[str]) -> list[DefRow]:
+    rows: list[DefRow] = []
+    for line in lines:
+        match = re.search(
+            r"ROW\s+(\S+)\s+(\S+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s+DO\s+(\d+)\s+BY\s+(\d+)\s+STEP\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)",
+            line,
+        )
+        if match:
+            rows.append(
+                DefRow(
+                    name=match.group(1),
+                    site=match.group(2),
+                    x=float(match.group(3)),
+                    y=float(match.group(4)),
+                    orient=match.group(5),
+                    count_x=int(match.group(6)),
+                    count_y=int(match.group(7)),
+                    step_x=float(match.group(8)),
+                    step_y=float(match.group(9)),
+                )
+            )
+    return rows
 
 
 def _parse_vias(lines: list[str]) -> list[dict[str, Any]]:
