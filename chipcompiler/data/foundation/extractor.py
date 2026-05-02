@@ -915,28 +915,25 @@ class FoundationExtractor:
         }
 
     def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict, *, options: dict[str, Any]) -> dict[str, Any]:
-        del stages, raw_maps
+        del stages, raw_maps, summary
         artifacts = {
-            "summary": str(self.foundation_dir / "summary.json"),
-            "stage_index": str(self.foundation_dir / "stage_index.json"),
-            "canonical_grid": str(self.foundation_dir / "canonical_grid.json"),
-            "quality": str(self.foundation_dir / "quality.json"),
-            "ml_view": str(self.foundation_dir / "views" / "ml" / "dataset_index.json"),
-            "agent_view": str(self.foundation_dir / "views" / "agent" / "run_summary.json"),
+            "summary": str((self.foundation_dir / "summary.json").relative_to(self.workspace_dir)),
+            "stage_index": str((self.foundation_dir / "stage_index.json").relative_to(self.workspace_dir)),
+            "canonical_grid": str((self.foundation_dir / "canonical_grid.json").relative_to(self.workspace_dir)),
+            "quality": str((self.foundation_dir / "quality.json").relative_to(self.workspace_dir)),
+            "ml_view": str((self.foundation_dir / "views" / "ml" / "dataset_index.json").relative_to(self.workspace_dir)),
+            "agent_view": str((self.foundation_dir / "views" / "agent" / "run_summary.json").relative_to(self.workspace_dir)),
         }
         if options.get("include_raw_refs"):
-            artifacts["raw_refs"] = str(self.foundation_dir / "raw_refs" / "artifacts.json")
+            artifacts["raw_refs"] = str((self.foundation_dir / "raw_refs" / "artifacts.json").relative_to(self.workspace_dir))
         return {
-            "version": 2,
-            "profile": self.profile,
             "options": options,
             "workspace": str(self.workspace_dir),
-            "created_at": summary["created_at"],
             "sources": self._source_signature(),
             "artifacts": artifacts,
         }
 
-    def _source_signature(self) -> dict[str, float]:
+    def _source_signature(self) -> list[str]:
         paths = [self.workspace_dir / "home" / "flow.json", self.workspace_dir / "home" / "parameters.json"]
         for stage_dir in self.workspace_dir.glob("*_*"):
             if not stage_dir.is_dir():
@@ -945,7 +942,7 @@ class FoundationExtractor:
                 root = stage_dir / folder
                 if root.exists():
                     paths.extend(path for path in root.rglob("*") if path.is_file())
-        return {str(path): path.stat().st_mtime for path in sorted(set(paths)) if path.exists()}
+        return [str(path.relative_to(self.workspace_dir)) for path in sorted(set(paths)) if path.exists()]
 
     def _write_views(self, summary: dict, metrics: dict, stage_index: dict, labels: dict, *, include_raw_refs: bool) -> None:
         write_json(

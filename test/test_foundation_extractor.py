@@ -307,6 +307,27 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     ]:
         assert (foundation_dir / rel).exists(), rel
 
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"options", "workspace", "sources", "artifacts"}
+    assert "version" not in manifest
+    assert "profile" not in manifest
+    assert "created_at" not in manifest
+    assert manifest["workspace"] == str(ws.resolve())
+    assert isinstance(manifest["sources"], list)
+    assert "home/flow.json" in manifest["sources"]
+    assert "place_dreamplace/analysis/place_metrics.json" in manifest["sources"]
+    assert all(not Path(source).is_absolute() for source in manifest["sources"])
+    assert all(isinstance(source, str) for source in manifest["sources"])
+    assert manifest["artifacts"] == {
+        "summary": "foundation_data/ecc/summary.json",
+        "stage_index": "foundation_data/ecc/stage_index.json",
+        "canonical_grid": "foundation_data/ecc/canonical_grid.json",
+        "quality": "foundation_data/ecc/quality.json",
+        "ml_view": "foundation_data/ecc/views/ml/dataset_index.json",
+        "agent_view": "foundation_data/ecc/views/agent/run_summary.json",
+        "raw_refs": "foundation_data/ecc/raw_refs/artifacts.json",
+    }
+
     grid = json.loads((foundation_dir / "canonical_grid.json").read_text(encoding="utf-8"))
     assert grid["rows"] == 2
     assert grid["cols"] == 2
