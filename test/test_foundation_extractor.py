@@ -255,6 +255,13 @@ END DESIGN
                             "overflow": 3,
                         },
                         {
+                            "gcell": [1, 0],
+                            "layer": "MET2",
+                            "direction": "horizontal",
+                            "capacity": 1,
+                            "demand": 5,
+                        },
+                        {
                             "gcell": [1, 1],
                             "layer": "MET2",
                             "direction": "horizontal",
@@ -299,6 +306,21 @@ END DESIGN
                                 "demand_capacity": 2.0,
                                 "utilization": 2.0,
                                 "overflow": 2.0,
+                                "source": "irt_space_router_native",
+                                "stage": "space_router_final",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "gcell": {"x": 1, "y": 0},
+                                "layer": "MET3",
+                                "layer_idx": 1,
+                                "direction": "vertical",
+                                "demand": 8.0,
+                                "capacity": 3.0,
+                                "demand_capacity": 5.0,
+                                "utilization": 2.6666666666666665,
+                                "overflow": 5.0,
                                 "source": "irt_space_router_native",
                                 "stage": "space_router_final",
                             }
@@ -441,7 +463,9 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert grid["grid_source"] == "irt_gcell_info"
     assert len(grid["patches"]) == 4
     assert grid["patches"][0]["bbox"] == {"llx": 0.0, "lly": 0.0, "urx": 120.0, "ury": 80.0}
-    assert grid["patches"][0]["gcell"] == {"x": 0, "y": 0}
+    assert grid["patches"][0]["row"] == 0
+    assert grid["patches"][0]["col"] == 0
+    assert "gcell" not in grid["patches"][0]
 
     canonical_place = json.loads((foundation_dir / "maps" / "canonical" / "place" / "egr_overflow.json").read_text())
     assert canonical_place["horizontal"] == [[5.0]]
@@ -471,6 +495,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert labels[0]["horizontal_capacity"] == 1.0
     assert labels[0]["horizontal_demand_capacity"] == 2.0
     assert labels[0]["horizontal_utilization"] == 3.0
+    assert labels[1]["horizontal_overflow"] == 4.0
+    assert labels[2]["horizontal_overflow"] == 0.0
     assert labels[3]["horizontal_overflow"] == 1.0
 
     native_demand_capacity = [
@@ -484,6 +510,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert native_demand_capacity[0]["horizontal_demand_capacity"] == 3.0
     assert native_demand_capacity[0]["vertical_demand_capacity"] == 2.0
     assert native_demand_capacity[0]["union_demand_capacity"] == 3.0
+    assert native_demand_capacity[1]["vertical_demand_capacity"] == 5.0
+    assert native_demand_capacity[2]["union_demand_capacity"] == 0.0
 
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
     pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route.jsonl").read_text().splitlines()]

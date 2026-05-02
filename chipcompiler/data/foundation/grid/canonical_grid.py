@@ -71,7 +71,6 @@ def build_gcell_patch_grid(cells: list[dict], *, source: str | None = None) -> d
                     "patch_id": row * cols + col,
                     "row": row,
                     "col": col,
-                    "gcell": {"x": col, "y": row},
                     "bbox": bbox,
                 }
             )

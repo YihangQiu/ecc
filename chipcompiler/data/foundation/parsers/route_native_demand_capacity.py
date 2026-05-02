@@ -64,7 +64,6 @@ def _labels_from_records(
             "patch_id": int(patch["patch_id"]),
             "row": int(patch["row"]),
             "col": int(patch["col"]),
-            "gcell": patch.get("gcell", {}),
             "horizontal_demand": 0.0,
             "horizontal_capacity": 0.0,
             "horizontal_overflow": 0.0,
@@ -80,15 +79,10 @@ def _labels_from_records(
     patches_by_coord = {
         (item["row"], item["col"]): patch_id for patch_id, item in patch_totals.items()
     }
-    patches_by_gcell = {}
-    for patch_id, item in patch_totals.items():
-        gcell = item.get("gcell")
-        if isinstance(gcell, dict) and gcell.get("x") is not None and gcell.get("y") is not None:
-            patches_by_gcell[(int(gcell["x"]), int(gcell["y"]))] = patch_id
 
     matched = False
     for record in records:
-        patch_id = _record_patch_id(record, canonical_grid, patches_by_coord, patches_by_gcell)
+        patch_id = _record_patch_id(record, canonical_grid, patches_by_coord)
         if patch_id is None or patch_id not in patch_totals:
             continue
         direction = _direction(record)
@@ -156,7 +150,6 @@ def _record_patch_id(
     record: dict[str, Any],
     canonical_grid: dict[str, Any],
     patches_by_coord: dict[tuple[int, int], int],
-    patches_by_gcell: dict[tuple[int, int], int],
 ) -> int | None:
     raw_patch_id = record.get("patch_id")
     if raw_patch_id is not None:
@@ -182,11 +175,11 @@ def _record_patch_id(
     if x is None or y is None:
         return None
     try:
-        gcell_key = (int(x), int(y))
+        gcell_key = (int(y), int(x))
     except (TypeError, ValueError):
         return None
-    if gcell_key in patches_by_gcell:
-        return patches_by_gcell[gcell_key]
+    if gcell_key in patches_by_coord:
+        return patches_by_coord[gcell_key]
     for patch in canonical_grid.get("patches", []):
         bbox = patch["bbox"]
         x_in_bbox = float(bbox["llx"]) <= float(x) <= float(bbox["urx"])
