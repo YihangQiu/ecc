@@ -44,7 +44,6 @@ def _make_workspace(
     *,
     include_route_artifacts: bool = True,
     include_route_maps: bool = True,
-    include_native_route_overflow: bool = True,
     include_native_demand_capacity: bool = True,
 ) -> Path:
     ws = tmp_path / "sample-ws"
@@ -230,47 +229,6 @@ END DESIGN
 """.strip()
             + "\n",
         )
-        if include_native_route_overflow:
-            _write_json(
-                ws / "route_ecc" / "data" / "rt" / "patch_overflow.json",
-                {
-                    "source": "router_native_overflow",
-                    "patches": [
-                        {
-                            "row": 0,
-                            "col": 0,
-                            "layer": "MET2",
-                            "direction": "horizontal",
-                            "capacity": 1,
-                            "demand": 3,
-                            "overflow": 2,
-                        },
-                        {
-                            "row": 0,
-                            "col": 0,
-                            "layer": "MET3",
-                            "direction": "vertical",
-                            "capacity": 1,
-                            "demand": 4,
-                            "overflow": 3,
-                        },
-                        {
-                            "gcell": [1, 0],
-                            "layer": "MET2",
-                            "direction": "horizontal",
-                            "capacity": 1,
-                            "demand": 5,
-                        },
-                        {
-                            "gcell": [1, 1],
-                            "layer": "MET2",
-                            "direction": "horizontal",
-                            "capacity": 1,
-                            "demand": 2,
-                        },
-                    ],
-                },
-            )
         if include_native_demand_capacity:
             _write_text(
                 ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.jsonl",
@@ -402,7 +360,6 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "canonical_grid.json",
         "views/ml/dataset_index.json",
         "views/agent/run_summary.json",
-        "labels/route_patch_overflow.jsonl",
         "labels/route_native_demand_capacity.jsonl",
         "labels/route_reconstructed_demand_capacity.jsonl",
         "vectors/instances/place.jsonl",
@@ -433,7 +390,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert summary["parameters"]["control_knobs"]["placement"]["target_density"] == 0.3
     assert summary["parameters"]["control_knobs"]["routing"]["top_routing_layer"] == "MET5"
     assert summary["metrics"]["route"]["derived"]["wire_count"] > 0
-    assert summary["metrics"]["route"]["derived"]["route_patch_overflow_count"] == 4
+    assert "route_patch_overflow_count" not in summary["metrics"]["route"]["derived"]
     assert "route.step.json" in summary["metrics"]["route"].get("features", {})
 
     manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -487,17 +444,9 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert all("availability" not in item for item in instances)
     assert any(item["is_macro"] for item in instances)
 
-    labels = [json.loads(line) for line in (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text().splitlines()]
-    assert {item["source"] for item in labels} == {"router_native_overflow"}
-    assert labels[0]["horizontal_overflow"] == 2.0
-    assert labels[0]["vertical_overflow"] == 3.0
-    assert labels[0]["horizontal_demand"] == 3.0
-    assert labels[0]["horizontal_capacity"] == 1.0
-    assert labels[0]["horizontal_demand_capacity"] == 2.0
-    assert labels[0]["horizontal_utilization"] == 3.0
-    assert labels[1]["horizontal_overflow"] == 4.0
-    assert labels[2]["horizontal_overflow"] == 0.0
-    assert labels[3]["horizontal_overflow"] == 1.0
+    assert not (foundation_dir / "labels" / "route_patch_overflow.jsonl").exists()
+    assert not (foundation_dir / "labels" / "route_hotspot_top5.jsonl").exists()
+    assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
 
     native_demand_capacity = [
         json.loads(line)
@@ -532,7 +481,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "bbox" not in patches[0]
     assert "availability" not in patches[0]
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
-    assert patches[0]["route_true_overflow"]["union"] == 3.0
+    assert "route_true_overflow" not in patches[0]
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
     assert patches[0]["route_native_demand_capacity"]["horizontal"] == 3.0
     assert patches[0]["route_native_demand_capacity"]["vertical"] == 2.0
@@ -555,7 +504,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert quality["availability"]["instances"]["place"] == "available"
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "available"
     assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
-    assert quality["availability"]["labels"]["route_patch_overflow"] == "available"
+    assert "route_patch_overflow" not in quality["availability"]["labels"]
     assert quality["availability"]["drc"]["drc"] == "available"
     assert quality["availability"]["timing_paths"]["route"] == "available"
     assert "null_reason" in quality
@@ -567,39 +516,33 @@ def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     foundation_dir = ws / "foundation_data" / "ecc"
-    labels = (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text(encoding="utf-8")
-    candidate = json.loads((foundation_dir / "labels" / "candidate_qor_summary.json").read_text(encoding="utf-8"))
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
 
-    assert labels == ""
-    assert candidate["available"] is False
-    assert candidate["score"] is None
-    assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
+    assert not (foundation_dir / "labels" / "route_patch_overflow.jsonl").exists()
+    assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
+    assert "route_patch_overflow" not in quality["availability"].get("labels", {})
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
-    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
     assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
-    assert summary["labels"]["route_patch_overflow_count"] == 0
+    assert "route_patch_overflow_count" not in summary["labels"]
     assert summary["labels"]["route_native_demand_capacity_count"] == 0
 
 
 def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(tmp_path: Path):
-    ws = _make_workspace(tmp_path, include_native_route_overflow=False, include_native_demand_capacity=False)
+    ws = _make_workspace(tmp_path, include_native_demand_capacity=False)
 
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     foundation_dir = ws / "foundation_data" / "ecc"
-    true_labels = (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text(encoding="utf-8")
     reconstructed = [
         json.loads(line)
         for line in (foundation_dir / "labels" / "route_reconstructed_congestion.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
-    candidate = json.loads((foundation_dir / "labels" / "candidate_qor_summary.json").read_text(encoding="utf-8"))
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
 
-    assert true_labels == ""
+    assert not (foundation_dir / "labels" / "route_patch_overflow.jsonl").exists()
     assert reconstructed
     assert {item["source"] for item in reconstructed} == {"routed_def_tracks_reconstruction"}
     assert reconstructed[0]["horizontal_overflow"] == 1.0
@@ -609,19 +552,18 @@ def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(t
     assert reconstructed[0]["horizontal_demand_capacity"] == 1.0
     assert reconstructed[0]["horizontal_utilization"] == 2.0
     native = (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8")
-    assert patches[0]["route_true_overflow"]["union"] is None
+    assert "route_true_overflow" not in patches[0]
     assert patches[0]["route_native_demand_capacity"]["union"] is None
     assert patches[0]["route_reconstructed_demand_capacity"]["union"] == 1.0
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
     assert patches[0]["route_demand_capacity"]["horizontal"] == 1.0
     assert patches[0]["route_demand_capacity"]["vertical"] == 1.0
     assert patches[0]["route_demand_capacity"]["source"] == "routed_def_tracks_reconstruction"
-    assert candidate["available"] is False
+    assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
     assert native == ""
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
     assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
-    assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
-    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
+    assert "route_patch_overflow" not in quality["availability"].get("labels", {})
     assert quality["availability"]["labels"]["route_reconstructed_congestion"] == "available"
     assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
 
@@ -659,8 +601,7 @@ def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
     assert "raw_refs" not in manifest["artifacts"]
     assert evidence["raw_refs"] is None
     assert evidence["raw_refs_disabled"] is True
-    assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
-    assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"
+    assert "route_patch_overflow" not in quality["availability"].get("labels", {})
 
 
 def test_iccd_full_v1_rejects_unknown_stage_filter(tmp_path: Path):

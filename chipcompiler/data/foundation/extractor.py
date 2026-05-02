@@ -12,7 +12,6 @@ from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.gcell import parse_gcell_info
 from .parsers.map_csv import read_numeric_csv, shape
 from .parsers.route_native_demand_capacity import parse_route_native_demand_capacity_artifacts
-from .parsers.route_overflow import parse_route_overflow_artifacts
 from .parsers.rt_log import parse_rt_log
 from .parsers.sta_parser import parse_sta_artifacts
 from .schema import ExtractionResult
@@ -70,10 +69,9 @@ class FoundationExtractor:
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
-        native_route_overflow = parse_route_overflow_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         reconstructed_congestion = self._route_reconstructed_congestion(canonical_grid, def_data.get("route"), rt_logs.get("route"))
-        labels = self._write_labels(canonical_grid, native_route_overflow.get("labels", []), native_demand_capacity.get("labels", []), reconstructed_congestion, rt_logs.get("route"))
+        labels = self._write_labels(native_demand_capacity.get("labels", []), reconstructed_congestion)
         self._write_tech(def_data, rt_logs)
         entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
@@ -427,9 +425,6 @@ class FoundationExtractor:
         drc_reports: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, int]]:
         counts: dict[str, dict[str, int]] = {entity: {} for entity in _ENTITY_NAMES}
-        route_labels_by_patch = {
-            item["patch_id"]: item for item in labels.get("_route_patch_overflow_records", [])
-        }
         native_demand_capacity_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_native_demand_capacity_records", [])
         }
@@ -463,7 +458,6 @@ class FoundationExtractor:
                 nets,
                 pins,
                 wires,
-                route_labels_by_patch if stage.name == "route" else {},
                 native_demand_capacity_by_patch if stage.name == "route" else {},
                 reconstructed_by_patch if stage.name == "route" else {},
                 timing_paths,
@@ -680,7 +674,6 @@ class FoundationExtractor:
         nets: list[dict[str, Any]],
         pins: list[dict[str, Any]],
         wires: list[dict[str, Any]],
-        route_labels_by_patch: dict[int, dict[str, Any]],
         native_demand_capacity_by_patch: dict[int, dict[str, Any]],
         reconstructed_by_patch: dict[int, dict[str, Any]],
         timing_paths: list[dict[str, Any]],
@@ -702,7 +695,6 @@ class FoundationExtractor:
             for wire in patch_wires:
                 layer = str(wire.get("layer"))
                 wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
-            label = route_labels_by_patch.get(int(patch["patch_id"]), {})
             native_demand_capacity = native_demand_capacity_by_patch.get(int(patch["patch_id"]), {})
             reconstructed = reconstructed_by_patch.get(int(patch["patch_id"]), {})
             patch_drc = _drc_for_patch(drc_report, bbox)
@@ -717,12 +709,6 @@ class FoundationExtractor:
                 "net_count": len(net_names) if net_names else (len(nets) if not patch_wires and stage == "route" else 0),
                 "pin_count": len(pins) if stage == "route" and row == 0 and col == 0 else 0,
                 "wire_length_by_layer": wire_length_by_layer,
-                "route_true_overflow": {
-                    "horizontal": label.get("horizontal_overflow"),
-                    "vertical": label.get("vertical_overflow"),
-                    "union": label.get("union_overflow"),
-                    "by_layer": label.get("by_layer", {}),
-                },
                 "route_reconstructed_congestion": {
                     "horizontal": reconstructed.get("horizontal_overflow"),
                     "vertical": reconstructed.get("vertical_overflow"),
@@ -752,14 +738,9 @@ class FoundationExtractor:
 
     def _write_labels(
         self,
-        canonical_grid: dict,
-        route_labels: list[dict[str, Any]],
         native_demand_capacity: list[dict[str, Any]],
         reconstructed_congestion: list[dict[str, Any]],
-        rt_log: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        rows = int(canonical_grid["rows"])
-        cols = int(canonical_grid["cols"])
         write_jsonl(self.foundation_dir / "labels" / "route_native_demand_capacity.jsonl", native_demand_capacity)
         self._mark(
             "labels",
@@ -781,57 +762,10 @@ class FoundationExtractor:
             "available" if reconstructed_congestion else "missing",
             "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
         )
-        if not route_labels:
-            write_jsonl(self.foundation_dir / "labels" / "route_patch_overflow.jsonl", [])
-            for percent in (5, 10, 20):
-                write_jsonl(self.foundation_dir / "labels" / f"route_hotspot_top{percent}.jsonl", [])
-            candidate_summary = {
-                "available": False,
-                "score_kind": "route_true_overflow_plus_guardrails",
-                "score_semantics": "Lower is better; combines top-average router-native true overflow and route guardrail totals for candidate strategy ranking.",
-                "top_average": {"horizontal": None, "vertical": None, "union": None},
-                "patch_count": rows * cols,
-                "score": None,
-                "null_reason": "missing_router_native_route_overflow_artifact",
-            }
-            write_json(self.foundation_dir / "labels" / "candidate_qor_summary.json", candidate_summary)
-            self._mark("labels", "route_patch_overflow", "missing", "missing_router_native_route_overflow_artifact")
-            self._quality.setdefault("warnings", []).append("router-native route overflow artifact missing/incomplete; true route labels were not generated")
-            return {
-                "route_patch_overflow_count": 0,
-                "route_native_demand_capacity_count": len(native_demand_capacity),
-                "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
-                "route_reconstructed_congestion_count": len(reconstructed_congestion),
-                "candidate_qor_summary": candidate_summary,
-                "_route_patch_overflow_records": [],
-                "_route_native_demand_capacity_records": native_demand_capacity,
-                "_route_reconstructed_congestion_records": reconstructed_congestion,
-            }
-
-        write_jsonl(self.foundation_dir / "labels" / "route_patch_overflow.jsonl", route_labels)
-        for percent in (5, 10, 20):
-            write_jsonl(self.foundation_dir / "labels" / f"route_hotspot_top{percent}.jsonl", _hotspot_records(route_labels, percent))
-        top_average = _label_top_average(route_labels)
-        totals = (rt_log or {}).get("totals", {})
-        candidate_summary = {
-            "available": True,
-            "score_kind": "route_true_overflow_plus_guardrails",
-            "score_semantics": "Lower is better; combines top-average router-native true overflow and route guardrail totals for candidate strategy ranking.",
-            "source": "router_native_overflow",
-            "top_average": top_average,
-            "patch_count": rows * cols,
-            "route_totals": totals,
-        }
-        candidate_summary["score"] = float(top_average.get("horizontal") or 0.0) + float(top_average.get("vertical") or 0.0) + float(totals.get("total_overflow") or 0.0)
-        write_json(self.foundation_dir / "labels" / "candidate_qor_summary.json", candidate_summary)
-        self._mark("labels", "route_patch_overflow", "available")
         return {
-            "route_patch_overflow_count": len(route_labels),
             "route_native_demand_capacity_count": len(native_demand_capacity),
             "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
             "route_reconstructed_congestion_count": len(reconstructed_congestion),
-            "candidate_qor_summary": candidate_summary,
-            "_route_patch_overflow_records": route_labels,
             "_route_native_demand_capacity_records": native_demand_capacity,
             "_route_reconstructed_congestion_records": reconstructed_congestion,
         }
@@ -1227,16 +1161,11 @@ class FoundationExtractor:
             derived["drc_violation_count"] = drc_report.get("count", 0)
         if stage.name == "route":
             for key in (
-                "route_patch_overflow_count",
                 "route_native_demand_capacity_count",
                 "route_reconstructed_demand_capacity_count",
                 "route_reconstructed_congestion_count",
             ):
                 derived[key] = labels.get(key, 0)
-            candidate = labels.get("candidate_qor_summary")
-            if isinstance(candidate, dict):
-                derived["candidate_qor_score"] = candidate.get("score")
-                derived["candidate_qor_available"] = candidate.get("available")
         return derived
 
     def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict, *, options: dict[str, Any]) -> dict[str, Any]:
@@ -1278,7 +1207,7 @@ class FoundationExtractor:
                 "vectors_dir": "vectors",
                 "maps_dir": "maps/canonical",
                 "labels_dir": "labels",
-                "tasks": ["patch_hotspot", "directional_overflow", "candidate_topavg_overflow"],
+                "tasks": ["route_demand_capacity"],
             },
         )
         write_json(self.foundation_dir / "views" / "ml" / "patch_memory_index.json", {"canonical_grid": "canonical_grid.json", "progressive_inputs": {"P1": ["Floorplan"], "P2": ["Floorplan", "place"], "P3": ["Floorplan", "place", "CTS"]}})
@@ -1289,7 +1218,6 @@ class FoundationExtractor:
                 "workspace": summary["workspace"],
                 "stages": summary["stages"],
                 "entity_counts": summary["entity_counts"],
-                "qor_summary": labels.get("candidate_qor_summary", {}),
                 "quality_warnings": self._quality.get("warnings", []),
                 "evidence_index": "views/agent/evidence_index.json",
             },
@@ -1399,26 +1327,6 @@ def _bbox_intersects_bbox(a: dict[str, Any], b: dict[str, Any]) -> bool:
         or float(a["ury"]) < float(b["lly"])
         or float(a["lly"]) > float(b["ury"])
     )
-
-
-def _hotspot_records(labels: list[dict[str, Any]], percent: int) -> list[dict[str, Any]]:
-    if not labels:
-        return []
-    sorted_labels = sorted(labels, key=lambda item: float(item.get("union_overflow") or 0.0), reverse=True)
-    count = max(1, int(len(sorted_labels) * percent / 100.0))
-    hot_ids = {item["patch_id"] for item in sorted_labels[:count]}
-    return [{**item, "is_hotspot": item["patch_id"] in hot_ids, "top_percent": percent} for item in labels]
-
-
-def _label_top_average(labels: list[dict[str, Any]]) -> dict[str, float | None]:
-    def avg_top(key: str) -> float | None:
-        values = sorted((float(item.get(key) or 0.0) for item in labels), reverse=True)
-        if not values:
-            return None
-        count = max(1, int(len(values) * 0.1))
-        return sum(values[:count]) / count
-
-    return {"horizontal": avg_top("horizontal_overflow"), "vertical": avg_top("vertical_overflow"), "union": avg_top("union_overflow")}
 
 
 def _demand_capacity_label(label: dict[str, Any]) -> dict[str, Any]:
