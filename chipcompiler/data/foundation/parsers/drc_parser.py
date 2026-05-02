@@ -43,7 +43,6 @@ def _parse_violation_map(path: Path) -> list[dict[str, Any]]:
                 "bbox": bbox,
                 "count": int(item.get("count") or 1),
                 "source": str(path),
-                "availability": "available",
                 "null_reason": {} if bbox else {"bbox": "missing_violation_bbox"},
             }
         )

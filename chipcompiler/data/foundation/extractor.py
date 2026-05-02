@@ -384,14 +384,13 @@ class FoundationExtractor:
                         "track_axes": [],
                         "preferred_direction": None,
                         "source": "def_tracks",
-                        "availability": "available",
                     },
                 )
                 item["track_axes"].append({"axis": track.axis, "start": track.start, "count": track.count, "step": track.step, "stage": stage_name})
             for component in parsed.components:
                 cell = cells_by_name.setdefault(
                     component["master"],
-                    {"name": component["master"], "instance_count": 0, "source": "def_components", "availability": "available"},
+                    {"name": component["master"], "instance_count": 0, "source": "def_components"},
                 )
                 cell["instance_count"] += 1
             for via in parsed.vias:
@@ -399,12 +398,12 @@ class FoundationExtractor:
             for net in parsed.nets:
                 for wire in net.wires:
                     if wire.via:
-                        vias_by_name.setdefault(wire.via, {"name": wire.via, "layers": [], "source": "def_routed_wires", "availability": "available"})
+                        vias_by_name.setdefault(wire.via, {"name": wire.via, "layers": [], "source": "def_routed_wires"})
         for parsed in rt_logs.values():
             for layer in parsed.get("layers", []):
                 item = layers_by_name.setdefault(
                     layer["name"],
-                    {"name": layer["name"], "track_axes": [], "source": "rt_log", "availability": "available"},
+                    {"name": layer["name"], "track_axes": [], "source": "rt_log"},
                 )
                 item["preferred_direction"] = layer.get("preferred_direction")
                 item["order"] = layer.get("order")
@@ -440,7 +439,7 @@ class FoundationExtractor:
             wires = self._wire_records(stage, parsed_def)
             routing_graphs = self._routing_graph_records(stage, parsed_def)
             timing_paths = self._timing_path_records(stage, sta_reports.get(stage.name))
-            counts["instances"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "instances" / f"{stage.name}-00000.jsonl", instances)
+            counts["instances"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl", instances)
             stage_vectors = {
                 "nets": nets,
                 "pins": pins,
@@ -449,7 +448,7 @@ class FoundationExtractor:
                 "timing_paths": timing_paths,
             }
             for entity, records in stage_vectors.items():
-                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}-00000.jsonl", records)
+                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records)
                 self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
                 stage.name,
@@ -464,7 +463,7 @@ class FoundationExtractor:
                 timing_paths,
                 drc_reports.get(stage.name),
             )
-            counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}-00000.jsonl", patches)
+            counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
         return counts
 
@@ -498,7 +497,6 @@ class FoundationExtractor:
                         "orientation": None,
                         "is_macro": "macro" in lower or "sram" in lower or "mem" in lower,
                         "source": str(layout_path.relative_to(self.workspace_dir)),
-                        "availability": "available",
                         "null_reason": {
                             "master": "layout_json_missing_master",
                             "orientation": "layout_json_missing_orientation",
@@ -532,7 +530,6 @@ class FoundationExtractor:
                     "via_count": sum(1 for wire in wires if wire.via),
                     "bbox": {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)} if xs and ys else None,
                     "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                    "availability": "available",
                     "null_reason": {"bbox": "no_routed_wires"} if not xs or not ys else {},
                 }
             )
@@ -552,7 +549,6 @@ class FoundationExtractor:
                     "pin_name": pin.get("pin_name"),
                     "direction": pin.get("direction"),
                     "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                    "availability": "available",
                     "null_reason": {"direction": "def_net_connection_missing_direction"} if pin.get("direction") is None else {},
                 }
             )
@@ -583,7 +579,6 @@ class FoundationExtractor:
             "via": wire.via,
             "special": wire.special,
             "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-            "availability": "available",
             "null_reason": {"width": "def_route_missing_width"} if wire.width is None else {},
         }
 
@@ -609,7 +604,6 @@ class FoundationExtractor:
                     "vertices": [{"id": vid, "x": x, "y": y, "layer": layer} for (x, y, layer), vid in vertices.items()],
                     "edges": edges,
                     "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                    "availability": "available",
                 }
             )
         return records
@@ -644,7 +638,6 @@ class FoundationExtractor:
                     "path_required": _to_float(item.get("path_required")),
                     "slack": _to_float(item.get("slack")),
                     "source": str((stage.directory / "data" / "sta" / "gcd.rpt.json").relative_to(self.workspace_dir)),
-                    "availability": "available",
                 }
             )
         for path in sorted((stage.directory / "data" / "sta" / "wire_paths").glob("*.json")):
@@ -710,7 +703,6 @@ class FoundationExtractor:
                 "stage": stage,
                 "row": row,
                 "col": col,
-                "bbox": bbox,
                 "instance_count": len(patch_instances),
                 "instance_area": sum(float(item.get("area") or 0.0) for item in patch_instances),
                 "macro_area": sum(float(item.get("area") or 0.0) for item in patch_instances if item.get("is_macro")),
@@ -743,7 +735,6 @@ class FoundationExtractor:
                 "egr_overflow_vertical": _matrix_value(egr_maps.get("vertical"), row, col),
                 "egr_overflow_union": _matrix_value(egr_maps.get("union"), row, col),
                 "source": "canonical_grid",
-                "availability": "available",
             }
             records.append(record)
         return records
@@ -1023,7 +1014,7 @@ def _drc_for_patch(drc_report: dict[str, Any] | None, bbox: dict[str, Any]) -> d
     violations = drc_report.get("violations", [])
     if not violations:
         total = int(drc_report.get("count") or 0)
-        return {"count": 0 if total == 0 else None, "by_type": {}, "by_layer": {}, "unlocalized_count": total or 0, "availability": "available"}
+        return {"count": 0 if total == 0 else None, "by_type": {}, "by_layer": {}, "unlocalized_count": total or 0}
     count = 0
     by_type: dict[str, int] = {}
     by_layer: dict[str, int] = {}
@@ -1043,7 +1034,7 @@ def _drc_for_patch(drc_report: dict[str, Any] | None, bbox: dict[str, Any]) -> d
         if layer:
             layer_name = str(layer)
             by_layer[layer_name] = by_layer.get(layer_name, 0) + amount
-    return {"count": count, "by_type": by_type, "by_layer": by_layer, "unlocalized_count": unlocalized, "availability": "available"}
+    return {"count": count, "by_type": by_type, "by_layer": by_layer, "unlocalized_count": unlocalized}
 
 
 def _timing_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:

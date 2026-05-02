@@ -28,7 +28,6 @@ def parse_rt_log(path: Path) -> dict[str, Any]:
                     "name": layer_match.group(3),
                     "preferred_direction": layer_match.group(4).lower(),
                     "source": "rt_log",
-                    "availability": "available",
                 }
             )
         for total_match in _TOTAL_RE.finditer(line):

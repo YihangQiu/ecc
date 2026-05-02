@@ -292,16 +292,16 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "views/ml/dataset_index.json",
         "views/agent/run_summary.json",
         "labels/route_patch_overflow.jsonl",
-        "vectors/instances/place-00000.jsonl",
+        "vectors/instances/place.jsonl",
         "vectors/tech/layers.json",
         "vectors/tech/cells.json",
         "vectors/tech/vias.json",
-        "vectors/nets/route-00000.jsonl",
-        "vectors/pins/route-00000.jsonl",
-        "vectors/wires/route-00000.jsonl",
-        "vectors/routing_graphs/route-00000.jsonl",
-        "vectors/timing_paths/route-00000.jsonl",
-        "vectors/patches/place-00000.jsonl",
+        "vectors/nets/route.jsonl",
+        "vectors/pins/route.jsonl",
+        "vectors/wires/route.jsonl",
+        "vectors/routing_graphs/route.jsonl",
+        "vectors/timing_paths/route.jsonl",
+        "vectors/patches/place.jsonl",
         "maps/canonical/place/density.json",
         "maps/canonical/route/egr_overflow.json",
     ]:
@@ -330,8 +330,9 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     canonical_rudy = json.loads((foundation_dir / "maps" / "canonical" / "place" / "rudy.json").read_text())
     assert canonical_rudy["rudy_union"] == [[50.0, 51.0], [52.0, 53.0]]
 
-    instances = [json.loads(line) for line in (foundation_dir / "vectors" / "instances" / "place-00000.jsonl").read_text().splitlines()]
+    instances = [json.loads(line) for line in (foundation_dir / "vectors" / "instances" / "place.jsonl").read_text().splitlines()]
     assert {item["name"] for item in instances} == {"Instance_U1", "Macro_SRAM0"}
+    assert all("availability" not in item for item in instances)
     assert any(item["is_macro"] for item in instances)
 
     labels = [json.loads(line) for line in (foundation_dir / "labels" / "route_patch_overflow.jsonl").read_text().splitlines()]
@@ -340,11 +341,12 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert labels[0]["vertical_overflow"] == 3.0
     assert labels[3]["horizontal_overflow"] == 1.0
 
-    nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route-00000.jsonl").read_text().splitlines()]
-    pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route-00000.jsonl").read_text().splitlines()]
-    wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route-00000.jsonl").read_text().splitlines()]
-    timing_paths = [json.loads(line) for line in (foundation_dir / "vectors" / "timing_paths" / "route-00000.jsonl").read_text().splitlines()]
+    nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
+    pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route.jsonl").read_text().splitlines()]
+    wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route.jsonl").read_text().splitlines()]
+    timing_paths = [json.loads(line) for line in (foundation_dir / "vectors" / "timing_paths" / "route.jsonl").read_text().splitlines()]
     assert nets[0]["name"] == "n1"
+    assert all("availability" not in item for item in [*nets, *pins, *wires, *timing_paths])
     assert any(pin["pin_name"] == "OUT" for pin in pins)
     assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
     assert timing_paths and timing_paths[0]["slack"] == 1.0
@@ -353,8 +355,10 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert timing_paths[0]["wire_electrical"]["max_slew"] == 0.6
     assert timing_paths[0]["wire_electrical"]["resistance_sum"] == 1.5
 
-    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
+    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
     assert patches[0]["net_count"] >= 1
+    assert "bbox" not in patches[0]
+    assert "availability" not in patches[0]
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
     assert patches[0]["route_true_overflow"]["union"] == 3.0
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
@@ -362,7 +366,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert patches[0]["electrical"]["capacitance_sum"] == 0.5
     assert patches[0]["electrical"]["max_slew"] == 0.6
 
-    drc_patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "drc-00000.jsonl").read_text().splitlines()]
+    drc_patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "drc.jsonl").read_text().splitlines()]
     assert drc_patches[0]["drc"]["count"] == 2
     assert drc_patches[0]["drc"]["by_type"] == {"short": 2}
     assert drc_patches[-1]["drc"]["count"] == 1
@@ -409,7 +413,7 @@ def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(t
     ]
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     candidate = json.loads((foundation_dir / "labels" / "candidate_qor_summary.json").read_text(encoding="utf-8"))
-    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route-00000.jsonl").read_text().splitlines()]
+    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
 
     assert true_labels == ""
     assert reconstructed
@@ -449,8 +453,8 @@ def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
 
     assert [item["name"] for item in summary["stages"]] == ["place"]
-    assert (foundation_dir / "vectors" / "instances" / "place-00000.jsonl").exists()
-    assert not (foundation_dir / "vectors" / "instances" / "route-00000.jsonl").exists()
+    assert (foundation_dir / "vectors" / "instances" / "place.jsonl").exists()
+    assert not (foundation_dir / "vectors" / "instances" / "route.jsonl").exists()
     assert not (foundation_dir / "raw_refs" / "artifacts.json").exists()
     assert manifest["options"]["stages"] == ["place"]
     assert manifest["options"]["include_raw_refs"] is False

@@ -38,7 +38,6 @@ def parse_sta_artifacts(stage_dir: Path) -> dict[str, Any]:
                 "wire_path_nodes": electrical["nodes"],
                 "source": str(rpt_path),
                 "wire_path_source": str(wire_path) if wire_path else None,
-                "availability": "available",
                 "null_reason": {} if wire_path else {"wire_path_source": "missing_wire_path_artifact"},
             }
         )

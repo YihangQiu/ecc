@@ -161,7 +161,7 @@ def _parse_vias(lines: list[str]) -> list[dict[str, Any]]:
             layers = []
             if "+ LAYERS" in stripped:
                 layers = stripped.split("+ LAYERS", 1)[1].replace(";", "").split()[:3]
-            vias.append({"name": tokens[1], "layers": layers, "source": "def_vias", "availability": "available"})
+            vias.append({"name": tokens[1], "layers": layers, "source": "def_vias"})
     return vias
 
 
@@ -189,7 +189,6 @@ def _parse_components(lines: list[str]) -> list[dict[str, Any]]:
                 "origin": {"x": float(placed.group(1)), "y": float(placed.group(2))} if placed else None,
                 "orientation": placed.group(3) if placed else None,
                 "source": "def_components",
-                "availability": "available",
             }
         )
     return components
@@ -214,7 +213,7 @@ def _parse_pins(lines: list[str]) -> list[dict[str, Any]]:
             if current:
                 pins.append(current)
             tokens = stripped.split()
-            current = {"pin_name": tokens[1], "instance": "PIN", "source": "def_pins", "availability": "available"}
+            current = {"pin_name": tokens[1], "instance": "PIN", "source": "def_pins"}
         if current is None:
             continue
         net_match = re.search(r"\+\s+NET\s+(\S+)", stripped)
@@ -261,7 +260,7 @@ def _net_from_chunks(name: str, chunks: list[str], *, special: bool) -> DefNet:
     text = " ".join(chunks)
     connection_text = re.split(r"\+\s+(?:ROUTED|FIXED|COVER|NEW)\b", text, maxsplit=1)[0]
     pins = [
-        {"instance": inst, "pin_name": pin, "net": name, "source": "def_net_connections", "availability": "available"}
+        {"instance": inst, "pin_name": pin, "net": name, "source": "def_net_connections"}
         for inst, pin in _PIN_RE.findall(connection_text)
         if not _looks_numeric(inst) and not _looks_numeric(pin) and "*" not in {inst, pin}
     ]
