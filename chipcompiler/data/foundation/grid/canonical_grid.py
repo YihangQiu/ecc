@@ -48,4 +48,42 @@ def build_patch_grid(rows: int, cols: int, die_bbox: dict[str, float] | None = N
                     },
                 }
             )
-    return {"rows": rows, "cols": cols, "die_bbox": bbox, "patches": patches}
+    return {"rows": rows, "cols": cols, "die_bbox": bbox, "grid_source": "uniform_shape", "patches": patches}
+
+
+def build_gcell_patch_grid(cells: list[dict], *, source: str | None = None) -> dict:
+    if not cells:
+        return build_patch_grid(1, 1)
+    max_x = max(int(cell["x"]) for cell in cells)
+    max_y = max(int(cell["y"]) for cell in cells)
+    cols = max_x + 1
+    rows = max_y + 1
+    by_coord = {(int(cell["x"]), int(cell["y"])): cell for cell in cells}
+    patches = []
+    for row in range(rows):
+        for col in range(cols):
+            cell = by_coord.get((col, row))
+            if cell is None:
+                continue
+            bbox = {key: float(value) for key, value in cell["bbox"].items()}
+            patches.append(
+                {
+                    "patch_id": row * cols + col,
+                    "row": row,
+                    "col": col,
+                    "gcell": {"x": col, "y": row},
+                    "bbox": bbox,
+                }
+            )
+    llx = min(float(cell["bbox"]["llx"]) for cell in cells)
+    lly = min(float(cell["bbox"]["lly"]) for cell in cells)
+    urx = max(float(cell["bbox"]["urx"]) for cell in cells)
+    ury = max(float(cell["bbox"]["ury"]) for cell in cells)
+    return {
+        "rows": rows,
+        "cols": cols,
+        "die_bbox": {"llx": llx, "lly": lly, "urx": urx, "ury": ury},
+        "grid_source": "irt_gcell_info",
+        "source": source,
+        "patches": patches,
+    }

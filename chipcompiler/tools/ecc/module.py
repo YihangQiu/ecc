@@ -271,6 +271,12 @@ class ECCToolsModule:
         generate cts map feature
         """
         self.ecc.feature_cts_eval(json_path, map_grid_size)
+
+    def feature_gcell_patch_map(self, json_path: str, stage: str):
+        """
+        generate gcell-aligned patch map features using ecc-tools/iDB data
+        """
+        self.ecc.feature_gcell_patch_eval(json_path, stage)
     
     ########################################################################    
     # DRC api

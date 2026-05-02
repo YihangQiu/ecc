@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .grid.canonical_grid import build_patch_grid, resize_nearest
+from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resize_nearest
 from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.def_parser import DefData, DefWire, parse_def
+from .parsers.gcell import parse_gcell_info
 from .parsers.map_csv import read_numeric_csv, shape
 from .parsers.route_overflow import parse_route_overflow_artifacts
 from .parsers.rt_log import parse_rt_log
@@ -50,6 +51,7 @@ class FoundationExtractor:
         self.foundation_dir = self.workspace_dir / FOUNDATION_REL
         self._quality: dict[str, Any] = {"profile": profile, "availability": {}, "null_reason": {}, "warnings": []}
         self._raw_refs: list[dict[str, Any]] = []
+        self._exact_gcell_map_keys: set[tuple[str, str, str]] = set()
 
     def extract(self, *, force: bool = False, stages: Any = "all", include_raw_refs: bool = True) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
@@ -65,8 +67,8 @@ class FoundationExtractor:
         drc_reports = self._collect_drc_reports(selected_stages)
         raw_maps = self._collect_raw_maps(selected_stages)
         die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
-        canonical_grid = self._build_canonical_grid(raw_maps, die_bbox)
-        canonical_maps = self._write_maps(raw_maps, canonical_grid)
+        canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
+        canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_route_overflow = parse_route_overflow_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         reconstructed_congestion = self._route_reconstructed_congestion(canonical_grid, def_data.get("route"), rt_logs.get("route"))
@@ -202,8 +204,18 @@ class FoundationExtractor:
                 if not matrix:
                     continue
                 category, key = self._classify_map(csv_path)
-                stage_maps.setdefault(category, {})[key] = matrix
-                self._record_raw_ref(stage, csv_path, "map_csv", {"category": category, "key": key, "shape": shape(matrix)})
+                exact_gcell_map = "gcell_patch_map" in csv_path.parts
+                if exact_gcell_map:
+                    self._exact_gcell_map_keys.add((stage.name, category, key))
+                if key in stage_maps.setdefault(category, {}) and not exact_gcell_map and (stage.name, category, key) in self._exact_gcell_map_keys:
+                    continue
+                stage_maps[category][key] = matrix
+                self._record_raw_ref(
+                    stage,
+                    csv_path,
+                    "gcell_patch_map_csv" if exact_gcell_map else "map_csv",
+                    {"category": category, "key": key, "shape": shape(matrix), "grid_source": "irt_gcell_info" if exact_gcell_map else "tool_default"},
+                )
             if stage_maps:
                 out[stage.name] = stage_maps
                 self._quality.setdefault("availability", {}).setdefault("maps", {})[stage.name] = "available"
@@ -262,7 +274,16 @@ class FoundationExtractor:
             return None
         return {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)}
 
-    def _build_canonical_grid(self, raw_maps: dict[str, dict[str, dict[str, list[list[float]]]]], die_bbox: dict[str, float] | None) -> dict:
+    def _build_canonical_grid(self, raw_maps: dict[str, dict[str, dict[str, list[list[float]]]]], die_bbox: dict[str, float] | None, stages: list[StageInfo]) -> dict:
+        gcell = self._discover_gcell_info(stages)
+        if gcell:
+            path, cells = gcell
+            try:
+                self._record_raw_ref(next(stage for stage in stages if path.is_relative_to(stage.directory)), path, "irt_gcell_info", {"cells": len(cells)})
+            except (StopIteration, ValueError):
+                pass
+            self._mark("grid", "canonical", "available")
+            return build_gcell_patch_grid(cells, source=str(path.relative_to(self.workspace_dir)) if path.is_relative_to(self.workspace_dir) else str(path))
         rows = 1
         cols = 1
         for stage_maps in raw_maps.values():
@@ -271,19 +292,84 @@ class FoundationExtractor:
                     src_rows, src_cols = shape(matrix)
                     rows = max(rows, src_rows)
                     cols = max(cols, src_cols)
+        self._mark("grid", "canonical", "available")
         return build_patch_grid(rows, cols, die_bbox)
 
-    def _write_maps(self, raw_maps: dict[str, dict[str, dict[str, list[list[float]]]]], canonical_grid: dict) -> dict[str, dict[str, dict[str, list[list[float]]]]]:
+    def _discover_gcell_info(self, stages: list[StageInfo]) -> tuple[Path, list[dict[str, Any]]] | None:
+        candidates: list[Path] = []
+        for preferred in ("route", "CTS", "place"):
+            candidates.extend(
+                stage.directory / "data" / "rt" / "rt_temp_directory" / "early_router" / "gcell.info"
+                for stage in stages
+                if stage.name == preferred
+            )
+        candidates.extend(stage.directory / "data" / "rt" / "rt_temp_directory" / "early_router" / "gcell.info" for stage in stages)
+        for path in candidates:
+            if not path.exists():
+                continue
+            cells = parse_gcell_info(path)
+            if cells:
+                return path, cells
+        return None
+
+    def _write_maps(
+        self,
+        raw_maps: dict[str, dict[str, dict[str, list[list[float]]]]],
+        canonical_grid: dict,
+        stages: list[StageInfo],
+        def_data: dict[str, DefData],
+    ) -> dict[str, dict[str, dict[str, list[list[float]]]]]:
         rows = int(canonical_grid["rows"])
         cols = int(canonical_grid["cols"])
+        stages_by_name = {stage.name: stage for stage in stages}
         canonical: dict[str, dict[str, dict[str, list[list[float]]]]] = {}
         for stage, stage_maps in raw_maps.items():
             for category, category_maps in stage_maps.items():
-                normalized = {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
+                normalized = self._canonicalize_maps_for_grid(
+                    category,
+                    category_maps,
+                    canonical_grid,
+                    stages_by_name.get(stage),
+                    def_data.get(stage),
+                    rows,
+                    cols,
+                )
                 canonical.setdefault(stage, {})[category] = normalized
                 write_json(self.foundation_dir / "maps" / "canonical" / stage / f"{category}.json", normalized)
                 write_json(self.foundation_dir / "maps" / "raw" / stage / f"{category}.json", category_maps)
         return canonical
+
+    def _canonicalize_maps_for_grid(
+        self,
+        category: str,
+        category_maps: dict[str, list[list[float]]],
+        canonical_grid: dict,
+        stage: StageInfo | None,
+        parsed_def: DefData | None,
+        rows: int,
+        cols: int,
+    ) -> dict[str, list[list[float]]]:
+        if category == "egr_overflow":
+            for key, matrix in category_maps.items():
+                src_shape = shape(matrix)
+                if src_shape != (rows, cols):
+                    self._quality.setdefault("warnings", []).append(
+                        f"egr map {stage.name if stage else 'unknown'}:{key} shape {src_shape} does not match canonical gcell grid {(rows, cols)}; kept raw without resize"
+                    )
+            return {key: [[float(value) for value in row] for row in matrix] for key, matrix in category_maps.items()}
+        if canonical_grid.get("grid_source") == "irt_gcell_info" and stage is not None and category in {"density", "rudy", "margin"}:
+            exact_maps = {
+                key: [[float(value) for value in row] for row in matrix]
+                for key, matrix in category_maps.items()
+                if (stage.name, category, key) in self._exact_gcell_map_keys and shape(matrix) == (rows, cols)
+            }
+            missing_maps = {key: matrix for key, matrix in category_maps.items() if key not in exact_maps}
+            if missing_maps:
+                self._quality.setdefault("warnings", []).append(
+                    f"exact ecc-tools gcell patch maps missing for {stage.name}:{category}:{sorted(missing_maps)}; omitted approximate Python recomputation"
+                )
+            return exact_maps
+        return {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
 
     def _write_tech(self, def_data: dict[str, DefData], rt_logs: dict[str, dict[str, Any]]) -> None:
         layers_by_name: dict[str, dict[str, Any]] = {}

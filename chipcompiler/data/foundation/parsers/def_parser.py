@@ -223,6 +223,10 @@ def _parse_pins(lines: list[str]) -> list[dict[str, Any]]:
         direction_match = re.search(r"\+\s+DIRECTION\s+(\S+)", stripped)
         if direction_match:
             current["direction"] = direction_match.group(1)
+        placed = _PLACED_RE.search(stripped)
+        if placed:
+            current["origin"] = {"x": float(placed.group(1)), "y": float(placed.group(2))}
+            current["orientation"] = placed.group(3)
     return pins
 
 

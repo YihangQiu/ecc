@@ -53,6 +53,7 @@ def _labels_from_records(records: list[dict[str, Any]], canonical_grid: dict[str
             "patch_id": int(patch["patch_id"]),
             "row": int(patch["row"]),
             "col": int(patch["col"]),
+            "gcell": patch.get("gcell", {}),
             "horizontal_overflow": 0.0,
             "vertical_overflow": 0.0,
             "by_layer": {},
@@ -62,8 +63,14 @@ def _labels_from_records(records: list[dict[str, Any]], canonical_grid: dict[str
         for patch in canonical_grid.get("patches", [])
     }
     patches_by_coord = {(item["row"], item["col"]): patch_id for patch_id, item in patch_totals.items()}
+    patches_by_gcell = {}
+    for patch_id, item in patch_totals.items():
+        gcell = item.get("gcell")
+        if not isinstance(gcell, dict) or gcell.get("x") is None or gcell.get("y") is None:
+            continue
+        patches_by_gcell[(int(gcell["x"]), int(gcell["y"]))] = patch_id
     for record in records:
-        patch_id = _record_patch_id(record, canonical_grid, patches_by_coord)
+        patch_id = _record_patch_id(record, canonical_grid, patches_by_coord, patches_by_gcell)
         if patch_id is None or patch_id not in patch_totals:
             continue
         direction = str(record.get("direction") or record.get("orient") or "").lower()
@@ -89,7 +96,12 @@ def _labels_from_records(records: list[dict[str, Any]], canonical_grid: dict[str
     return labels
 
 
-def _record_patch_id(record: dict[str, Any], canonical_grid: dict[str, Any], patches_by_coord: dict[tuple[int, int], int]) -> int | None:
+def _record_patch_id(
+    record: dict[str, Any],
+    canonical_grid: dict[str, Any],
+    patches_by_coord: dict[tuple[int, int], int],
+    patches_by_gcell: dict[tuple[int, int], int],
+) -> int | None:
     raw_patch_id = record.get("patch_id")
     if raw_patch_id is not None:
         try:
@@ -108,6 +120,12 @@ def _record_patch_id(record: dict[str, Any], canonical_grid: dict[str, Any], pat
     if x is None or y is None:
         gcell = record.get("gcell")
         if isinstance(gcell, list | tuple) and len(gcell) >= 2:
+            try:
+                gcell_key = (int(gcell[0]), int(gcell[1]))
+            except (TypeError, ValueError):
+                return None
+            if gcell_key in patches_by_gcell:
+                return patches_by_gcell[gcell_key]
             x, y = gcell[0], gcell[1]
     if x is None or y is None:
         return None

@@ -24,6 +24,21 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _write_sample_gcell_info(stage_dir: Path) -> None:
+    _write_text(
+        stage_dir / "data" / "rt" / "rt_temp_directory" / "early_router" / "gcell.info",
+        "\n".join(
+            [
+                "0,0,0,0,120,80",
+                "0,1,0,80,120,200",
+                "1,0,120,0,200,80",
+                "1,1,120,80,200,200",
+            ]
+        )
+        + "\n",
+    )
+
+
 def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, include_route_maps: bool = True, include_native_route_overflow: bool = True) -> Path:
     ws = tmp_path / "sample-ws"
     _write_json(
@@ -72,8 +87,42 @@ def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, inc
         )
 
     _write_csv(ws / "place_dreamplace" / "feature" / "density_map" / "place_allcell_density.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "density_map" / "place_macro_density.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "density_map" / "place_stdcell_density.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "margin_map" / "place_horizontal_margin.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "margin_map" / "place_vertical_margin.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "margin_map" / "place_union_margin.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "RUDY_map" / "place_rudy_union.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_density.csv", [[10, 11], [12, 13]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_pin_density.csv", [[20, 21], [22, 23]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allnet_density.csv", [[30, 31], [32, 33]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "margin_map" / "place_union_margin.csv", [[40, 41], [42, 43]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_rudy_union.csv", [[50, 51], [52, 53]])
     _write_csv(ws / "place_dreamplace" / "feature" / "egr_congestion_map" / "place_egr_horizontal_overflow.csv", [[5]])
     _write_csv(ws / "place_dreamplace" / "feature" / "egr_congestion_map" / "place_egr_vertical_overflow.csv", [[7]])
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( U1 A ) ( PIN OUT ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_sample_gcell_info(ws / "place_dreamplace")
     _write_json(
         ws / "place_dreamplace" / "feature" / "place.map.json",
         {
@@ -82,8 +131,8 @@ def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, inc
                 "map": {"egr": {"horizontal": "egr_congestion_map/place_egr_horizontal_overflow.csv", "vertical": "egr_congestion_map/place_egr_vertical_overflow.csv"}},
                 "overflow": {"top_average": {"horizontal": 5, "vertical": 7}},
             },
-        },
-    )
+            },
+        )
     if include_route_maps:
         _write_csv(ws / "route_ecc" / "feature" / "egr_congestion_map" / "route_egr_horizontal_overflow.csv", [[1, 0], [2, 3]])
         _write_csv(ws / "route_ecc" / "feature" / "egr_congestion_map" / "route_egr_vertical_overflow.csv", [[0, 4], [1, 1]])
@@ -104,6 +153,7 @@ def _make_workspace(tmp_path: Path, *, include_route_artifacts: bool = True, inc
             },
         )
     if include_route_artifacts:
+        _write_sample_gcell_info(ws / "route_ecc")
         _write_text(
             ws / "route_ecc" / "output" / "gcd_route.def",
             """
@@ -179,6 +229,13 @@ END DESIGN
                             "demand": 4,
                             "overflow": 3,
                         },
+                        {
+                            "gcell": [1, 1],
+                            "layer": "MET2",
+                            "direction": "horizontal",
+                            "capacity": 1,
+                            "demand": 2,
+                        },
                     ],
                 },
             )
@@ -253,11 +310,25 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     grid = json.loads((foundation_dir / "canonical_grid.json").read_text(encoding="utf-8"))
     assert grid["rows"] == 2
     assert grid["cols"] == 2
+    assert grid["grid_source"] == "irt_gcell_info"
     assert len(grid["patches"]) == 4
+    assert grid["patches"][0]["bbox"] == {"llx": 0.0, "lly": 0.0, "urx": 120.0, "ury": 80.0}
+    assert grid["patches"][0]["gcell"] == {"x": 0, "y": 0}
 
     canonical_place = json.loads((foundation_dir / "maps" / "canonical" / "place" / "egr_overflow.json").read_text())
-    assert canonical_place["horizontal"] == [[5.0, 5.0], [5.0, 5.0]]
-    assert canonical_place["vertical"] == [[7.0, 7.0], [7.0, 7.0]]
+    assert canonical_place["horizontal"] == [[5.0]]
+    assert canonical_place["vertical"] == [[7.0]]
+
+    canonical_density = json.loads((foundation_dir / "maps" / "canonical" / "place" / "density.json").read_text())
+    assert canonical_density["place_allcell_density"] == [[10.0, 11.0], [12.0, 13.0]]
+    assert canonical_density["place_allcell_pin_density"] == [[20.0, 21.0], [22.0, 23.0]]
+    assert canonical_density["place_allnet_density"] == [[30.0, 31.0], [32.0, 33.0]]
+
+    canonical_margin = json.loads((foundation_dir / "maps" / "canonical" / "place" / "margin.json").read_text())
+    assert canonical_margin["union"] == [[40.0, 41.0], [42.0, 43.0]]
+
+    canonical_rudy = json.loads((foundation_dir / "maps" / "canonical" / "place" / "rudy.json").read_text())
+    assert canonical_rudy["rudy_union"] == [[50.0, 51.0], [52.0, 53.0]]
 
     instances = [json.loads(line) for line in (foundation_dir / "vectors" / "instances" / "place-00000.jsonl").read_text().splitlines()]
     assert {item["name"] for item in instances} == {"Instance_U1", "Macro_SRAM0"}
@@ -267,6 +338,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert {item["source"] for item in labels} == {"router_native_overflow"}
     assert labels[0]["horizontal_overflow"] == 2.0
     assert labels[0]["vertical_overflow"] == 3.0
+    assert labels[3]["horizontal_overflow"] == 1.0
 
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route-00000.jsonl").read_text().splitlines()]
     pins = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route-00000.jsonl").read_text().splitlines()]
