@@ -360,6 +360,10 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert {item["source"] for item in labels} == {"router_native_overflow"}
     assert labels[0]["horizontal_overflow"] == 2.0
     assert labels[0]["vertical_overflow"] == 3.0
+    assert labels[0]["horizontal_demand"] == 3.0
+    assert labels[0]["horizontal_capacity"] == 1.0
+    assert labels[0]["horizontal_demand_capacity"] == 2.0
+    assert labels[0]["horizontal_utilization"] == 3.0
     assert labels[3]["horizontal_overflow"] == 1.0
 
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
@@ -383,6 +387,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
     assert patches[0]["route_true_overflow"]["union"] == 3.0
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
+    assert patches[0]["route_demand_capacity"]["horizontal"] == 2.0
+    assert patches[0]["route_demand_capacity"]["vertical"] == 3.0
     assert patches[0]["timing"]["worst_slack"] == 1.0
     assert patches[0]["electrical"]["capacitance_sum"] == 0.5
     assert patches[0]["electrical"]["max_slew"] == 0.6
@@ -393,7 +399,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert drc_patches[-1]["drc"]["count"] == 1
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
-    assert quality["profile"] == "iccd_full_v1"
+    assert "profile" not in quality
     assert quality["availability"]["instances"]["place"] == "available"
     assert quality["availability"]["labels"]["route_patch_overflow"] == "available"
     assert quality["availability"]["drc"]["drc"] == "available"
@@ -441,8 +447,14 @@ def test_iccd_full_v1_separates_reconstructed_congestion_from_true_route_label(t
     assert {item["source"] for item in reconstructed} == {"routed_def_tracks_reconstruction"}
     assert reconstructed[0]["horizontal_overflow"] == 1.0
     assert reconstructed[0]["vertical_overflow"] == 1.0
+    assert reconstructed[0]["horizontal_demand"] == 2.0
+    assert reconstructed[0]["horizontal_capacity"] == 1.0
+    assert reconstructed[0]["horizontal_demand_capacity"] == 1.0
+    assert reconstructed[0]["horizontal_utilization"] == 2.0
     assert patches[0]["route_true_overflow"]["union"] is None
     assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
+    assert patches[0]["route_demand_capacity"]["horizontal"] == 1.0
+    assert patches[0]["route_demand_capacity"]["vertical"] == 1.0
     assert candidate["available"] is False
     assert quality["availability"]["labels"]["route_patch_overflow"] == "missing"
     assert quality["null_reason"]["labels"]["route_patch_overflow"] == "missing_router_native_route_overflow_artifact"

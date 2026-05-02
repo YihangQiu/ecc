@@ -49,7 +49,7 @@ class FoundationExtractor:
         self.workspace_dir = Path(workspace_dir).expanduser().resolve()
         self.profile = profile
         self.foundation_dir = self.workspace_dir / FOUNDATION_REL
-        self._quality: dict[str, Any] = {"profile": profile, "availability": {}, "null_reason": {}, "warnings": []}
+        self._quality: dict[str, Any] = {"availability": {}, "null_reason": {}, "warnings": []}
         self._raw_refs: list[dict[str, Any]] = []
         self._exact_gcell_map_keys: set[tuple[str, str, str]] = set()
 
@@ -721,6 +721,7 @@ class FoundationExtractor:
                     "union": reconstructed.get("union_overflow"),
                     "by_layer": reconstructed.get("by_layer", {}),
                 },
+                "route_demand_capacity": _demand_capacity_label(_demand_capacity_source(label, reconstructed)),
                 "drc": patch_drc,
                 "timing": _timing_for_patch(timing_paths),
                 "electrical": _electrical_for_patch(timing_paths),
@@ -804,7 +805,7 @@ class FoundationExtractor:
         rows = int(canonical_grid["rows"])
         cols = int(canonical_grid["cols"])
         demand = {(row, col): {"horizontal": 0.0, "vertical": 0.0, "by_layer": {}} for row in range(rows) for col in range(cols)}
-        supply = {(row, col): {"horizontal": 0.0, "vertical": 0.0} for row in range(rows) for col in range(cols)}
+        capacity = {(row, col): {"horizontal": 0.0, "vertical": 0.0} for row in range(rows) for col in range(cols)}
         for track in parsed_def.tracks:
             direction = "horizontal" if track.axis == "Y" else "vertical"
             for idx in range(track.count):
@@ -814,9 +815,9 @@ class FoundationExtractor:
                     row = int(patch["row"])
                     col = int(patch["col"])
                     if direction == "horizontal" and float(bbox["lly"]) <= pos <= float(bbox["ury"]):
-                        supply[(row, col)][direction] += 1.0
+                        capacity[(row, col)][direction] += 1.0
                     if direction == "vertical" and float(bbox["llx"]) <= pos <= float(bbox["urx"]):
-                        supply[(row, col)][direction] += 1.0
+                        capacity[(row, col)][direction] += 1.0
         for wire in routed_wires:
             direction = wire.direction
             for patch in canonical_grid.get("patches", []):
@@ -836,14 +837,29 @@ class FoundationExtractor:
                 h = v = 0.0
                 by_layer_overflow = {}
             else:
-                h = max(0.0, demand[(row, col)]["horizontal"] - supply[(row, col)]["horizontal"])
-                v = max(0.0, demand[(row, col)]["vertical"] - supply[(row, col)]["vertical"])
+                h = max(0.0, demand[(row, col)]["horizontal"] - capacity[(row, col)]["horizontal"])
+                v = max(0.0, demand[(row, col)]["vertical"] - capacity[(row, col)]["vertical"])
                 by_layer_overflow = demand[(row, col)]["by_layer"]
+            horizontal_demand = demand[(row, col)]["horizontal"]
+            vertical_demand = demand[(row, col)]["vertical"]
+            horizontal_capacity = capacity[(row, col)]["horizontal"]
+            vertical_capacity = capacity[(row, col)]["vertical"]
+            horizontal_demand_capacity = horizontal_demand - horizontal_capacity
+            vertical_demand_capacity = vertical_demand - vertical_capacity
             labels.append(
                 {
                     "patch_id": patch["patch_id"],
                     "row": row,
                     "col": col,
+                    "horizontal_demand": horizontal_demand,
+                    "vertical_demand": vertical_demand,
+                    "horizontal_capacity": horizontal_capacity,
+                    "vertical_capacity": vertical_capacity,
+                    "horizontal_demand_capacity": horizontal_demand_capacity,
+                    "vertical_demand_capacity": vertical_demand_capacity,
+                    "union_demand_capacity": max(horizontal_demand_capacity, vertical_demand_capacity),
+                    "horizontal_utilization": _safe_ratio(horizontal_demand, horizontal_capacity),
+                    "vertical_utilization": _safe_ratio(vertical_demand, vertical_capacity),
                     "horizontal_overflow": h,
                     "vertical_overflow": v,
                     "union_overflow": max(h, v),
@@ -1094,6 +1110,37 @@ def _label_top_average(labels: list[dict[str, Any]]) -> dict[str, float | None]:
         return sum(values[:count]) / count
 
     return {"horizontal": avg_top("horizontal_overflow"), "vertical": avg_top("vertical_overflow"), "union": avg_top("union_overflow")}
+
+
+def _demand_capacity_label(label: dict[str, Any]) -> dict[str, Any]:
+    h_demand = label.get("horizontal_demand")
+    v_demand = label.get("vertical_demand")
+    h_capacity = label.get("horizontal_capacity")
+    v_capacity = label.get("vertical_capacity")
+    return {
+        "horizontal": label.get("horizontal_demand_capacity"),
+        "vertical": label.get("vertical_demand_capacity"),
+        "union": label.get("union_demand_capacity"),
+        "horizontal_demand": h_demand,
+        "vertical_demand": v_demand,
+        "horizontal_capacity": h_capacity,
+        "vertical_capacity": v_capacity,
+        "horizontal_utilization": label.get("horizontal_utilization"),
+        "vertical_utilization": label.get("vertical_utilization"),
+        "source": label.get("source"),
+    }
+
+
+def _demand_capacity_source(label: dict[str, Any], reconstructed: dict[str, Any]) -> dict[str, Any]:
+    if any(label.get(key) is not None for key in ("horizontal_demand_capacity", "vertical_demand_capacity", "union_demand_capacity")):
+        return label
+    return reconstructed
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator / denominator
 
 
 def _to_float(value: Any) -> float | None:

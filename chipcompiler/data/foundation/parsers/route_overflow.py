@@ -79,20 +79,30 @@ def _labels_from_records(records: list[dict[str, Any]], canonical_grid: dict[str
         overflow = _overflow(record)
         if overflow is None:
             continue
+        demand = _float_or_none(record.get("demand"))
+        capacity = _float_or_none(record.get("capacity"))
         item = patch_totals[patch_id]
         layer = str(record.get("layer") or record.get("layer_name") or "unknown")
         layer_item = item["by_layer"].setdefault(layer, {"horizontal": 0.0, "vertical": 0.0})
         if direction == "vertical":
             item["vertical_overflow"] += overflow
+            _accumulate_optional(item, "vertical_demand", demand)
+            _accumulate_optional(item, "vertical_capacity", capacity)
+            _accumulate_optional(layer_item, "vertical_demand", demand)
+            _accumulate_optional(layer_item, "vertical_capacity", capacity)
             layer_item["vertical"] += overflow
         else:
             item["horizontal_overflow"] += overflow
+            _accumulate_optional(item, "horizontal_demand", demand)
+            _accumulate_optional(item, "horizontal_capacity", capacity)
+            _accumulate_optional(layer_item, "horizontal_demand", demand)
+            _accumulate_optional(layer_item, "horizontal_capacity", capacity)
             layer_item["horizontal"] += overflow
     labels = []
     for item in patch_totals.values():
         h = float(item["horizontal_overflow"])
         v = float(item["vertical_overflow"])
-        labels.append({**item, "union_overflow": max(h, v)})
+        labels.append({**item, **_demand_capacity_fields(item), "union_overflow": max(h, v)})
     return labels
 
 
@@ -143,6 +153,44 @@ def _overflow(record: dict[str, Any]) -> float | None:
         capacity = record.get("capacity")
         if demand is not None and capacity is not None:
             value = max(0.0, float(demand) - float(capacity))
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _accumulate_optional(item: dict[str, Any], key: str, value: float | None) -> None:
+    if value is not None:
+        item[key] = float(item.get(key) or 0.0) + value
+
+
+def _demand_capacity_fields(item: dict[str, Any]) -> dict[str, float | None]:
+    h_demand = _float_or_none(item.get("horizontal_demand"))
+    v_demand = _float_or_none(item.get("vertical_demand"))
+    h_capacity = _float_or_none(item.get("horizontal_capacity"))
+    v_capacity = _float_or_none(item.get("vertical_capacity"))
+    h_margin = None if h_demand is None or h_capacity is None else h_demand - h_capacity
+    v_margin = None if v_demand is None or v_capacity is None else v_demand - v_capacity
+    return {
+        "horizontal_demand": h_demand,
+        "vertical_demand": v_demand,
+        "horizontal_capacity": h_capacity,
+        "vertical_capacity": v_capacity,
+        "horizontal_demand_capacity": h_margin,
+        "vertical_demand_capacity": v_margin,
+        "union_demand_capacity": max(value for value in (h_margin, v_margin) if value is not None) if h_margin is not None or v_margin is not None else None,
+        "horizontal_utilization": _safe_ratio(h_demand, h_capacity),
+        "vertical_utilization": _safe_ratio(v_demand, v_capacity),
+    }
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator / denominator
+
+
+def _float_or_none(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
