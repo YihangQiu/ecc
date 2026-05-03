@@ -86,6 +86,7 @@ def save_data(workspace: Workspace,
                     top_module=workspace.design.top_module,
                     lib_paths=workspace.pdk.libs,
                     sdc_path=workspace.pdk.sdc)
+    ecc_module.build_timing_rc_tree(routing_type="ROUTED")
     ecc_module.report_timing()
     
     # update parameters

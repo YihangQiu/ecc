@@ -720,6 +720,9 @@ class ECCToolsModule:
     def update_timing(self):
         return self.ecc.update_timing()
 
+    def build_timing_rc_tree(self, routing_type: str = "HPWL"):
+        return self.ecc.build_timing_rc_tree(routing_type)
+
     def write_abstract_lef(self, output_lef_path: str):
         return self.ecc.write_abstract_lef(output_lef_path)
 
