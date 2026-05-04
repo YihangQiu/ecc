@@ -188,6 +188,7 @@ ROW ROW_0 core 0 0 N DO 2 BY 1 STEP 50 10 ;
 COMPONENTS 2 ;
 - U1 NAND2 + PLACED ( 10 20 ) N ;
 - MAC0 SRAM + PLACED ( 50 50 ) N ;
+- ENDCAP_0 FILLTAPH7R + FIXED ( 0 0 ) N + SIZE 50 BY 20 ;
 END COMPONENTS
 PINS 1 ;
 - OUT + NET n1 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
@@ -196,6 +197,12 @@ NETS 2 ;
 - n1 ( U1 A ) ( PIN OUT ) ;
 - n2 ( MAC0 A ) ( U1 Y ) ;
 END NETS
+SPECIALNETS 1 ;
+- VDD ( * VDD )
+  + USE POWER
+  + ROUTED MET2 10 ( 0 50 ) ( 200 * )
+  ;
+END SPECIALNETS
 END DESIGN
 """.strip()
         + "\n",
@@ -608,14 +615,24 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_pin_density.csv", [[132, 133], [134, 135]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[110, 111], [112, 113]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "margin_map" / "cts_union_margin.csv", [[120, 121], [122, 123]])
+    floorplan_layout = json.loads((ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.json").read_text(encoding="utf-8"))
+    floorplan_layout["data"].append(
+        {
+            "type": "group",
+            "struct name": "Instance_ENDCAP_0",
+            "children": [
+                {"type": "box", "layer": 0, "path": [[0, 0], [50, 0], [50, 20], [0, 20], [0, 0]]}
+            ],
+        }
+    )
+    _write_json(ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.json", floorplan_layout)
 
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     foundation_dir = ws / "foundation_data" / "ecc"
     for rel in [
         "maps/Floorplan/density.json",
-        "maps/Floorplan/rudy.json",
-        "maps/Floorplan/margin.json",
+        "maps/Floorplan/floorplan.json",
         "maps/place/density.json",
         "maps/place/egr_overflow.json",
         "maps/CTS/density.json",
@@ -623,19 +640,24 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
         assert (foundation_dir / rel).exists(), rel
 
     floorplan_density = json.loads((foundation_dir / "maps" / "Floorplan" / "density.json").read_text(encoding="utf-8"))
-    assert floorplan_density["stage"] == "Floorplan"
-    assert floorplan_density["category"] == "density"
-    assert floorplan_density["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
-    assert "matrix" not in floorplan_density["maps"]["allcell_density"]
-    floorplan_values = floorplan_density["maps"]["allcell_density"]["values"]
-    assert len(floorplan_values) == 4
-    assert floorplan_values[0] == {"patch_id": 0, "row": 0, "col": 0, "value": 0.10416666666666667}
-    assert {item["patch_id"] for item in floorplan_values} == {0, 1, 2, 3}
-    assert all({"patch_id", "row", "col", "value"} == set(item) for item in floorplan_values)
+    assert set(floorplan_density["maps"]) == {
+        "allcell_density",
+        "macro_density",
+        "stdcell_density",
+        "allcell_pin_density",
+        "macro_pin_density",
+        "stdcell_pin_density",
+        "allnet_density",
+        "local_net_density",
+        "global_net_density",
+    }
+    assert [item["value"] for item in floorplan_density["maps"]["allcell_density"]["values"]] == [0.0, 0.0, 0.0, 0.0]
 
-    floorplan_margin = json.loads((foundation_dir / "maps" / "Floorplan" / "margin.json").read_text(encoding="utf-8"))
-    assert set(floorplan_margin["maps"]) == {"horizontal", "vertical", "union"}
-    assert floorplan_margin["maps"]["union"]["values"][0]["row"] == 0
+    floorplan_specific = json.loads((foundation_dir / "maps" / "Floorplan" / "floorplan.json").read_text(encoding="utf-8"))
+    assert floorplan_specific["category"] == "floorplan"
+    assert [item["value"] for item in floorplan_specific["maps"]["io_pin_density"]["values"]] == [0.0, 1.0, 0.0, 0.0]
+    assert [item["value"] for item in floorplan_specific["maps"]["physical_only_cell_density"]["values"]] == [0.10416666666666667, 0.0, 0.0, 0.0]
+    assert [item["value"] for item in floorplan_specific["maps"]["power_grid_density"]["values"]] == [0.125, 0.125, 0.0, 0.0]
 
     place_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text(encoding="utf-8"))
     assert set(place_density["maps"]) == set(floorplan_density["maps"])
@@ -647,7 +669,7 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     assert "strictly_aligned" not in json.dumps(place_egr)
 
     cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
-    assert set(cts_density["maps"]) == set(floorplan_density["maps"])
+    assert set(cts_density["maps"]) == set(place_density["maps"])
     assert cts_density["maps"]["allcell_density"]["values"][3] == {"patch_id": 3, "row": 1, "col": 1, "value": 103.0}
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))

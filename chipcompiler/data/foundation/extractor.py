@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gzip
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +87,7 @@ class FoundationExtractor:
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         self._ensure_floorplan_maps(selected_stages, canonical_grid, canonical_maps, def_data)
         self._write_indexed_maps(canonical_maps, canonical_grid)
+        self._write_floorplan_specific_maps(selected_stages, canonical_grid, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         labels = self._write_labels(native_demand_capacity.get("labels", []))
@@ -404,17 +407,71 @@ class FoundationExtractor:
         stage = next((item for item in stages if item.name == "Floorplan"), None)
         if stage is None or canonical_maps.get("Floorplan"):
             return
-        parsed_def = def_data.get("Floorplan")
-        if parsed_def is None:
+        zero_density = _zero_density_maps(canonical_grid)
+        if not zero_density:
             return
-        generated = _computed_patch_maps_from_def("Floorplan", canonical_grid, parsed_def)
-        if not generated:
-            return
-        canonical_maps["Floorplan"] = generated
+        canonical_maps["Floorplan"] = {"density": zero_density}
         self._quality.setdefault("availability", {}).setdefault("maps", {})[
             "Floorplan"
         ] = "available"
         self._quality.get("null_reason", {}).get("maps", {}).pop("Floorplan", None)
+
+    def _write_floorplan_specific_maps(
+        self,
+        stages: list[StageInfo],
+        canonical_grid: dict,
+        def_data: dict[str, DefData],
+    ) -> None:
+        stage = next((item for item in stages if item.name == "Floorplan"), None)
+        parsed_def = def_data.get("Floorplan")
+        if stage is None or parsed_def is None:
+            return
+        layout_physical_only_cells = self._floorplan_physical_only_cells_from_layout(stage)
+        maps = _floorplan_specific_patch_maps(parsed_def, canonical_grid, layout_physical_only_cells)
+        if not maps:
+            return
+        payload = {
+            "stage": "Floorplan",
+            "category": "floorplan",
+            "grid": {
+                "source": canonical_grid.get("grid_source"),
+                "rows": int(canonical_grid.get("rows", 0)),
+                "cols": int(canonical_grid.get("cols", 0)),
+            },
+            "maps": {
+                key: {"values": _matrix_to_patch_values(matrix, canonical_grid)}
+                for key, matrix in maps.items()
+            },
+        }
+        write_json(self.foundation_dir / "maps" / "Floorplan" / "floorplan.json", payload)
+        self._record_raw_ref(
+            stage,
+            parsed_def.path,
+            "floorplan_specific_def_maps",
+            {"category": "floorplan", "keys": list(maps), "grid_source": canonical_grid.get("grid_source")},
+        )
+
+    def _floorplan_physical_only_cells_from_layout(self, stage: StageInfo) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for layout_path in sorted((stage.directory / "output").glob("*.json")):
+            payload = self._read_json(layout_path)
+            if not isinstance(payload.get("data"), list):
+                continue
+            for item in payload.get("data", []):
+                if not isinstance(item, dict) or item.get("type") != "group":
+                    continue
+                name = str(item.get("struct name") or "")
+                if not _is_physical_only_cell_name(name, ""):
+                    continue
+                bbox = self._bbox_from_children(item.get("children", []))
+                if bbox is None:
+                    continue
+                llx, lly, urx, ury = bbox
+                out.append({"llx": llx, "lly": lly, "urx": urx, "ury": ury})
+            if out:
+                self._record_raw_ref(stage, layout_path, "floorplan_physical_only_layout_json", {"count": len(out)})
+                break
+        return out
 
     def _write_indexed_maps(self, canonical_maps: CanonicalMaps, canonical_grid: dict) -> None:
         for stage, stage_maps in canonical_maps.items():
@@ -1154,6 +1211,153 @@ def _first_key_containing(maps: dict[str, MapMatrix], token: str) -> str | None:
         if token in key:
             return key
     return None
+
+
+def _zero_density_maps(canonical_grid: dict) -> dict[str, MapMatrix]:
+    rows = int(canonical_grid.get("rows") or 0)
+    cols = int(canonical_grid.get("cols") or 0)
+    if rows <= 0 or cols <= 0:
+        return {}
+    return {key: _empty_matrix(rows, cols) for key in _DENSITY_MAP_KEY_ORDER}
+
+
+def _floorplan_specific_patch_maps(
+    parsed_def: DefData,
+    canonical_grid: dict,
+    layout_physical_only_cells: list[dict[str, Any]] | None = None,
+) -> dict[str, MapMatrix]:
+    patches = canonical_grid.get("patches", [])
+    rows = int(canonical_grid.get("rows") or 0)
+    cols = int(canonical_grid.get("cols") or 0)
+    if not patches or rows <= 0 or cols <= 0:
+        return {}
+    physical_only_cells = layout_physical_only_cells or _physical_only_cells_from_floorplan_def(parsed_def)
+    power_grid_shapes = _power_grid_shapes_from_floorplan_def(parsed_def)
+    io_pins = _io_pin_points_from_def(parsed_def)
+    return {
+        "io_pin_density": _patch_point_density(patches, rows, cols, io_pins),
+        "power_grid_density": _patch_shape_density(patches, rows, cols, power_grid_shapes),
+        "physical_only_cell_density": _patch_shape_density(patches, rows, cols, physical_only_cells),
+    }
+
+
+def _physical_only_cells_from_floorplan_def(parsed_def: DefData) -> list[dict[str, Any]]:
+    component_boxes = _component_boxes_from_raw_def(parsed_def.path)
+    out: list[dict[str, Any]] = []
+    for component in parsed_def.components:
+        name = str(component.get("name") or "")
+        master = str(component.get("master") or "")
+        if not _is_physical_only_cell_name(name, master):
+            continue
+        bbox = component_boxes.get(name)
+        if bbox is not None:
+            out.append(bbox)
+            continue
+        origin = component.get("origin")
+        if isinstance(origin, dict):
+            x = float(origin.get("x", 0.0))
+            y = float(origin.get("y", 0.0))
+            out.append({"llx": x, "lly": y, "urx": x, "ury": y})
+    return out
+
+
+def _component_boxes_from_raw_def(path: Path) -> dict[str, dict[str, float]]:
+    text = _read_text_maybe_gzip(path)
+    boxes: dict[str, dict[str, float]] = {}
+    match = re.search(r"COMPONENTS\s+\d+\s*;(?P<body>.*?)END COMPONENTS", text, re.S)
+    if not match:
+        return boxes
+    current_name: str | None = None
+    for raw_line in match.group("body").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("- "):
+            parts = stripped.split()
+            current_name = parts[1] if len(parts) > 1 else None
+        if current_name is None:
+            continue
+        placed = re.search(r"\+\s+(?:PLACED|FIXED)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", stripped)
+        size = re.search(r"\+\s+SIZE\s+(-?\d+(?:\.\d+)?)\s+BY\s+(-?\d+(?:\.\d+)?)", stripped)
+        if placed and size:
+            x = float(placed.group(1))
+            y = float(placed.group(2))
+            width = float(size.group(1))
+            height = float(size.group(2))
+            boxes[current_name] = {"llx": x, "lly": y, "urx": x + width, "ury": y + height}
+            current_name = None
+    return boxes
+
+
+def _power_grid_shapes_from_floorplan_def(parsed_def: DefData) -> list[dict[str, Any]]:
+    return [
+        _wire_bbox_with_width(wire)
+        for net in parsed_def.nets
+        if net.special and _is_power_or_ground_net(net.name)
+        for wire in net.wires
+    ]
+
+
+def _io_pin_points_from_def(parsed_def: DefData) -> list[dict[str, Any]]:
+    return [
+        {"x": float(pin["origin"]["x"]), "y": float(pin["origin"]["y"])}
+        for pin in parsed_def.pins
+        if isinstance(pin.get("origin"), dict)
+    ]
+
+
+def _patch_point_density(
+    patches: list[dict[str, Any]],
+    rows: int,
+    cols: int,
+    points: list[dict[str, Any]],
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        matrix[row][col] = float(sum(1 for point in points if _point_in_bbox(point.get("x"), point.get("y"), bbox)))
+    return matrix
+
+
+def _patch_shape_density(
+    patches: list[dict[str, Any]],
+    rows: int,
+    cols: int,
+    shapes: list[dict[str, Any]],
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        patch_area = _bbox_area(bbox)
+        if patch_area <= 0:
+            continue
+        matrix[row][col] = sum(_bbox_overlap_area(shape, bbox) for shape in shapes) / patch_area
+    return matrix
+
+
+def _is_physical_only_cell_name(name: str, master: str) -> bool:
+    lower = f"{name} {master}".lower()
+    return any(token in lower for token in ("fill", "tap", "endcap", "decap", "welltap"))
+
+
+def _is_power_or_ground_net(name: str) -> bool:
+    lower = name.lower()
+    return lower.startswith(("vdd", "vss", "vcc", "gnd", "power", "ground"))
+
+
+def _wire_bbox_with_width(wire: DefWire) -> dict[str, float]:
+    half_width = float(wire.width or 0.0) / 2.0
+    return {
+        "llx": min(float(wire.x1), float(wire.x2)) - half_width,
+        "lly": min(float(wire.y1), float(wire.y2)) - half_width,
+        "urx": max(float(wire.x1), float(wire.x2)) + half_width,
+        "ury": max(float(wire.y1), float(wire.y2)) + half_width,
+    }
+
+
+def _read_text_maybe_gzip(path: Path) -> str:
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _computed_patch_maps_from_def(stage: str, canonical_grid: dict, parsed_def: DefData) -> StageMaps:
