@@ -144,6 +144,7 @@ def _make_workspace(
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allnet_density.csv", [[30, 31], [32, 33]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "margin_map" / "place_union_margin.csv", [[40, 41], [42, 43]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_rudy_union.csv", [[50, 51], [52, 53]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_lut_rudy_union.csv", [[150, 151], [152, 153]])
     _write_csv(ws / "place_dreamplace" / "feature" / "egr_congestion_map" / "place_egr_horizontal_overflow.csv", [[5]])
     _write_csv(ws / "place_dreamplace" / "feature" / "egr_congestion_map" / "place_egr_vertical_overflow.csv", [[7]])
     _write_text(
@@ -418,8 +419,8 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "vectors/routing_graphs/route.jsonl",
         "vectors/timing_paths/route.jsonl",
         "vectors/patches/place.jsonl",
-        "maps/canonical/place/density.json",
-        "maps/canonical/route/egr_overflow.json",
+        "maps/place/density.json",
+        "maps/place/egr_overflow.json",
     ]:
         assert (foundation_dir / rel).exists(), rel
 
@@ -491,20 +492,24 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert grid["patches"][0]["col"] == 0
     assert "gcell" not in grid["patches"][0]
 
-    canonical_place = json.loads((foundation_dir / "maps" / "canonical" / "place" / "egr_overflow.json").read_text())
-    assert canonical_place["horizontal"] == [[5.0]]
-    assert canonical_place["vertical"] == [[7.0]]
+    place_egr = json.loads((foundation_dir / "maps" / "place" / "egr_overflow.json").read_text())
+    assert place_egr["maps"]["horizontal"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 5.0}]
+    assert place_egr["maps"]["vertical"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 7.0}]
 
-    canonical_density = json.loads((foundation_dir / "maps" / "canonical" / "place" / "density.json").read_text())
-    assert canonical_density["place_allcell_density"] == [[10.0, 11.0], [12.0, 13.0]]
-    assert canonical_density["place_allcell_pin_density"] == [[20.0, 21.0], [22.0, 23.0]]
-    assert canonical_density["place_allnet_density"] == [[30.0, 31.0], [32.0, 33.0]]
+    indexed_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text())
+    assert [item["value"] for item in indexed_density["maps"]["place_allcell_density"]["values"]] == [10.0, 11.0, 12.0, 13.0]
+    assert [item["value"] for item in indexed_density["maps"]["place_allcell_pin_density"]["values"]] == [20.0, 21.0, 22.0, 23.0]
+    assert [item["value"] for item in indexed_density["maps"]["place_allnet_density"]["values"]] == [30.0, 31.0, 32.0, 33.0]
 
-    canonical_margin = json.loads((foundation_dir / "maps" / "canonical" / "place" / "margin.json").read_text())
-    assert canonical_margin["union"] == [[40.0, 41.0], [42.0, 43.0]]
+    indexed_margin = json.loads((foundation_dir / "maps" / "place" / "margin.json").read_text())
+    assert [item["value"] for item in indexed_margin["maps"]["union"]["values"]] == [40.0, 41.0, 42.0, 43.0]
 
-    canonical_rudy = json.loads((foundation_dir / "maps" / "canonical" / "place" / "rudy.json").read_text())
-    assert canonical_rudy["rudy_union"] == [[50.0, 51.0], [52.0, 53.0]]
+    indexed_rudy = json.loads((foundation_dir / "maps" / "place" / "rudy.json").read_text())
+    assert [item["value"] for item in indexed_rudy["maps"]["rudy_union"]["values"]] == [50.0, 51.0, 52.0, 53.0]
+    assert all("lut" not in key for key in indexed_rudy["maps"])
+    assert not (foundation_dir / "maps" / "place" / "ignored.json").exists()
+    assert not (foundation_dir / "maps" / "canonical").exists()
+    assert not (foundation_dir / "maps" / "raw").exists()
 
     instances = [json.loads(line) for line in (foundation_dir / "vectors" / "instances" / "place.jsonl").read_text().splitlines()]
     assert {item["name"] for item in instances} == {"Instance_U1", "Macro_SRAM0"}
@@ -630,6 +635,35 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert quality["availability"]["maps"]["Floorplan"] == "available"
+
+
+def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_density(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_sample_gcell_info(ws / "CTS_ecc")
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[0.4, 0.5], [0.6, 0.7]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_density.csv", [[0.1, 0.2], [0.3, 0.4]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[1, 2], [3, 4]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_lut_rudy_union.csv", [[5, 6], [7, 8]])
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    assert not (foundation_dir / "maps" / "canonical").exists()
+    assert not (foundation_dir / "maps" / "raw").exists()
+
+    cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
+    allcell = [item["value"] for item in cts_density["maps"]["cts_allcell_density"]["values"]]
+    stdcell = [item["value"] for item in cts_density["maps"]["cts_stdcell_density"]["values"]]
+    macro = [item["value"] for item in cts_density["maps"]["cts_macro_density"]["values"]]
+    assert macro == [0.0, 0.0, 0.0, 0.0]
+    assert allcell == stdcell
+
+    cts_rudy = json.loads((foundation_dir / "maps" / "CTS" / "rudy.json").read_text(encoding="utf-8"))
+    assert set(cts_rudy["maps"]) == {"rudy_union"}
+    assert not (foundation_dir / "maps" / "CTS" / "ignored.json").exists()
+    raw_refs = json.loads((foundation_dir / "raw_refs" / "artifacts.json").read_text(encoding="utf-8"))
+    assert "lut_rudy" not in json.dumps(raw_refs)
 
 def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_route_artifacts=False, include_route_maps=True)

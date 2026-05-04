@@ -209,6 +209,8 @@ class FoundationExtractor:
                 if not matrix:
                     continue
                 category, key = self._classify_map(csv_path)
+                if category == "ignored":
+                    continue
                 exact_gcell_map = "gcell_patch_map" in csv_path.parts
                 if exact_gcell_map:
                     self._exact_gcell_map_keys.add((stage.name, category, key))
@@ -239,8 +241,9 @@ class FoundationExtractor:
         if "egr" in name and "overflow" in name:
             return "egr_overflow", direction
         if "rudy" in name:
-            prefix = "lutrudy" if "lut" in name else "rudy"
-            return "rudy", f"{prefix}_{direction}"
+            if "lut" in name:
+                return "ignored", name
+            return "rudy", f"rudy_{direction}"
         if "margin" in name:
             return "margin", direction
         if "density" in name:
@@ -340,8 +343,6 @@ class FoundationExtractor:
                     cols,
                 )
                 canonical.setdefault(stage, {})[category] = normalized
-                write_json(self.foundation_dir / "maps" / "canonical" / stage / f"{category}.json", normalized)
-                write_json(self.foundation_dir / "maps" / "raw" / stage / f"{category}.json", category_maps)
         return canonical
 
     def _canonicalize_maps_for_grid(
@@ -373,6 +374,8 @@ class FoundationExtractor:
                 self._quality.setdefault("warnings", []).append(
                     f"exact ecc-tools gcell patch maps missing for {stage.name}:{category}:{sorted(missing_maps)}; omitted approximate Python recomputation"
                 )
+            if category == "density":
+                _drop_filler_from_allcell_density(exact_maps)
             return exact_maps
         return {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
 
@@ -393,15 +396,6 @@ class FoundationExtractor:
         if not generated:
             return
         canonical_maps["Floorplan"] = generated
-        for category, category_maps in generated.items():
-            write_json(
-                self.foundation_dir / "maps" / "canonical" / "Floorplan" / f"{category}.json",
-                category_maps,
-            )
-            write_json(
-                self.foundation_dir / "maps" / "raw" / "Floorplan" / f"{category}.json",
-                category_maps,
-            )
         self._quality.setdefault("availability", {}).setdefault("maps", {})[
             "Floorplan"
         ] = "available"
@@ -1094,6 +1088,34 @@ def _matrix_to_patch_values(matrix: list[list[float]], canonical_grid: dict) -> 
             {"patch_id": int(patch["patch_id"]), "row": row, "col": col, "value": value}
         )
     return values
+
+
+def _drop_filler_from_allcell_density(maps: dict[str, MapMatrix]) -> None:
+    """Keep public allcell density aligned with stdcell when there are no macros.
+
+    ecc-tools' gcell patch exporter currently builds allcell density from every
+    IDB instance returned by getDensityCells(); fixed in-core filler/tap cells can
+    have an empty type, so they inflate allcell_density while macro_density stays
+    zero. For the ICCD feature maps, allcell means standard cells plus macros. If
+    macro density is zero for the design, allcell must equal stdcell.
+    """
+
+    allcell_key = _first_key_containing(maps, "allcell_density")
+    stdcell_key = _first_key_containing(maps, "stdcell_density")
+    macro_key = _first_key_containing(maps, "macro_density")
+    if allcell_key is None or stdcell_key is None or macro_key is None:
+        return
+    macro = maps[macro_key]
+    if any(float(value) != 0.0 for row in macro for value in row):
+        return
+    maps[allcell_key] = [[float(value) for value in row] for row in maps[stdcell_key]]
+
+
+def _first_key_containing(maps: dict[str, MapMatrix], token: str) -> str | None:
+    for key in maps:
+        if token in key:
+            return key
+    return None
 
 
 def _computed_patch_maps_from_def(stage: str, canonical_grid: dict, parsed_def: DefData) -> StageMaps:
