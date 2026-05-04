@@ -748,14 +748,7 @@ class FoundationExtractor:
             "available" if native_demand_capacity else "missing",
             "" if native_demand_capacity else "missing_irt_space_router_native_demand_capacity_artifact",
         )
-        write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_congestion.jsonl", reconstructed_congestion)
         write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl", reconstructed_congestion)
-        self._mark(
-            "labels",
-            "route_reconstructed_congestion",
-            "available" if reconstructed_congestion else "missing",
-            "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
-        )
         self._mark(
             "labels",
             "route_reconstructed_demand_capacity",
@@ -765,7 +758,6 @@ class FoundationExtractor:
         return {
             "route_native_demand_capacity_count": len(native_demand_capacity),
             "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
-            "route_reconstructed_congestion_count": len(reconstructed_congestion),
             "_route_native_demand_capacity_records": native_demand_capacity,
             "_route_reconstructed_congestion_records": reconstructed_congestion,
         }
