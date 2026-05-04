@@ -918,10 +918,9 @@ class FoundationExtractor:
         ppa_metrics = self._build_ppa_metrics(metrics, stages, labels, def_data, sta_reports, drc_reports)
         return {
             "workspace": str(self.workspace_dir),
-            "flow": _strip_empty_info(flow),
+            "flow": _summary_flow(flow, stages),
             "parameters": parameters,
             "stage_count": len(stages),
-            "stages": [{"name": item.name, "tool": item.tool, "state": item.state} for item in stages],
             "metrics": ppa_metrics,
             "entity_counts": entity_counts,
             "labels": labels,
@@ -1111,7 +1110,7 @@ class FoundationExtractor:
             {
                 "profile": self.profile,
                 "workspace": summary["workspace"],
-                "stages": summary["stages"],
+                "stages": _summary_stages(summary),
                 "entity_counts": summary["entity_counts"],
                 "quality_warnings": self._quality.get("warnings", []),
                 "evidence_index": "views/agent/evidence_index.json",
@@ -1290,6 +1289,27 @@ def _strip_empty_info(flow: dict[str, Any]) -> dict[str, Any]:
             if isinstance(step, dict) and step.get("info") == {}:
                 step.pop("info", None)
     return normalized
+
+
+def _summary_flow(flow: dict[str, Any], stages: list[StageInfo]) -> dict[str, Any]:
+    normalized = _strip_empty_info(flow)
+    steps = normalized.get("steps")
+    if isinstance(steps, list):
+        by_name = {step.get("name"): step for step in steps if isinstance(step, dict)}
+        normalized["steps"] = [by_name[stage.name] for stage in stages if stage.name in by_name]
+    return normalized
+
+
+def _summary_stages(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = summary.get("flow", {}).get("steps", [])
+    if not isinstance(steps, list):
+        return []
+    stages = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        stages.append({key: step.get(key) for key in ("name", "tool", "state") if key in step})
+    return stages
 
 
 def _scale_bbox(bbox: dict[str, float] | None, scale: float) -> dict[str, float] | None:

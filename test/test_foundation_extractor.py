@@ -400,6 +400,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
     assert "profile" not in summary
     assert "created_at" not in summary
+    assert "stages" not in summary
     assert all("info" not in step for step in summary["flow"]["steps"])
     assert "Die" not in summary["parameters"]
     assert summary["parameters"]["Core"] == {
@@ -632,7 +633,8 @@ def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
     evidence = json.loads((foundation_dir / "views" / "agent" / "evidence_index.json").read_text(encoding="utf-8"))
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
 
-    assert [item["name"] for item in summary["stages"]] == ["place"]
+    assert "stages" not in summary
+    assert [item["name"] for item in summary["flow"]["steps"]] == ["place"]
     assert (foundation_dir / "vectors" / "instances" / "place.jsonl").exists()
     assert not (foundation_dir / "vectors" / "instances" / "route.jsonl").exists()
     assert not (foundation_dir / "raw_refs" / "artifacts.json").exists()
