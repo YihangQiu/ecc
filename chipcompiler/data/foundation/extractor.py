@@ -24,6 +24,10 @@ _STAGE_DIR_OVERRIDES = {
     ("legalization", "dreamplace"): "legalization_dreamplace",
 }
 _ENTITY_NAMES = ("instances", "nets", "pins", "wires", "routing_graphs", "timing_paths", "patches")
+MapMatrix = list[list[float]]
+StageMaps = dict[str, dict[str, MapMatrix]]
+CanonicalMaps = dict[str, StageMaps]
+
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,8 @@ class FoundationExtractor:
         die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
+        self._ensure_floorplan_maps(selected_stages, canonical_grid, canonical_maps, def_data)
+        self._write_indexed_maps(canonical_maps, canonical_grid)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         labels = self._write_labels(native_demand_capacity.get("labels", []))
@@ -369,6 +375,55 @@ class FoundationExtractor:
                 )
             return exact_maps
         return {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
+
+    def _ensure_floorplan_maps(
+        self,
+        stages: list[StageInfo],
+        canonical_grid: dict,
+        canonical_maps: CanonicalMaps,
+        def_data: dict[str, DefData],
+    ) -> None:
+        stage = next((item for item in stages if item.name == "Floorplan"), None)
+        if stage is None or canonical_maps.get("Floorplan"):
+            return
+        parsed_def = def_data.get("Floorplan")
+        if parsed_def is None:
+            return
+        generated = _computed_patch_maps_from_def("Floorplan", canonical_grid, parsed_def)
+        if not generated:
+            return
+        canonical_maps["Floorplan"] = generated
+        for category, category_maps in generated.items():
+            write_json(
+                self.foundation_dir / "maps" / "canonical" / "Floorplan" / f"{category}.json",
+                category_maps,
+            )
+            write_json(
+                self.foundation_dir / "maps" / "raw" / "Floorplan" / f"{category}.json",
+                category_maps,
+            )
+        self._quality.setdefault("availability", {}).setdefault("maps", {})[
+            "Floorplan"
+        ] = "available"
+        self._quality.get("null_reason", {}).get("maps", {}).pop("Floorplan", None)
+
+    def _write_indexed_maps(self, canonical_maps: CanonicalMaps, canonical_grid: dict) -> None:
+        for stage, stage_maps in canonical_maps.items():
+            for category, category_maps in stage_maps.items():
+                payload = {
+                    "stage": stage,
+                    "category": category,
+                    "grid": {
+                        "source": canonical_grid.get("grid_source"),
+                        "rows": int(canonical_grid.get("rows", 0)),
+                        "cols": int(canonical_grid.get("cols", 0)),
+                    },
+                    "maps": {
+                        key: {"values": _matrix_to_patch_values(matrix, canonical_grid)}
+                        for key, matrix in category_maps.items()
+                    },
+                }
+                write_json(self.foundation_dir / "maps" / stage / f"{category}.json", payload)
 
     def _write_tech(self, def_data: dict[str, DefData], rt_logs: dict[str, dict[str, Any]]) -> None:
         layers_by_name: dict[str, dict[str, Any]] = {}
@@ -987,7 +1042,7 @@ class FoundationExtractor:
                 "profile": self.profile,
                 "canonical_grid": "canonical_grid.json",
                 "vectors_dir": "vectors",
-                "maps_dir": "maps/canonical",
+                "maps_dir": "maps",
                 "labels_dir": "labels",
                 "tasks": ["route_demand_capacity"],
             },
@@ -1025,6 +1080,287 @@ class FoundationExtractor:
         self._quality.setdefault("availability", {}).setdefault(entity, {})[key] = status
         if status != "available":
             self._quality.setdefault("null_reason", {}).setdefault(entity, {})[key] = reason or "missing"
+
+
+def _matrix_to_patch_values(matrix: list[list[float]], canonical_grid: dict) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    for patch in canonical_grid.get("patches", []):
+        row = int(patch["row"])
+        col = int(patch["col"])
+        value = _matrix_value(matrix, row, col)
+        if value is None:
+            continue
+        values.append(
+            {"patch_id": int(patch["patch_id"]), "row": row, "col": col, "value": value}
+        )
+    return values
+
+
+def _computed_patch_maps_from_def(stage: str, canonical_grid: dict, parsed_def: DefData) -> StageMaps:
+    patches = canonical_grid.get("patches", [])
+    if not patches:
+        return {}
+    rows = int(canonical_grid.get("rows") or 0)
+    cols = int(canonical_grid.get("cols") or 0)
+    if rows <= 0 or cols <= 0:
+        return {}
+    components = _component_records_for_maps(parsed_def)
+    pins = _pin_points_for_maps(parsed_def)
+    nets = _net_bboxes_for_maps(parsed_def)
+    macros = [item for item in components if item["is_macro"]]
+    stdcells = [item for item in components if not item["is_macro"]]
+    density = {
+        "allcell_density": _patch_cell_density(patches, rows, cols, components),
+        "macro_density": _patch_cell_density(patches, rows, cols, macros),
+        "stdcell_density": _patch_cell_density(patches, rows, cols, stdcells),
+        "allcell_pin_density": _patch_pin_density(patches, rows, cols, pins),
+        "macro_pin_density": _patch_pin_density(
+            patches, rows, cols, [pin for pin in pins if pin.get("is_macro")]
+        ),
+        "stdcell_pin_density": _patch_pin_density(
+            patches, rows, cols, [pin for pin in pins if not pin.get("is_macro")]
+        ),
+        "allnet_density": _patch_net_density(patches, rows, cols, nets),
+        "local_net_density": _patch_net_density(
+            patches, rows, cols, [net for net in nets if net.get("overlap_count", 0) <= 1]
+        ),
+        "global_net_density": _patch_net_density(
+            patches, rows, cols, [net for net in nets if net.get("overlap_count", 0) > 1]
+        ),
+    }
+    rudy = {
+        "rudy_horizontal": _patch_rudy(patches, rows, cols, nets, "horizontal"),
+        "rudy_vertical": _patch_rudy(patches, rows, cols, nets, "vertical"),
+        "rudy_union": _patch_rudy(patches, rows, cols, nets, "union"),
+    }
+    margin = {
+        "horizontal": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "horizontal"),
+        "vertical": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "vertical"),
+        "union": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "union"),
+    }
+    return {"density": density, "rudy": rudy, "margin": margin}
+
+
+def _empty_matrix(rows: int, cols: int) -> list[list[float]]:
+    return [[0.0 for _ in range(cols)] for _ in range(rows)]
+
+
+def _component_records_for_maps(parsed_def: DefData) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    rows = parsed_def.rows
+    default_width = max((float(row.step_x) for row in rows if row.step_x), default=1.0)
+    default_height = max((float(row.step_y) for row in rows if row.step_y), default=1.0)
+    for component in parsed_def.components:
+        origin = component.get("origin") if isinstance(component, dict) else None
+        if not isinstance(origin, dict):
+            continue
+        x = float(origin.get("x", 0.0))
+        y = float(origin.get("y", 0.0))
+        master = str(component.get("master") or "")
+        lower = master.lower()
+        is_macro = "macro" in lower or "sram" in lower or "mem" in lower
+        out.append(
+            {
+                "name": component.get("name"),
+                "llx": x,
+                "lly": y,
+                "urx": x + default_width,
+                "ury": y + default_height,
+                "is_macro": is_macro,
+            }
+        )
+    return out
+
+
+def _pin_points_for_maps(parsed_def: DefData) -> list[dict[str, Any]]:
+    components_by_name = {str(item.get("name")): item for item in _component_records_for_maps(parsed_def)}
+    pins: list[dict[str, Any]] = []
+    for pin in parsed_def.pins:
+        origin = pin.get("origin")
+        if isinstance(origin, dict):
+            pins.append(
+            {"x": float(origin.get("x", 0.0)), "y": float(origin.get("y", 0.0)), "is_macro": False}
+        )
+    for net in parsed_def.nets:
+        for pin in net.pins:
+            component = components_by_name.get(str(pin.get("instance")))
+            if component is None:
+                continue
+            pins.append(
+                {
+                    "x": (component["llx"] + component["urx"]) / 2.0,
+                    "y": (component["lly"] + component["ury"]) / 2.0,
+                    "is_macro": bool(component.get("is_macro")),
+                }
+            )
+    return pins
+
+
+def _net_bboxes_for_maps(parsed_def: DefData) -> list[dict[str, Any]]:
+    points_by_instance = {
+        str(item.get("name")): (
+            (item["llx"] + item["urx"]) / 2.0,
+            (item["lly"] + item["ury"]) / 2.0,
+        )
+        for item in _component_records_for_maps(parsed_def)
+    }
+    top_pin_points = {
+        str(pin.get("pin_name")): (
+            float(pin.get("origin", {}).get("x", 0.0)),
+            float(pin.get("origin", {}).get("y", 0.0)),
+        )
+        for pin in parsed_def.pins
+        if isinstance(pin.get("origin"), dict)
+    }
+    nets: list[dict[str, Any]] = []
+    for net in parsed_def.nets:
+        xs: list[float] = []
+        ys: list[float] = []
+        for pin in net.pins:
+            instance = str(pin.get("instance"))
+            pin_name = str(pin.get("pin_name"))
+            point = top_pin_points.get(pin_name) if instance == "PIN" else points_by_instance.get(instance)
+            if point is None:
+                continue
+            xs.append(point[0])
+            ys.append(point[1])
+        for wire in net.wires:
+            xs.extend([float(wire.x1), float(wire.x2)])
+            ys.extend([float(wire.y1), float(wire.y2)])
+        if not xs or not ys:
+            continue
+        bbox = {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)}
+        nets.append({**bbox, "overlap_count": 0})
+    return nets
+
+
+def _patch_cell_density(
+    patches: list[dict[str, Any]], rows: int, cols: int, cells: list[dict[str, Any]]
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        patch_area = _bbox_area(bbox)
+        if patch_area <= 0:
+            continue
+        matrix[row][col] = sum(_bbox_overlap_area(cell, bbox) for cell in cells) / patch_area
+    return matrix
+
+
+def _patch_pin_density(
+    patches: list[dict[str, Any]], rows: int, cols: int, pins: list[dict[str, Any]]
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        matrix[row][col] = float(sum(1 for pin in pins if _point_in_bbox(pin.get("x"), pin.get("y"), bbox)))
+    return matrix
+
+
+def _patch_net_density(
+    patches: list[dict[str, Any]], rows: int, cols: int, nets: list[dict[str, Any]]
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for net in nets:
+        net["overlap_count"] = sum(1 for patch in patches if _bbox_overlap_area(net, patch["bbox"]) > 0)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        patch_area = _bbox_area(bbox)
+        if patch_area <= 0:
+            continue
+        matrix[row][col] = sum(_bbox_overlap_area(net, bbox) for net in nets) / patch_area
+    return matrix
+
+
+def _patch_rudy(
+    patches: list[dict[str, Any]], rows: int, cols: int, nets: list[dict[str, Any]], direction: str
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        patch_area = _bbox_area(bbox)
+        if patch_area <= 0:
+            continue
+        value = 0.0
+        for net in nets:
+            overlap = _bbox_overlap_area(net, bbox)
+            if overlap <= 0:
+                continue
+            width = max(0.0, float(net["urx"]) - float(net["llx"]))
+            height = max(0.0, float(net["ury"]) - float(net["lly"]))
+            horizontal = 1.0 if height == 0 else 1.0 / height
+            vertical = 1.0 if width == 0 else 1.0 / width
+            if direction == "horizontal":
+                value += overlap * horizontal / patch_area
+            elif direction == "vertical":
+                value += overlap * vertical / patch_area
+            else:
+                value += overlap * (horizontal + vertical) / patch_area
+        matrix[row][col] = value
+    return matrix
+
+
+def _patch_margin(
+    patches: list[dict[str, Any]],
+    rows: int,
+    cols: int,
+    macros: list[dict[str, Any]],
+    diearea: dict[str, float] | None,
+    direction: str,
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    core = diearea or _bbox_union([patch["bbox"] for patch in patches])
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        if _bbox_overlap_area(bbox, core) <= 0:
+            continue
+        patch_area = _bbox_area(bbox)
+        if patch_area > 0 and sum(_bbox_overlap_area(macro, bbox) for macro in macros) > 0.5 * patch_area:
+            continue
+        center_x = (float(bbox["llx"]) + float(bbox["urx"])) / 2.0
+        center_y = (float(bbox["lly"]) + float(bbox["ury"])) / 2.0
+        h_left, h_right = float(core["llx"]), float(core["urx"])
+        v_down, v_up = float(core["lly"]), float(core["ury"])
+        for macro in macros:
+            macro_cx = (float(macro["llx"]) + float(macro["urx"])) / 2.0
+            macro_cy = (float(macro["lly"]) + float(macro["ury"])) / 2.0
+            if float(macro["lly"]) <= center_y <= float(macro["ury"]):
+                if macro_cx > center_x:
+                    h_right = min(h_right, float(macro["llx"]))
+                else:
+                    h_left = max(h_left, float(macro["urx"]))
+            if float(macro["llx"]) <= center_x <= float(macro["urx"]):
+                if macro_cy > center_y:
+                    v_up = min(v_up, float(macro["lly"]))
+                else:
+                    v_down = max(v_down, float(macro["ury"]))
+        horizontal = h_right - h_left
+        vertical = v_up - v_down
+        matrix[row][col] = horizontal if direction == "horizontal" else vertical if direction == "vertical" else horizontal + vertical
+    return matrix
+
+
+def _bbox_area(bbox: dict[str, Any]) -> float:
+    return max(0.0, float(bbox["urx"]) - float(bbox["llx"])) * max(0.0, float(bbox["ury"]) - float(bbox["lly"]))
+
+
+def _bbox_overlap_area(a: dict[str, Any], b: dict[str, Any]) -> float:
+    overlap_lx = max(float(a["llx"]), float(b["llx"]))
+    overlap_ly = max(float(a["lly"]), float(b["lly"]))
+    overlap_ux = min(float(a["urx"]), float(b["urx"]))
+    overlap_uy = min(float(a["ury"]), float(b["ury"]))
+    return max(0.0, overlap_ux - overlap_lx) * max(0.0, overlap_uy - overlap_ly)
+
+
+def _bbox_union(boxes: list[dict[str, Any]]) -> dict[str, float]:
+    if not boxes:
+        return {"llx": 0.0, "lly": 0.0, "urx": 0.0, "ury": 0.0}
+    return {
+        "llx": min(float(box["llx"]) for box in boxes),
+        "lly": min(float(box["lly"]) for box in boxes),
+        "urx": max(float(box["urx"]) for box in boxes),
+        "ury": max(float(box["ury"]) for box in boxes),
+    }
 
 
 def _matrix_value(matrix: list[list[float]] | None, row: int, col: int) -> float | None:

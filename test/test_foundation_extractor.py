@@ -53,6 +53,7 @@ def _make_workspace(
             "steps": [
                 {"name": "Floorplan", "tool": "ecc", "state": "Success", "info": {}},
                 {"name": "place", "tool": "dreamplace", "state": "Success"},
+                {"name": "CTS", "tool": "ecc", "state": "Success"},
                 {"name": "route", "tool": "ecc", "state": "Success"},
                 {"name": "drc", "tool": "ecc", "state": "Success"},
             ]
@@ -77,6 +78,7 @@ def _make_workspace(
     for stage_dir, stage_name in [
         ("Floorplan_ecc", "Floorplan"),
         ("place_dreamplace", "place"),
+        ("CTS_ecc", "CTS"),
         ("route_ecc", "route"),
         ("drc_ecc", "drc"),
     ]:
@@ -161,6 +163,31 @@ PINS 1 ;
 END PINS
 NETS 1 ;
 - n1 ( U1 A ) ( PIN OUT ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_text(
+        ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+ROW ROW_0 core 0 0 N DO 2 BY 1 STEP 50 10 ;
+COMPONENTS 2 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+- MAC0 SRAM + PLACED ( 50 50 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( U1 A ) ( PIN OUT ) ;
+- n2 ( MAC0 A ) ( U1 Y ) ;
 END NETS
 END DESIGN
 """.strip()
@@ -553,6 +580,56 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "route_reconstructed_congestion_count" not in summary["labels"]
     assert "route_reconstructed_demand_capacity_count" not in summary["labels"]
 
+
+
+def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_sample_gcell_info(ws / "CTS_ecc")
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[100, 101], [102, 103]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[110, 111], [112, 113]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "margin_map" / "cts_union_margin.csv", [[120, 121], [122, 123]])
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    for rel in [
+        "maps/Floorplan/density.json",
+        "maps/Floorplan/rudy.json",
+        "maps/Floorplan/margin.json",
+        "maps/place/density.json",
+        "maps/place/egr_overflow.json",
+        "maps/CTS/density.json",
+    ]:
+        assert (foundation_dir / rel).exists(), rel
+
+    floorplan_density = json.loads((foundation_dir / "maps" / "Floorplan" / "density.json").read_text(encoding="utf-8"))
+    assert floorplan_density["stage"] == "Floorplan"
+    assert floorplan_density["category"] == "density"
+    assert floorplan_density["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
+    assert "matrix" not in floorplan_density["maps"]["allcell_density"]
+    floorplan_values = floorplan_density["maps"]["allcell_density"]["values"]
+    assert len(floorplan_values) == 4
+    assert floorplan_values[0] == {"patch_id": 0, "row": 0, "col": 0, "value": 0.10416666666666667}
+    assert {item["patch_id"] for item in floorplan_values} == {0, 1, 2, 3}
+    assert all({"patch_id", "row", "col", "value"} == set(item) for item in floorplan_values)
+
+    floorplan_margin = json.loads((foundation_dir / "maps" / "Floorplan" / "margin.json").read_text(encoding="utf-8"))
+    assert set(floorplan_margin["maps"]) == {"horizontal", "vertical", "union"}
+    assert floorplan_margin["maps"]["union"]["values"][0]["row"] == 0
+
+    place_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text(encoding="utf-8"))
+    assert place_density["maps"]["place_allcell_density"]["values"][0] == {"patch_id": 0, "row": 0, "col": 0, "value": 10.0}
+
+    place_egr = json.loads((foundation_dir / "maps" / "place" / "egr_overflow.json").read_text(encoding="utf-8"))
+    assert place_egr["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
+    assert place_egr["maps"]["horizontal"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 5.0}]
+    assert "strictly_aligned" not in json.dumps(place_egr)
+
+    cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
+    assert cts_density["maps"]["cts_allcell_density"]["values"][3] == {"patch_id": 3, "row": 1, "col": 1, "value": 103.0}
+
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    assert quality["availability"]["maps"]["Floorplan"] == "available"
 
 def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_route_artifacts=False, include_route_maps=True)
