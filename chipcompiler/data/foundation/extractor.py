@@ -375,7 +375,7 @@ class FoundationExtractor:
                     f"exact ecc-tools gcell patch maps missing for {stage.name}:{category}:{sorted(missing_maps)}; omitted approximate Python recomputation"
                 )
             if category == "density":
-                _drop_filler_from_allcell_density(exact_maps)
+                _rebuild_allcell_maps(exact_maps)
             return exact_maps
         return {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
 
@@ -1090,25 +1090,35 @@ def _matrix_to_patch_values(matrix: list[list[float]], canonical_grid: dict) -> 
     return values
 
 
-def _drop_filler_from_allcell_density(maps: dict[str, MapMatrix]) -> None:
-    """Keep public allcell density aligned with stdcell when there are no macros.
+def _rebuild_allcell_maps(maps: dict[str, MapMatrix]) -> None:
+    """Keep public allcell maps as stdcell plus macro maps.
 
     ecc-tools' gcell patch exporter currently builds allcell density from every
     IDB instance returned by getDensityCells(); fixed in-core filler/tap cells can
-    have an empty type, so they inflate allcell_density while macro_density stays
-    zero. For the ICCD feature maps, allcell means standard cells plus macros. If
-    macro density is zero for the design, allcell must equal stdcell.
+    have an empty type, so they inflate allcell_density/allcell_pin_density. For
+    the ICCD feature maps, allcell means standard cells plus macros.
     """
 
-    allcell_key = _first_key_containing(maps, "allcell_density")
-    stdcell_key = _first_key_containing(maps, "stdcell_density")
-    macro_key = _first_key_containing(maps, "macro_density")
-    if allcell_key is None or stdcell_key is None or macro_key is None:
+    _replace_with_matrix_sum(maps, "allcell_density", "stdcell_density", "macro_density")
+    _replace_with_matrix_sum(maps, "allcell_pin_density", "stdcell_pin_density", "macro_pin_density")
+
+
+def _replace_with_matrix_sum(maps: dict[str, MapMatrix], target_token: str, lhs_token: str, rhs_token: str) -> None:
+    target_key = _first_key_containing(maps, target_token)
+    lhs_key = _first_key_containing(maps, lhs_token)
+    rhs_key = _first_key_containing(maps, rhs_token)
+    if target_key is None or lhs_key is None or rhs_key is None:
         return
-    macro = maps[macro_key]
-    if any(float(value) != 0.0 for row in macro for value in row):
+    if _matrix_shape(maps[lhs_key]) != _matrix_shape(maps[rhs_key]):
         return
-    maps[allcell_key] = [[float(value) for value in row] for row in maps[stdcell_key]]
+    maps[target_key] = [
+        [float(lhs_value) + float(rhs_value) for lhs_value, rhs_value in zip(lhs_row, rhs_row, strict=True)]
+        for lhs_row, rhs_row in zip(maps[lhs_key], maps[rhs_key], strict=True)
+    ]
+
+
+def _matrix_shape(matrix: MapMatrix) -> tuple[int, int]:
+    return (len(matrix), len(matrix[0]) if matrix else 0)
 
 
 def _first_key_containing(maps: dict[str, MapMatrix], token: str) -> str | None:

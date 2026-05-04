@@ -641,8 +641,11 @@ def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_dens
     ws = _make_workspace(tmp_path)
     _write_sample_gcell_info(ws / "CTS_ecc")
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[0.4, 0.5], [0.6, 0.7]])
-    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_density.csv", [[0, 0.01], [0.02, 0]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_density.csv", [[0.1, 0.2], [0.3, 0.4]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_pin_density.csv", [[10, 11], [12, 13]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_pin_density.csv", [[0, 1], [2, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_pin_density.csv", [[1, 2], [3, 4]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[1, 2], [3, 4]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_lut_rudy_union.csv", [[5, 6], [7, 8]])
 
@@ -656,8 +659,14 @@ def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_dens
     allcell = [item["value"] for item in cts_density["maps"]["cts_allcell_density"]["values"]]
     stdcell = [item["value"] for item in cts_density["maps"]["cts_stdcell_density"]["values"]]
     macro = [item["value"] for item in cts_density["maps"]["cts_macro_density"]["values"]]
-    assert macro == [0.0, 0.0, 0.0, 0.0]
-    assert allcell == stdcell
+    assert macro == [0.0, 0.01, 0.02, 0.0]
+    assert allcell == [0.1, 0.21000000000000002, 0.32, 0.4]
+    allcell_pin = [item["value"] for item in cts_density["maps"]["cts_allcell_pin_density"]["values"]]
+    stdcell_pin = [item["value"] for item in cts_density["maps"]["cts_stdcell_pin_density"]["values"]]
+    macro_pin = [item["value"] for item in cts_density["maps"]["cts_macro_pin_density"]["values"]]
+    assert macro_pin == [0.0, 1.0, 2.0, 0.0]
+    assert stdcell_pin == [1.0, 2.0, 3.0, 4.0]
+    assert allcell_pin == [1.0, 3.0, 5.0, 4.0]
 
     cts_rudy = json.loads((foundation_dir / "maps" / "CTS" / "rudy.json").read_text(encoding="utf-8"))
     assert set(cts_rudy["maps"]) == {"rudy_union"}
