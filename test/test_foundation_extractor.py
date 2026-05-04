@@ -381,7 +381,6 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "views/ml/dataset_index.json",
         "views/agent/run_summary.json",
         "labels/route_native_demand_capacity.jsonl",
-        "labels/route_reconstructed_demand_capacity.jsonl",
         "vectors/instances/place.jsonl",
         "vectors/tech/layers.json",
         "vectors/tech/cells.json",
@@ -489,6 +488,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert not (foundation_dir / "labels" / "route_hotspot_top5.jsonl").exists()
     assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
     assert not (foundation_dir / "labels" / "route_reconstructed_congestion.jsonl").exists()
+    assert not (foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl").exists()
 
     native_demand_capacity = [
         json.loads(line)
@@ -524,11 +524,10 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "availability" not in patches[0]
     assert patches[0]["wire_length_by_layer"]["MET2"] > 0
     assert "route_true_overflow" not in patches[0]
-    assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
+    assert "route_reconstructed_congestion" not in patches[0]
     assert patches[0]["route_native_demand_capacity"]["horizontal"] == 3.0
     assert patches[0]["route_native_demand_capacity"]["vertical"] == 2.0
-    assert patches[0]["route_reconstructed_demand_capacity"]["horizontal"] == 1.0
-    assert patches[0]["route_reconstructed_demand_capacity"]["vertical"] == 1.0
+    assert "route_reconstructed_demand_capacity" not in patches[0]
     assert patches[0]["route_demand_capacity"]["horizontal"] == 3.0
     assert patches[0]["route_demand_capacity"]["vertical"] == 2.0
     assert patches[0]["route_demand_capacity"]["source"] == "irt_space_router_native"
@@ -545,13 +544,14 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "profile" not in quality
     assert quality["availability"]["instances"]["place"] == "available"
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "available"
-    assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
+    assert "route_reconstructed_demand_capacity" not in quality["availability"]["labels"]
     assert "route_reconstructed_congestion" not in quality["availability"]["labels"]
     assert "route_patch_overflow" not in quality["availability"]["labels"]
     assert quality["availability"]["drc"]["drc"] == "available"
     assert quality["availability"]["timing_paths"]["route"] == "available"
     assert "null_reason" in quality
     assert "route_reconstructed_congestion_count" not in summary["labels"]
+    assert "route_reconstructed_demand_capacity_count" not in summary["labels"]
 
 
 def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path: Path):
@@ -572,45 +572,31 @@ def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path
     assert summary["labels"]["route_native_demand_capacity_count"] == 0
 
 
-def test_iccd_full_v1_keeps_only_reconstructed_demand_capacity_label(tmp_path: Path):
+def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_native_demand_capacity=False)
 
     FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     foundation_dir = ws / "foundation_data" / "ecc"
-    reconstructed = [
-        json.loads(line)
-        for line in (foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
 
     assert not (foundation_dir / "labels" / "route_patch_overflow.jsonl").exists()
     assert not (foundation_dir / "labels" / "route_reconstructed_congestion.jsonl").exists()
-    assert reconstructed
-    assert {item["source"] for item in reconstructed} == {"routed_def_tracks_reconstruction"}
-    assert reconstructed[0]["horizontal_overflow"] == 1.0
-    assert reconstructed[0]["vertical_overflow"] == 1.0
-    assert reconstructed[0]["horizontal_demand"] == 2.0
-    assert reconstructed[0]["horizontal_capacity"] == 1.0
-    assert reconstructed[0]["horizontal_demand_capacity"] == 1.0
-    assert reconstructed[0]["horizontal_utilization"] == 2.0
+    assert not (foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl").exists()
     native = (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8")
     assert "route_true_overflow" not in patches[0]
     assert patches[0]["route_native_demand_capacity"]["union"] is None
-    assert patches[0]["route_reconstructed_demand_capacity"]["union"] == 1.0
-    assert patches[0]["route_reconstructed_congestion"]["union"] == 1.0
-    assert patches[0]["route_demand_capacity"]["horizontal"] == 1.0
-    assert patches[0]["route_demand_capacity"]["vertical"] == 1.0
-    assert patches[0]["route_demand_capacity"]["source"] == "routed_def_tracks_reconstruction"
+    assert "route_reconstructed_demand_capacity" not in patches[0]
+    assert "route_reconstructed_congestion" not in patches[0]
+    assert patches[0]["route_demand_capacity"]["union"] is None
     assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
     assert native == ""
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
     assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
     assert "route_patch_overflow" not in quality["availability"].get("labels", {})
     assert "route_reconstructed_congestion" not in quality["availability"]["labels"]
-    assert quality["availability"]["labels"]["route_reconstructed_demand_capacity"] == "available"
+    assert "route_reconstructed_demand_capacity" not in quality["availability"]["labels"]
 
 
 def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):

@@ -70,8 +70,7 @@ class FoundationExtractor:
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
-        reconstructed_congestion = self._route_reconstructed_congestion(canonical_grid, def_data.get("route"), rt_logs.get("route"))
-        labels = self._write_labels(native_demand_capacity.get("labels", []), reconstructed_congestion)
+        labels = self._write_labels(native_demand_capacity.get("labels", []))
         self._write_tech(def_data, rt_logs)
         entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
@@ -428,9 +427,6 @@ class FoundationExtractor:
         native_demand_capacity_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_native_demand_capacity_records", [])
         }
-        reconstructed_by_patch = {
-            item["patch_id"]: item for item in labels.get("_route_reconstructed_congestion_records", [])
-        }
         for stage in stages:
             instances = self._parse_instances(stage)
             parsed_def = def_data.get(stage.name)
@@ -459,7 +455,6 @@ class FoundationExtractor:
                 pins,
                 wires,
                 native_demand_capacity_by_patch if stage.name == "route" else {},
-                reconstructed_by_patch if stage.name == "route" else {},
                 timing_paths,
                 drc_reports.get(stage.name),
             )
@@ -675,7 +670,6 @@ class FoundationExtractor:
         pins: list[dict[str, Any]],
         wires: list[dict[str, Any]],
         native_demand_capacity_by_patch: dict[int, dict[str, Any]],
-        reconstructed_by_patch: dict[int, dict[str, Any]],
         timing_paths: list[dict[str, Any]],
         drc_report: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
@@ -696,7 +690,6 @@ class FoundationExtractor:
                 layer = str(wire.get("layer"))
                 wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
             native_demand_capacity = native_demand_capacity_by_patch.get(int(patch["patch_id"]), {})
-            reconstructed = reconstructed_by_patch.get(int(patch["patch_id"]), {})
             patch_drc = _drc_for_patch(drc_report, bbox)
             record = {
                 "patch_id": patch["patch_id"],
@@ -709,15 +702,8 @@ class FoundationExtractor:
                 "net_count": len(net_names) if net_names else (len(nets) if not patch_wires and stage == "route" else 0),
                 "pin_count": len(pins) if stage == "route" and row == 0 and col == 0 else 0,
                 "wire_length_by_layer": wire_length_by_layer,
-                "route_reconstructed_congestion": {
-                    "horizontal": reconstructed.get("horizontal_overflow"),
-                    "vertical": reconstructed.get("vertical_overflow"),
-                    "union": reconstructed.get("union_overflow"),
-                    "by_layer": reconstructed.get("by_layer", {}),
-                },
                 "route_native_demand_capacity": _demand_capacity_label(native_demand_capacity),
-                "route_reconstructed_demand_capacity": _demand_capacity_label(reconstructed),
-                "route_demand_capacity": _demand_capacity_label(_demand_capacity_source(native_demand_capacity, reconstructed)),
+                "route_demand_capacity": _demand_capacity_label(native_demand_capacity),
                 "drc": patch_drc,
                 "timing": _timing_for_patch(timing_paths),
                 "electrical": _electrical_for_patch(timing_paths),
@@ -736,11 +722,7 @@ class FoundationExtractor:
             records.append(record)
         return records
 
-    def _write_labels(
-        self,
-        native_demand_capacity: list[dict[str, Any]],
-        reconstructed_congestion: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+    def _write_labels(self, native_demand_capacity: list[dict[str, Any]]) -> dict[str, Any]:
         write_jsonl(self.foundation_dir / "labels" / "route_native_demand_capacity.jsonl", native_demand_capacity)
         self._mark(
             "labels",
@@ -748,96 +730,10 @@ class FoundationExtractor:
             "available" if native_demand_capacity else "missing",
             "" if native_demand_capacity else "missing_irt_space_router_native_demand_capacity_artifact",
         )
-        write_jsonl(self.foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl", reconstructed_congestion)
-        self._mark(
-            "labels",
-            "route_reconstructed_demand_capacity",
-            "available" if reconstructed_congestion else "missing",
-            "" if reconstructed_congestion else "missing_routed_def_tracks_reconstruction_inputs",
-        )
         return {
             "route_native_demand_capacity_count": len(native_demand_capacity),
-            "route_reconstructed_demand_capacity_count": len(reconstructed_congestion),
             "_route_native_demand_capacity_records": native_demand_capacity,
-            "_route_reconstructed_congestion_records": reconstructed_congestion,
         }
-
-    def _route_reconstructed_congestion(self, canonical_grid: dict, parsed_def: DefData | None, rt_log: dict[str, Any] | None) -> list[dict[str, Any]]:
-        if not parsed_def or not rt_log or "total_overflow" not in rt_log.get("totals", {}):
-            return []
-        routed_wires = [wire for net in parsed_def.nets for wire in net.wires if wire.length > 0]
-        if not routed_wires:
-            return []
-        rows = int(canonical_grid["rows"])
-        cols = int(canonical_grid["cols"])
-        demand = {(row, col): {"horizontal": 0.0, "vertical": 0.0, "by_layer": {}} for row in range(rows) for col in range(cols)}
-        capacity = {(row, col): {"horizontal": 0.0, "vertical": 0.0} for row in range(rows) for col in range(cols)}
-        for track in parsed_def.tracks:
-            direction = "horizontal" if track.axis == "Y" else "vertical"
-            for idx in range(track.count):
-                pos = track.start + idx * track.step
-                for patch in canonical_grid.get("patches", []):
-                    bbox = patch["bbox"]
-                    row = int(patch["row"])
-                    col = int(patch["col"])
-                    if direction == "horizontal" and float(bbox["lly"]) <= pos <= float(bbox["ury"]):
-                        capacity[(row, col)][direction] += 1.0
-                    if direction == "vertical" and float(bbox["llx"]) <= pos <= float(bbox["urx"]):
-                        capacity[(row, col)][direction] += 1.0
-        for wire in routed_wires:
-            direction = wire.direction
-            for patch in canonical_grid.get("patches", []):
-                bbox = patch["bbox"]
-                if _segment_intersects_bbox(wire.x1, wire.y1, wire.x2, wire.y2, bbox):
-                    key = (int(patch["row"]), int(patch["col"]))
-                    demand[key][direction] += 1.0
-                    by_layer = demand[key]["by_layer"]
-                    layer_item = by_layer.setdefault(wire.layer, {"horizontal": 0.0, "vertical": 0.0})
-                    layer_item[direction] += 1.0
-        labels = []
-        total_overflow = float(rt_log.get("totals", {}).get("total_overflow") or 0.0)
-        for patch in canonical_grid.get("patches", []):
-            row = int(patch["row"])
-            col = int(patch["col"])
-            if total_overflow <= 0:
-                h = v = 0.0
-                by_layer_overflow = {}
-            else:
-                h = max(0.0, demand[(row, col)]["horizontal"] - capacity[(row, col)]["horizontal"])
-                v = max(0.0, demand[(row, col)]["vertical"] - capacity[(row, col)]["vertical"])
-                by_layer_overflow = demand[(row, col)]["by_layer"]
-            horizontal_demand = demand[(row, col)]["horizontal"]
-            vertical_demand = demand[(row, col)]["vertical"]
-            horizontal_capacity = capacity[(row, col)]["horizontal"]
-            vertical_capacity = capacity[(row, col)]["vertical"]
-            horizontal_demand_capacity = horizontal_demand - horizontal_capacity
-            vertical_demand_capacity = vertical_demand - vertical_capacity
-            labels.append(
-                {
-                    "patch_id": patch["patch_id"],
-                    "row": row,
-                    "col": col,
-                    "horizontal_demand": horizontal_demand,
-                    "vertical_demand": vertical_demand,
-                    "horizontal_capacity": horizontal_capacity,
-                    "vertical_capacity": vertical_capacity,
-                    "horizontal_demand_capacity": horizontal_demand_capacity,
-                    "vertical_demand_capacity": vertical_demand_capacity,
-                    "union_demand_capacity": max(horizontal_demand_capacity, vertical_demand_capacity),
-                    "horizontal_utilization": _safe_ratio(horizontal_demand, horizontal_capacity),
-                    "vertical_utilization": _safe_ratio(vertical_demand, vertical_capacity),
-                    "horizontal_overflow": h,
-                    "vertical_overflow": v,
-                    "union_overflow": max(h, v),
-                    "by_layer": by_layer_overflow,
-                    "source": "routed_def_tracks_reconstruction",
-                    "source_artifacts": {
-                        "def": str(parsed_def.path.relative_to(self.workspace_dir)),
-                        "rt_log": str(Path(rt_log["source"]).relative_to(self.workspace_dir)) if Path(rt_log["source"]).is_relative_to(self.workspace_dir) else rt_log["source"],
-                    },
-                }
-            )
-        return labels
 
     @staticmethod
     def _top_average_from_raw(route_maps: dict[str, list[list[float]]]) -> dict[str, float | None]:
@@ -1266,12 +1162,6 @@ def _extract_route_ppa_metrics(features: Any) -> dict[str, Any]:
         "route_via_count": last_iter.get("total_via_num"),
         "route_violation_count": last_iter.get("total_violation_num"),
     }
-
-def _demand_capacity_source(label: dict[str, Any], reconstructed: dict[str, Any]) -> dict[str, Any]:
-    if any(label.get(key) is not None for key in ("horizontal_demand_capacity", "vertical_demand_capacity", "union_demand_capacity")):
-        return label
-    return reconstructed
-
 
 def _strip_empty_info(flow: dict[str, Any]) -> dict[str, Any]:
     normalized = json.loads(json.dumps(flow))
