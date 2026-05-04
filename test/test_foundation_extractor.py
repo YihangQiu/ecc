@@ -142,6 +142,12 @@ def _make_workspace(
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_density.csv", [[10, 11], [12, 13]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_pin_density.csv", [[20, 21], [22, 23]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allnet_density.csv", [[30, 31], [32, 33]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_global_net_density.csv", [[34, 35], [36, 37]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_local_net_density.csv", [[38, 39], [40, 41]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_macro_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_macro_pin_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_stdcell_density.csv", [[10, 11], [12, 13]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_stdcell_pin_density.csv", [[20, 21], [22, 23]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "margin_map" / "place_union_margin.csv", [[40, 41], [42, 43]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_rudy_union.csv", [[50, 51], [52, 53]])
     _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_lut_rudy_union.csv", [[150, 151], [152, 153]])
@@ -497,9 +503,10 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert place_egr["maps"]["vertical"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 7.0}]
 
     indexed_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text())
-    assert [item["value"] for item in indexed_density["maps"]["place_allcell_density"]["values"]] == [10.0, 11.0, 12.0, 13.0]
-    assert [item["value"] for item in indexed_density["maps"]["place_allcell_pin_density"]["values"]] == [20.0, 21.0, 22.0, 23.0]
-    assert [item["value"] for item in indexed_density["maps"]["place_allnet_density"]["values"]] == [30.0, 31.0, 32.0, 33.0]
+    assert "place_allcell_density" not in indexed_density["maps"]
+    assert [item["value"] for item in indexed_density["maps"]["allcell_density"]["values"]] == [10.0, 11.0, 12.0, 13.0]
+    assert [item["value"] for item in indexed_density["maps"]["allcell_pin_density"]["values"]] == [20.0, 21.0, 22.0, 23.0]
+    assert [item["value"] for item in indexed_density["maps"]["allnet_density"]["values"]] == [30.0, 31.0, 32.0, 33.0]
 
     indexed_margin = json.loads((foundation_dir / "maps" / "place" / "margin.json").read_text())
     assert [item["value"] for item in indexed_margin["maps"]["union"]["values"]] == [40.0, 41.0, 42.0, 43.0]
@@ -591,6 +598,14 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     ws = _make_workspace(tmp_path)
     _write_sample_gcell_info(ws / "CTS_ecc")
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[100, 101], [102, 103]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_pin_density.csv", [[104, 105], [106, 107]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allnet_density.csv", [[108, 109], [110, 111]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_global_net_density.csv", [[112, 113], [114, 115]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_local_net_density.csv", [[116, 117], [118, 119]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_pin_density.csv", [[124, 125], [126, 127]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_density.csv", [[100, 101], [102, 103]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_pin_density.csv", [[132, 133], [134, 135]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[110, 111], [112, 113]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "margin_map" / "cts_union_margin.csv", [[120, 121], [122, 123]])
 
@@ -623,7 +638,8 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     assert floorplan_margin["maps"]["union"]["values"][0]["row"] == 0
 
     place_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text(encoding="utf-8"))
-    assert place_density["maps"]["place_allcell_density"]["values"][0] == {"patch_id": 0, "row": 0, "col": 0, "value": 10.0}
+    assert set(place_density["maps"]) == set(floorplan_density["maps"])
+    assert place_density["maps"]["allcell_density"]["values"][0] == {"patch_id": 0, "row": 0, "col": 0, "value": 10.0}
 
     place_egr = json.loads((foundation_dir / "maps" / "place" / "egr_overflow.json").read_text(encoding="utf-8"))
     assert place_egr["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
@@ -631,7 +647,8 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     assert "strictly_aligned" not in json.dumps(place_egr)
 
     cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
-    assert cts_density["maps"]["cts_allcell_density"]["values"][3] == {"patch_id": 3, "row": 1, "col": 1, "value": 103.0}
+    assert set(cts_density["maps"]) == set(floorplan_density["maps"])
+    assert cts_density["maps"]["allcell_density"]["values"][3] == {"patch_id": 3, "row": 1, "col": 1, "value": 103.0}
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert quality["availability"]["maps"]["Floorplan"] == "available"
@@ -656,14 +673,14 @@ def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_dens
     assert not (foundation_dir / "maps" / "raw").exists()
 
     cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
-    allcell = [item["value"] for item in cts_density["maps"]["cts_allcell_density"]["values"]]
-    stdcell = [item["value"] for item in cts_density["maps"]["cts_stdcell_density"]["values"]]
-    macro = [item["value"] for item in cts_density["maps"]["cts_macro_density"]["values"]]
+    allcell = [item["value"] for item in cts_density["maps"]["allcell_density"]["values"]]
+    stdcell = [item["value"] for item in cts_density["maps"]["stdcell_density"]["values"]]
+    macro = [item["value"] for item in cts_density["maps"]["macro_density"]["values"]]
     assert macro == [0.0, 0.01, 0.02, 0.0]
     assert allcell == [0.1, 0.21000000000000002, 0.32, 0.4]
-    allcell_pin = [item["value"] for item in cts_density["maps"]["cts_allcell_pin_density"]["values"]]
-    stdcell_pin = [item["value"] for item in cts_density["maps"]["cts_stdcell_pin_density"]["values"]]
-    macro_pin = [item["value"] for item in cts_density["maps"]["cts_macro_pin_density"]["values"]]
+    allcell_pin = [item["value"] for item in cts_density["maps"]["allcell_pin_density"]["values"]]
+    stdcell_pin = [item["value"] for item in cts_density["maps"]["stdcell_pin_density"]["values"]]
+    macro_pin = [item["value"] for item in cts_density["maps"]["macro_pin_density"]["values"]]
     assert macro_pin == [0.0, 1.0, 2.0, 0.0]
     assert stdcell_pin == [1.0, 2.0, 3.0, 4.0]
     assert allcell_pin == [1.0, 3.0, 5.0, 4.0]

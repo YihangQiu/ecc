@@ -24,6 +24,17 @@ _STAGE_DIR_OVERRIDES = {
     ("legalization", "dreamplace"): "legalization_dreamplace",
 }
 _ENTITY_NAMES = ("instances", "nets", "pins", "wires", "routing_graphs", "timing_paths", "patches")
+_DENSITY_MAP_KEY_ORDER = (
+    "allcell_density",
+    "macro_density",
+    "stdcell_density",
+    "allcell_pin_density",
+    "macro_pin_density",
+    "stdcell_pin_density",
+    "allnet_density",
+    "local_net_density",
+    "global_net_density",
+)
 MapMatrix = list[list[float]]
 StageMaps = dict[str, dict[str, MapMatrix]]
 CanonicalMaps = dict[str, StageMaps]
@@ -375,9 +386,13 @@ class FoundationExtractor:
                     f"exact ecc-tools gcell patch maps missing for {stage.name}:{category}:{sorted(missing_maps)}; omitted approximate Python recomputation"
                 )
             if category == "density":
+                exact_maps = _strip_stage_prefix_from_density_maps(exact_maps, stage.name)
                 _rebuild_allcell_maps(exact_maps)
             return exact_maps
-        return {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
+        resized = {key: resize_nearest(matrix, rows, cols) for key, matrix in category_maps.items()}
+        if category == "density" and stage is not None:
+            return _strip_stage_prefix_from_density_maps(resized, stage.name)
+        return resized
 
     def _ensure_floorplan_maps(
         self,
@@ -1101,6 +1116,19 @@ def _rebuild_allcell_maps(maps: dict[str, MapMatrix]) -> None:
 
     _replace_with_matrix_sum(maps, "allcell_density", "stdcell_density", "macro_density")
     _replace_with_matrix_sum(maps, "allcell_pin_density", "stdcell_pin_density", "macro_pin_density")
+
+
+def _strip_stage_prefix_from_density_maps(maps: dict[str, MapMatrix], stage: str) -> dict[str, MapMatrix]:
+    prefix = f"{stage.lower()}_"
+    stripped = {
+        key.removeprefix(prefix): matrix
+        for key, matrix in maps.items()
+    }
+    return {
+        key: stripped[key]
+        for key in [*list(_DENSITY_MAP_KEY_ORDER), *sorted(stripped)]
+        if key in stripped
+    }
 
 
 def _replace_with_matrix_sum(maps: dict[str, MapMatrix], target_token: str, lhs_token: str, rhs_token: str) -> None:
