@@ -10,6 +10,8 @@ def read_numeric_csv(path: Path) -> list[list[float]]:
         for row in csv.reader(handle):
             if not row:
                 continue
+            while row and row[-1].strip() == "":
+                row.pop()
             numeric_row: list[float] = []
             for cell in row:
                 value = cell.strip()

@@ -430,6 +430,18 @@ END DESIGN
     return ws
 
 
+def test_read_numeric_csv_ignores_trailing_empty_columns(tmp_path: Path):
+    from chipcompiler.data.foundation.parsers.map_csv import read_numeric_csv, shape
+
+    csv_path = tmp_path / "trailing.csv"
+    csv_path.write_text("1,2,\n3,,4,\n", encoding="utf-8")
+
+    matrix = read_numeric_csv(csv_path)
+
+    assert matrix == [[1.0, 2.0], [3.0, 0.0, 4.0]]
+    assert shape(matrix) == (2, 3)
+
+
 def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
