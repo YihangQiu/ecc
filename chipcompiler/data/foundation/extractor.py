@@ -587,7 +587,11 @@ class FoundationExtractor:
             wires = self._wire_records(stage, parsed_def)
             routing_graphs = self._routing_graph_records(stage, parsed_def)
             timing_paths = self._timing_path_records(stage, sta_reports.get(stage.name))
-            counts["instances"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl", instances)
+            counts["instances"][stage.name] = write_jsonl(
+                self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl",
+                instances,
+                sort_keys=False,
+            )
             stage_vectors = {
                 "nets": nets,
                 "pins": pins,
@@ -642,7 +646,7 @@ class FoundationExtractor:
                 if record is None:
                     continue
                 _attach_patch_anchor(record, canonical_grid or {}, stage_maps or {})
-                records.append({**record, "id": len(records)})
+                records.append(_ordered_instance_record(record, len(records)))
             if records:
                 break
         self._quality.setdefault("availability", {}).setdefault("instances", {})[stage.name] = "available" if records else "missing"
@@ -1273,6 +1277,22 @@ def _rebuild_allcell_maps(maps: dict[str, MapMatrix]) -> None:
     _replace_with_matrix_sum(maps, "allcell_density", "stdcell_density", "macro_density")
     _replace_with_matrix_sum(maps, "allcell_pin_density", "stdcell_pin_density", "macro_pin_density")
 
+
+def _ordered_instance_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "stage": record["stage"],
+        "name": record["name"],
+        "source": record["source"],
+        "identity": record["identity"],
+        "physical_state": record["physical_state"],
+        "connectivity_summary": record["connectivity_summary"],
+        "patch_anchor": record["patch_anchor"],
+        "progressive_metadata": record["progressive_metadata"],
+        "clock_tree": record["clock_tree"],
+        "route_analysis": record["route_analysis"],
+        "null_reason": record["null_reason"],
+    }
 
 def _instance_key_from_layout_name(name: str) -> str:
     if name.startswith("Instance_"):

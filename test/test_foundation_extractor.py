@@ -643,6 +643,27 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
 
 
 
+def test_iccd_full_v1_orders_instance_record_fields_like_documented_schema(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+
+    row = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()[0])
+    assert list(row) == [
+        "id",
+        "stage",
+        "name",
+        "source",
+        "identity",
+        "physical_state",
+        "connectivity_summary",
+        "patch_anchor",
+        "progressive_metadata",
+        "clock_tree",
+        "route_analysis",
+        "null_reason",
+    ]
+
 def test_iccd_full_v1_enriches_instances_from_def_components(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     _write_text(
