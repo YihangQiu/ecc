@@ -82,6 +82,7 @@ class FoundationExtractor:
         sta_reports = self._collect_sta_reports(selected_stages)
         drc_reports = self._collect_drc_reports(selected_stages)
         raw_maps = self._collect_raw_maps(selected_stages)
+        self._merge_egr_demand_capacity_maps(raw_maps, selected_stages)
         die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
@@ -244,6 +245,27 @@ class FoundationExtractor:
                 self._quality.setdefault("availability", {}).setdefault("maps", {})[stage.name] = "missing"
         return out
 
+    def _merge_egr_demand_capacity_maps(
+        self,
+        raw_maps: dict[str, dict[str, dict[str, list[list[float]]]]],
+        stages: list[StageInfo],
+    ) -> None:
+        for stage in stages:
+            if stage.name not in {"place", "CTS"}:
+                continue
+            maps, source_paths = _egr_demand_capacity_maps_from_stage(stage.directory)
+            if not maps:
+                continue
+            raw_maps.setdefault(stage.name, {})["congestion"] = maps
+            self._quality.setdefault("availability", {}).setdefault("maps", {})[stage.name] = "available"
+            for source_path in source_paths:
+                self._record_raw_ref(
+                    stage,
+                    source_path,
+                    "egr_demand_capacity_map_csv",
+                    {"category": "congestion", "grid_source": "irt_early_router"},
+                )
+
     @staticmethod
     def _classify_map(path: Path) -> tuple[str, str]:
         name = path.stem.lower()
@@ -253,7 +275,7 @@ class FoundationExtractor:
                 direction = candidate
                 break
         if "egr" in name and "overflow" in name:
-            return "egr_overflow", direction
+            return "ignored", name
         if "rudy" in name:
             if "lut" in name:
                 return "ignored", name
@@ -369,12 +391,12 @@ class FoundationExtractor:
         rows: int,
         cols: int,
     ) -> dict[str, list[list[float]]]:
-        if category == "egr_overflow":
+        if category == "congestion":
             for key, matrix in category_maps.items():
                 src_shape = shape(matrix)
                 if src_shape != (rows, cols):
                     self._quality.setdefault("warnings", []).append(
-                        f"egr map {stage.name if stage else 'unknown'}:{key} shape {src_shape} does not match canonical gcell grid {(rows, cols)}; kept raw without resize"
+                        f"congestion map {stage.name if stage else 'unknown'}:{key} shape {src_shape} does not match canonical gcell grid {(rows, cols)}; kept raw without resize"
                     )
             return {key: [[float(value) for value in row] for row in matrix] for key, matrix in category_maps.items()}
         if canonical_grid.get("grid_source") == "irt_gcell_info" and stage is not None and category in {"density", "rudy", "margin"}:
@@ -796,7 +818,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         records = []
         density_maps = stage_maps.get("density", {})
-        egr_maps = stage_maps.get("egr_overflow", {})
+        congestion_maps = stage_maps.get("congestion", {})
         rudy_maps = stage_maps.get("rudy", {})
         margin_maps = stage_maps.get("margin", {})
         for patch in canonical_grid.get("patches", []):
@@ -835,9 +857,9 @@ class FoundationExtractor:
                 "rudy_congestion": _value_from_named_map(rudy_maps, "rudy_union", row, col),
                 "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col),
                 "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col),
-                "egr_overflow_horizontal": _matrix_value(egr_maps.get("horizontal"), row, col),
-                "egr_overflow_vertical": _matrix_value(egr_maps.get("vertical"), row, col),
-                "egr_overflow_union": _matrix_value(egr_maps.get("union"), row, col),
+                "congestion_horizontal": _matrix_value(congestion_maps.get("horizontal"), row, col),
+                "congestion_vertical": _matrix_value(congestion_maps.get("vertical"), row, col),
+                "congestion_union": _matrix_value(congestion_maps.get("union"), row, col),
                 "source": "canonical_grid",
             }
             records.append(record)
@@ -1239,6 +1261,94 @@ def _floorplan_specific_patch_maps(
         "power_grid_density": _patch_shape_density(patches, rows, cols, power_grid_shapes),
         "physical_only_cell_density": _patch_shape_density(patches, rows, cols, physical_only_cells),
     }
+
+
+def _egr_demand_capacity_maps_from_stage(stage_dir: Path) -> tuple[dict[str, MapMatrix], list[Path]]:
+    early_router = stage_dir / "data" / "rt" / "rt_temp_directory" / "early_router"
+    if not early_router.exists():
+        return {}, []
+    layer_directions = _layer_directions_from_route_guide(early_router / "route.guide")
+    if not layer_directions:
+        return {}, []
+    demand_by_direction: dict[str, list[MapMatrix]] = {"horizontal": [], "vertical": []}
+    source_paths: list[Path] = []
+    for layer, direction in layer_directions.items():
+        if direction not in demand_by_direction:
+            continue
+        demand_path = early_router / f"net_map_{layer}.csv"
+        capacity_path = early_router / f"supply_map_{layer}.csv"
+        if not demand_path.exists() or not capacity_path.exists():
+            continue
+        demand = _read_early_router_csv_matrix(demand_path)
+        capacity = _read_early_router_csv_matrix(capacity_path)
+        if not demand or shape(demand) != shape(capacity):
+            continue
+        demand_by_direction[direction].append(_matrix_subtract(demand, capacity))
+        source_paths.extend([demand_path, capacity_path])
+    horizontal = _sum_matrices(demand_by_direction["horizontal"])
+    vertical = _sum_matrices(demand_by_direction["vertical"])
+    if not horizontal and not vertical:
+        return {}, source_paths
+    if not horizontal:
+        horizontal = _empty_matrix(*_matrix_shape(vertical))
+    if not vertical:
+        vertical = _empty_matrix(*_matrix_shape(horizontal))
+    if _matrix_shape(horizontal) != _matrix_shape(vertical):
+        return {}, source_paths
+    union = [
+        [max(float(h_value), float(v_value)) for h_value, v_value in zip(h_row, v_row, strict=True)]
+        for h_row, v_row in zip(horizontal, vertical, strict=True)
+    ]
+    return {"horizontal": horizontal, "vertical": vertical, "union": union}, source_paths
+
+
+def _read_early_router_csv_matrix(path: Path) -> MapMatrix:
+    matrix = read_numeric_csv(path)
+    return list(reversed(matrix))
+
+
+def _layer_directions_from_route_guide(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    directions: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 10 or parts[0] != "wire":
+            continue
+        layer = parts[9]
+        if layer in directions:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(parts[index]) for index in (1, 2, 3, 4))
+        except ValueError:
+            continue
+        if x1 == x2 and y1 != y2:
+            directions[layer] = "vertical"
+        elif y1 == y2 and x1 != x2:
+            directions[layer] = "horizontal"
+    return directions
+
+
+def _matrix_subtract(lhs: MapMatrix, rhs: MapMatrix) -> MapMatrix:
+    return [
+        [float(lhs_value) - float(rhs_value) for lhs_value, rhs_value in zip(lhs_row, rhs_row, strict=True)]
+        for lhs_row, rhs_row in zip(lhs, rhs, strict=True)
+    ]
+
+
+def _sum_matrices(matrices: list[MapMatrix]) -> MapMatrix:
+    if not matrices:
+        return []
+    rows, cols = _matrix_shape(matrices[0])
+    out = _empty_matrix(rows, cols)
+    for matrix in matrices:
+        if _matrix_shape(matrix) != (rows, cols):
+            return []
+        out = [
+            [float(lhs_value) + float(rhs_value) for lhs_value, rhs_value in zip(lhs_row, rhs_row, strict=True)]
+            for lhs_row, rhs_row in zip(out, matrix, strict=True)
+        ]
+    return out
 
 
 def _physical_only_cells_from_floorplan_def(parsed_def: DefData) -> list[dict[str, Any]]:

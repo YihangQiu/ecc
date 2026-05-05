@@ -39,6 +39,29 @@ def _write_sample_gcell_info(stage_dir: Path) -> None:
     )
 
 
+def _write_sample_egr_demand_capacity(stage_dir: Path) -> None:
+    early_router = stage_dir / "data" / "rt" / "rt_temp_directory" / "early_router"
+    _write_text(
+        early_router / "route.guide",
+        "\n".join(
+            [
+                "guide net_name",
+                "pin grid_x grid_y real_x real_y layer energy name",
+                "wire grid1_x grid1_y grid2_x grid2_y real1_x real1_y real2_x real2_y layer",
+                "via grid_x grid_y real_x real_y layer1 layer2",
+                "guide n1",
+                "wire 0 0 1 0 0 0 120 0 MET2",
+                "wire 0 0 0 1 0 0 0 80 MET3",
+            ]
+        )
+        + "\n",
+    )
+    _write_csv(early_router / "net_map_MET2.csv", [[8, 1], [3, 4]])
+    _write_csv(early_router / "supply_map_MET2.csv", [[5, 5], [2, 1]])
+    _write_csv(early_router / "net_map_MET3.csv", [[0, 9], [6, 1]])
+    _write_csv(early_router / "supply_map_MET3.csv", [[1, 2], [3, 4]])
+
+
 def _make_workspace(
     tmp_path: Path,
     *,
@@ -208,6 +231,7 @@ END DESIGN
         + "\n",
     )
     _write_sample_gcell_info(ws / "place_dreamplace")
+    _write_sample_egr_demand_capacity(ws / "place_dreamplace")
     _write_json(
         ws / "place_dreamplace" / "feature" / "place.map.json",
         {
@@ -433,9 +457,10 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "vectors/timing_paths/route.jsonl",
         "vectors/patches/place.jsonl",
         "maps/place/density.json",
-        "maps/place/egr_overflow.json",
+        "maps/place/congestion.json",
     ]:
         assert (foundation_dir / rel).exists(), rel
+    assert not (foundation_dir / "maps" / "place" / "egr_overflow.json").exists()
 
     summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
     assert "profile" not in summary
@@ -505,9 +530,11 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert grid["patches"][0]["col"] == 0
     assert "gcell" not in grid["patches"][0]
 
-    place_egr = json.loads((foundation_dir / "maps" / "place" / "egr_overflow.json").read_text())
-    assert place_egr["maps"]["horizontal"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 5.0}]
-    assert place_egr["maps"]["vertical"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 7.0}]
+    place_congestion = json.loads((foundation_dir / "maps" / "place" / "congestion.json").read_text())
+    assert place_congestion["category"] == "congestion"
+    assert [item["value"] for item in place_congestion["maps"]["horizontal"]["values"]] == [1.0, 3.0, 3.0, -4.0]
+    assert [item["value"] for item in place_congestion["maps"]["vertical"]["values"]] == [3.0, -3.0, -1.0, 7.0]
+    assert [item["value"] for item in place_congestion["maps"]["union"]["values"]] == [3.0, 3.0, 3.0, 7.0]
 
     indexed_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text())
     assert "place_allcell_density" not in indexed_density["maps"]
@@ -604,6 +631,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
 def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     _write_sample_gcell_info(ws / "CTS_ecc")
+    _write_sample_egr_demand_capacity(ws / "CTS_ecc")
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[100, 101], [102, 103]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_pin_density.csv", [[104, 105], [106, 107]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allnet_density.csv", [[108, 109], [110, 111]])
@@ -634,8 +662,9 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
         "maps/Floorplan/density.json",
         "maps/Floorplan/floorplan.json",
         "maps/place/density.json",
-        "maps/place/egr_overflow.json",
+        "maps/place/congestion.json",
         "maps/CTS/density.json",
+        "maps/CTS/congestion.json",
     ]:
         assert (foundation_dir / rel).exists(), rel
 
@@ -663,10 +692,10 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     assert set(place_density["maps"]) == set(floorplan_density["maps"])
     assert place_density["maps"]["allcell_density"]["values"][0] == {"patch_id": 0, "row": 0, "col": 0, "value": 10.0}
 
-    place_egr = json.loads((foundation_dir / "maps" / "place" / "egr_overflow.json").read_text(encoding="utf-8"))
-    assert place_egr["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
-    assert place_egr["maps"]["horizontal"]["values"] == [{"patch_id": 0, "row": 0, "col": 0, "value": 5.0}]
-    assert "strictly_aligned" not in json.dumps(place_egr)
+    place_congestion = json.loads((foundation_dir / "maps" / "place" / "congestion.json").read_text(encoding="utf-8"))
+    assert place_congestion["grid"] == {"source": "irt_gcell_info", "rows": 2, "cols": 2}
+    assert [item["value"] for item in place_congestion["maps"]["union"]["values"]] == [3.0, 3.0, 3.0, 7.0]
+    assert "strictly_aligned" not in json.dumps(place_congestion)
 
     cts_density = json.loads((foundation_dir / "maps" / "CTS" / "density.json").read_text(encoding="utf-8"))
     assert set(cts_density["maps"]) == set(place_density["maps"])
