@@ -597,7 +597,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     timing_paths = [json.loads(line) for line in (foundation_dir / "vectors" / "timing_paths" / "route.jsonl").read_text().splitlines()]
     assert nets[0]["name"] == "n1"
     assert all("availability" not in item for item in [*nets, *pins, *wires, *timing_paths])
-    assert any(pin["pin_name"] == "OUT" for pin in pins)
+    assert any(pin["identity"]["pin_name"] == "OUT" for pin in pins)
     assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
     assert timing_paths and timing_paths[0]["slack"] == 1.0
     assert timing_paths[0]["arc_sequence"][0]["name"] == "U1/A"
@@ -1148,3 +1148,194 @@ def test_iccd_full_v1_rejects_unknown_stage_filter(tmp_path: Path):
         assert "unknown foundation extraction stage" in str(exc)
     else:
         raise AssertionError("expected unknown stage to fail")
+
+
+def test_iccd_full_v1_writes_canonical_pin_records_without_flat_fields(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + USE SIGNAL + LAYER MET2 ( -5 -5 ) ( 5 5 ) + PLACED ( 180 50 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( U1 A ) ( PIN OUT ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+
+    rows = [
+        json.loads(line)
+        for line in (ws / "foundation_data" / "ecc" / "vectors" / "pins" / "place.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    io_pin = next(row for row in rows if row["pin_key"] == "PIN:OUT")
+    inst_pin = next(row for row in rows if row["pin_key"] == "U1:A")
+
+    assert list(io_pin) == [
+        "id",
+        "stage",
+        "pin_key",
+        "source",
+        "identity",
+        "electrical_context",
+        "parent_instance",
+        "geometry",
+        "connectivity_context",
+        "timing_context",
+        "patch_anchor",
+        "route_context",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+    ]
+    assert {"instance", "net", "pin_name", "direction", "bbox", "center", "layer", "patch_id"}.isdisjoint(io_pin)
+    assert io_pin["identity"] == {
+        "pin_key": "PIN:OUT",
+        "pin_kind": "io_port",
+        "instance": "PIN",
+        "parent_instance_key": None,
+        "parent_master": None,
+        "pin_name": "OUT",
+        "full_name": "PIN/OUT",
+        "net": "n1",
+        "net_key": "n1",
+        "is_io": True,
+        "is_macro_pin": False,
+        "classification_source": "def_section",
+    }
+    assert io_pin["electrical_context"]["direction"] == "OUTPUT"
+    assert io_pin["electrical_context"]["use"] == "SIGNAL"
+    assert io_pin["electrical_context"]["direction_source"] == "def_pin_direction"
+    assert io_pin["geometry"]["geometry_status"] == "exact"
+    assert io_pin["geometry"]["anchor_source"] == "io_pin_shape"
+    assert io_pin["geometry"]["bbox"] == {"llx": 175.0, "lly": 45.0, "urx": 185.0, "ury": 55.0}
+    assert io_pin["geometry"]["center"] == {"x": 180.0, "y": 50.0}
+    assert io_pin["geometry"]["layers"] == ["MET2"]
+    assert io_pin["patch_anchor"]["anchor_source"] == "exact_pin_geometry"
+    assert io_pin["route_context"] is None
+    assert io_pin["progressive_metadata"]["route_only_oracle"] is False
+    assert inst_pin["parent_instance"]["instance_key"] == "U1"
+    assert inst_pin["geometry"]["geometry_status"] == "fallback_to_instance_anchor"
+    assert inst_pin["geometry"]["anchor_source"] == "parent_instance_center"
+    assert inst_pin["geometry"]["bbox"] is None
+    assert inst_pin["null_reason"]["geometry_bbox"] == "missing_lef_pin_shape"
+    assert inst_pin["connectivity_context"]["net_degree"] == 2
+    assert inst_pin["connectivity_context"]["same_net_pin_count"] == 2
+
+
+def test_iccd_full_v1_pin_progressive_and_route_leakage_guard(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 DFFHQNX1H7L + PLACED ( 10 20 ) N ;
+END COMPONENTS
+NETS 1 ;
+- clk ( U1 CK ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_text(
+        ws / "CTS_ecc" / "output" / "gcd_CTS.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 DFFHQNX1H7L + PLACED ( 12 22 ) N ;
+- clk_leaf_0_0_buf BUFX1P4H7L + PLACED ( 80 80 ) N ;
+END COMPONENTS
+NETS 2 ;
+- clk ( clk_leaf_0_0_buf A ) ;
+- clk_leaf ( clk_leaf_0_0_buf Y ) ( U1 CK ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "CTS_ecc" / "output" / "gcd_CTS.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {"type": "group", "struct name": "Instance_U1", "children": [{"type": "box", "layer": 0, "path": [[12, 22], [32, 22], [32, 42], [12, 42], [12, 22]]}]},
+                {"type": "group", "struct name": "clk_leaf_0_0_buf", "children": [{"type": "box", "layer": 0, "path": [[80, 80], [90, 80], [90, 90], [80, 90], [80, 80]]}]},
+            ],
+        },
+    )
+
+    _write_text(
+        ws / "route_ecc" / "output" / "gcd_route.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 DFFHQNX1H7L + PLACED ( 12 22 ) N ;
+- clk_leaf_0_0_buf BUFX1P4H7L + PLACED ( 80 80 ) N ;
+END COMPONENTS
+NETS 2 ;
+- clk ( clk_leaf_0_0_buf A )
+  + ROUTED MET2 ( 80 80 ) ( 120 * )
+  ;
+- clk_leaf ( clk_leaf_0_0_buf Y ) ( U1 CK )
+  + ROUTED MET3 ( 80 80 ) ( * 120 )
+  ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "CTS", "route"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    place_pin = json.loads((foundation_dir / "vectors" / "pins" / "place.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    cts_rows = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "CTS.jsonl").read_text(encoding="utf-8").splitlines()]
+    route_rows = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route.jsonl").read_text(encoding="utf-8").splitlines()]
+    new_cts_pin = next(row for row in cts_rows if row["pin_key"] == "clk_leaf_0_0_buf:A")
+    moved_cts_pin = next(row for row in cts_rows if row["pin_key"] == "U1:CK")
+    route_pin = next(row for row in route_rows if row["pin_key"] == "clk_leaf_0_0_buf:A")
+
+    assert place_pin["route_context"] is None
+    assert place_pin["progressive_metadata"]["route_only_oracle"] is False
+    assert "local_final_overflow" not in json.dumps(place_pin)
+    assert new_cts_pin["progressive_metadata"]["available_from"] == "CTS"
+    assert new_cts_pin["progressive_metadata"]["introduced_by_cts"] is True
+    assert new_cts_pin["progressive_metadata"]["exists_in_place"] is False
+    assert moved_cts_pin["progressive_metadata"]["prev_net"] == "clk"
+    assert moved_cts_pin["progressive_metadata"]["net_changed_from_prev_stage"] is True
+    assert moved_cts_pin["progressive_metadata"]["moved_from_prev_stage"] is True
+    assert route_pin["route_context"]["route_only_oracle"] is True
+    assert route_pin["progressive_metadata"]["route_only_oracle"] is True
+    assert route_pin["route_context"]["net_routed_length"] == 40.0

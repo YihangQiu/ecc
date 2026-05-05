@@ -583,7 +583,14 @@ class FoundationExtractor:
             parsed_def = def_data.get(stage.name)
             instances = instances_by_stage.get(stage.name, [])
             nets = self._net_records(stage, parsed_def)
-            pins = self._pin_records(stage, parsed_def)
+            pins = self._pin_records(
+                stage,
+                parsed_def,
+                instances,
+                canonical_grid,
+                canonical_maps.get(stage.name, {}),
+                sta_reports.get(stage.name),
+            )
             wires = self._wire_records(stage, parsed_def)
             routing_graphs = self._routing_graph_records(stage, parsed_def)
             timing_paths = self._timing_path_records(stage, sta_reports.get(stage.name))
@@ -600,7 +607,7 @@ class FoundationExtractor:
                 "timing_paths": timing_paths,
             }
             for entity, records in stage_vectors.items():
-                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records)
+                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity != "pins")
                 self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
                 stage.name,
@@ -616,6 +623,7 @@ class FoundationExtractor:
             )
             counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
+        _attach_pin_progressive_metadata(stages, self.foundation_dir / "vectors" / "pins")
         return counts
 
     def _parse_instances(
@@ -754,24 +762,26 @@ class FoundationExtractor:
             )
         return records
 
-    def _pin_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
+    def _pin_records(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData | None,
+        instances: list[dict[str, Any]],
+        canonical_grid: dict,
+        stage_maps: dict[str, dict[str, list[list[float]]]],
+        sta_report: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
-        records: list[dict[str, Any]] = []
-        for pin in [*parsed_def.pins, *(pin for net in parsed_def.nets for pin in net.pins)]:
-            records.append(
-                {
-                    "id": len(records),
-                    "stage": stage.name,
-                    "net": pin.get("net"),
-                    "instance": pin.get("instance"),
-                    "pin_name": pin.get("pin_name"),
-                    "direction": pin.get("direction"),
-                    "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                    "null_reason": {"direction": "def_net_connection_missing_direction"} if pin.get("direction") is None else {},
-                }
-            )
-        return records
+        return _pin_records_for_stage(
+            stage,
+            parsed_def,
+            instances,
+            canonical_grid,
+            stage_maps,
+            sta_report,
+            self.workspace_dir,
+        )
 
     def _wire_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
         if not parsed_def:
@@ -1445,6 +1455,593 @@ def _attach_connectivity_summaries(records: list[dict[str, Any]], parsed_def: De
         }
         if connected_nets and not has_center:
             record.setdefault("null_reason", {})["connectivity_hpwl"] = "not_available_before_placement"
+
+
+def _pin_records_for_stage(
+    stage: StageInfo,
+    parsed_def: DefData,
+    instances: list[dict[str, Any]],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+    sta_report: dict[str, Any] | None,
+    workspace_dir: Path,
+) -> list[dict[str, Any]]:
+    source = str(parsed_def.path.relative_to(workspace_dir))
+    instance_by_key = {str(record.get("identity", {}).get("instance_key")): record for record in instances}
+    component_by_name = {str(component.get("name")): component for component in parsed_def.components}
+    net_by_name = {net.name: net for net in parsed_def.nets}
+    net_use_by_name = {net.name: net.use for net in parsed_def.nets if net.use}
+    raw_pins: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for def_index, pin in enumerate(parsed_def.pins):
+        record = {
+            **pin,
+            "pin_kind": "io_port",
+            "def_section": "PINS",
+            "def_index": pin.get("def_index", def_index),
+        }
+        key = _pin_key(record)
+        if key not in seen:
+            raw_pins.append(record)
+            seen.add(key)
+
+    for net in parsed_def.nets:
+        for def_index, pin in enumerate(net.pins):
+            if str(pin.get("instance")) == "PIN":
+                continue
+            record = {
+                **pin,
+                "net": pin.get("net") or net.name,
+                "pin_kind": "instance_terminal",
+                "def_section": "NETS",
+                "def_index": def_index,
+            }
+            key = _pin_key(record)
+            if key not in seen:
+                raw_pins.append(record)
+                seen.add(key)
+
+    interim = [
+        _build_pin_record(
+            record_id,
+            stage,
+            raw_pin,
+            source,
+            instance_by_key,
+            component_by_name,
+            net_use_by_name,
+            canonical_grid,
+            stage_maps,
+            sta_report,
+            workspace_dir,
+            parsed_def,
+        )
+        for record_id, raw_pin in enumerate(raw_pins)
+    ]
+    _attach_pin_connectivity_context(interim, net_by_name)
+    return [_ordered_pin_record(record, idx) for idx, record in enumerate(interim)]
+
+
+def _build_pin_record(
+    record_id: int,
+    stage: StageInfo,
+    raw_pin: dict[str, Any],
+    source: str,
+    instance_by_key: dict[str, dict[str, Any]],
+    component_by_name: dict[str, dict[str, Any]],
+    net_use_by_name: dict[str, str],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+    sta_report: dict[str, Any] | None,
+    workspace_dir: Path,
+    parsed_def: DefData,
+) -> dict[str, Any]:
+    del record_id
+    pin_kind = str(raw_pin.get("pin_kind") or "instance_terminal")
+    instance_name = str(raw_pin.get("instance") or "")
+    pin_name = str(raw_pin.get("pin_name") or "")
+    parent_key = None if pin_kind == "io_port" else instance_name
+    parent = instance_by_key.get(parent_key or "")
+    component = component_by_name.get(parent_key or "")
+    net = str(raw_pin.get("net") or "")
+    pin_key = _pin_key(raw_pin)
+    null_reason: dict[str, str] = {}
+    identity = _pin_identity(raw_pin, pin_key, parent, component)
+    parent_instance = _pin_parent_instance(parent, component, parent_key)
+    electrical = _pin_electrical_context(raw_pin, net_use_by_name.get(net), null_reason)
+    geometry = _pin_geometry(raw_pin, pin_kind, parent_instance, canonical_grid, null_reason)
+    patch_anchor = _pin_patch_anchor(geometry, canonical_grid, stage_maps)
+    timing_context = _pin_timing_context(pin_key, identity["full_name"], net, sta_report, workspace_dir)
+    if timing_context["available"] and timing_context["timing_path_count"] == 0:
+        null_reason["timing_context"] = "pin_not_found_in_timing_paths"
+    elif not timing_context["available"]:
+        null_reason["timing_context"] = "missing_sta_artifacts"
+    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps)
+    if route_context is None:
+        null_reason["route_context"] = "not_route_stage"
+    return {
+        "stage": stage.name,
+        "pin_key": pin_key,
+        "source": source,
+        "identity": identity,
+        "electrical_context": electrical,
+        "parent_instance": parent_instance,
+        "geometry": geometry,
+        "connectivity_context": {},
+        "timing_context": timing_context,
+        "patch_anchor": patch_anchor,
+        "route_context": route_context,
+        "progressive_metadata": {},
+        "source_refs": {
+            "def": source,
+            "def_section": raw_pin.get("def_section"),
+            "def_index": raw_pin.get("def_index"),
+            "lef": None,
+            "lef_macro": identity.get("parent_master"),
+            "lef_pin": pin_name,
+            "liberty": None,
+            "sta": timing_context.get("source"),
+            "route": route_context.get("source") if isinstance(route_context, dict) else None,
+        },
+        "null_reason": null_reason,
+    }
+
+
+def _pin_identity(
+    raw_pin: dict[str, Any],
+    pin_key: str,
+    parent: dict[str, Any] | None,
+    component: dict[str, Any] | None,
+) -> dict[str, Any]:
+    pin_kind = str(raw_pin.get("pin_kind") or "instance_terminal")
+    instance_name = str(raw_pin.get("instance") or "")
+    pin_name = str(raw_pin.get("pin_name") or "")
+    parent_identity = parent.get("identity", {}) if isinstance(parent, dict) else {}
+    parent_master = parent_identity.get("master") or (component.get("master") if isinstance(component, dict) else None)
+    physical_class = parent_identity.get("physical_class")
+    return {
+        "pin_key": pin_key,
+        "pin_kind": pin_kind,
+        "instance": instance_name,
+        "parent_instance_key": None if pin_kind == "io_port" else instance_name,
+        "parent_master": parent_master,
+        "pin_name": pin_name,
+        "full_name": f"PIN/{pin_name}" if pin_kind == "io_port" else f"{instance_name}/{pin_name}",
+        "net": raw_pin.get("net"),
+        "net_key": raw_pin.get("net"),
+        "is_io": pin_kind == "io_port",
+        "is_macro_pin": physical_class == "macro",
+        "classification_source": "def_section" if pin_kind == "io_port" else "def_component_join",
+    }
+
+
+def _pin_parent_instance(
+    parent: dict[str, Any] | None,
+    component: dict[str, Any] | None,
+    parent_key: str | None,
+) -> dict[str, Any] | None:
+    if parent_key is None:
+        return None
+    identity = parent.get("identity", {}) if isinstance(parent, dict) else {}
+    physical_state = parent.get("physical_state", {}) if isinstance(parent, dict) else {}
+    master = identity.get("master") or (component.get("master") if isinstance(component, dict) else None)
+    return {
+        "instance_key": parent_key,
+        "name": parent.get("name") if isinstance(parent, dict) else parent_key,
+        "master": master,
+        "cell_class": identity.get("cell_class") or _cell_class(str(master or ""), parent_key),
+        "physical_class": identity.get("physical_class") or _physical_class(str(master or ""), parent_key),
+        "bbox": physical_state.get("bbox"),
+        "center": physical_state.get("center"),
+        "orientation": physical_state.get("orientation") or (component.get("orientation") if isinstance(component, dict) else None),
+        "patch_id": physical_state.get("patch_id"),
+        "overlap_patch_ids": physical_state.get("overlap_patch_ids") or [],
+    }
+
+
+def _pin_electrical_context(raw_pin: dict[str, Any], net_use: str | None, null_reason: dict[str, str]) -> dict[str, Any]:
+    direction = str(raw_pin.get("direction") or "UNKNOWN").upper()
+    use = str(raw_pin.get("use") or net_use or "UNKNOWN").upper()
+    name_blob = f"{raw_pin.get('net') or ''} {raw_pin.get('pin_name') or ''}".lower()
+    is_clock = use == "CLOCK" or _is_clock_like(name_blob)
+    is_reset = "reset" in name_blob or "rst" in name_blob
+    is_power_ground = use in {"POWER", "GROUND"} or any(token in name_blob.split() for token in ("vdd", "vss", "vcc", "gnd"))
+    if direction == "UNKNOWN":
+        null_reason["electrical_direction"] = "missing_pin_direction"
+    if use == "UNKNOWN":
+        null_reason["electrical_use"] = "missing_pin_use"
+    return {
+        "direction": direction,
+        "use": "CLOCK" if is_clock and use == "UNKNOWN" else "RESET" if is_reset and use == "UNKNOWN" else use,
+        "is_clock": is_clock,
+        "is_reset": is_reset,
+        "is_power_ground": is_power_ground,
+        "is_signal": not is_clock and not is_reset and not is_power_ground and use in {"SIGNAL", "UNKNOWN"},
+        "direction_source": "def_pin_direction" if raw_pin.get("direction") else "unknown",
+        "use_source": "def_pin_use" if raw_pin.get("use") else "def_net_use" if net_use else "heuristic_name_rule" if is_clock or is_reset or is_power_ground else "unknown",
+    }
+
+
+def _pin_geometry(
+    raw_pin: dict[str, Any],
+    pin_kind: str,
+    parent_instance: dict[str, Any] | None,
+    canonical_grid: dict,
+    null_reason: dict[str, str],
+) -> dict[str, Any]:
+    if pin_kind == "io_port":
+        origin = raw_pin.get("origin")
+        shapes = raw_pin.get("shapes") if isinstance(raw_pin.get("shapes"), list) else []
+        if isinstance(origin, dict) and shapes:
+            absolute_shapes = []
+            boxes = []
+            for idx, shape in enumerate(shapes):
+                rect = shape.get("rect") if isinstance(shape, dict) else None
+                if not isinstance(rect, dict):
+                    continue
+                abs_rect = {
+                    "llx": float(origin["x"]) + float(rect["llx"]),
+                    "lly": float(origin["y"]) + float(rect["lly"]),
+                    "urx": float(origin["x"]) + float(rect["urx"]),
+                    "ury": float(origin["y"]) + float(rect["ury"]),
+                }
+                boxes.append(abs_rect)
+                absolute_shapes.append(
+                    {
+                        "shape_id": idx,
+                        "port_index": 0,
+                        "layer": shape.get("layer"),
+                        "shape_type": "rect",
+                        "rect": abs_rect,
+                        "polygon": None,
+                    }
+                )
+            if boxes:
+                bbox = _bbox_union(boxes)
+                center = _bbox_center(bbox)
+                patch = _patch_for_point(canonical_grid.get("patches", []), center)
+                return {
+                    "geometry_status": "exact",
+                    "anchor_source": "io_pin_shape",
+                    "bbox": bbox,
+                    "center": center,
+                    "layers": sorted({str(shape["layer"]) for shape in absolute_shapes if shape.get("layer")}),
+                    "shape_count": len(absolute_shapes),
+                    "area": sum(_bbox_area(box) for box in boxes),
+                    "local_shapes": [
+                        {
+                            "shape_id": idx,
+                            "port_index": 0,
+                            "layer": shape.get("layer"),
+                            "shape_type": "rect",
+                            "rect": shape.get("rect"),
+                            "polygon": None,
+                        }
+                        for idx, shape in enumerate(shapes)
+                    ],
+                    "absolute_shapes": absolute_shapes,
+                    "patch_id": int(patch["patch_id"]) if patch else None,
+                    "overlap_patch_ids": _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
+                }
+        if isinstance(origin, dict):
+            center = {"x": float(origin["x"]), "y": float(origin["y"])}
+            patch = _patch_for_point(canonical_grid.get("patches", []), center)
+            null_reason["geometry_bbox"] = "missing_def_pin_shape"
+            return _empty_pin_geometry("fallback_to_instance_anchor", "io_pin_origin", center, int(patch["patch_id"]) if patch else None)
+        null_reason["geometry_bbox"] = "missing_def_pin_shape"
+        return _empty_pin_geometry("missing", "none", None, None)
+
+    center = parent_instance.get("center") if isinstance(parent_instance, dict) else None
+    patch_id = parent_instance.get("patch_id") if isinstance(parent_instance, dict) else None
+    if isinstance(center, dict):
+        null_reason["geometry_bbox"] = "missing_lef_pin_shape"
+        return _empty_pin_geometry("fallback_to_instance_anchor", "parent_instance_center", center, patch_id)
+    null_reason["geometry_bbox"] = "missing_instance_origin"
+    return _empty_pin_geometry("missing", "none", None, None)
+
+
+def _empty_pin_geometry(status: str, anchor_source: str, center: dict[str, Any] | None, patch_id: Any) -> dict[str, Any]:
+    return {
+        "geometry_status": status,
+        "anchor_source": anchor_source,
+        "bbox": None,
+        "center": {"x": float(center["x"]), "y": float(center["y"])} if isinstance(center, dict) else None,
+        "layers": [],
+        "shape_count": 0,
+        "area": None,
+        "local_shapes": [],
+        "absolute_shapes": [],
+        "patch_id": int(patch_id) if patch_id is not None else None,
+        "overlap_patch_ids": [],
+    }
+
+
+def _pin_patch_anchor(
+    geometry: dict[str, Any],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+) -> dict[str, Any]:
+    center = geometry.get("center")
+    bbox = geometry.get("bbox")
+    patches = canonical_grid.get("patches", []) if isinstance(canonical_grid, dict) else []
+    primary_patch = _patch_for_point(patches, center) if isinstance(center, dict) else None
+    patch_id = int(primary_patch["patch_id"]) if primary_patch is not None else geometry.get("patch_id")
+    row = int(primary_patch["row"]) if primary_patch is not None else None
+    col = int(primary_patch["col"]) if primary_patch is not None else None
+    overlap_patch_ids = _overlap_patch_ids(patches, bbox) if isinstance(bbox, dict) else list(geometry.get("overlap_patch_ids") or [])
+    if patch_id is not None and patch_id not in overlap_patch_ids and isinstance(bbox, dict):
+        overlap_patch_ids = [int(patch_id), *overlap_patch_ids]
+    return {
+        "primary_patch_id": patch_id,
+        "overlap_patch_ids": overlap_patch_ids,
+        "anchor_source": "exact_pin_geometry" if geometry.get("geometry_status") == "exact" else "parent_instance_anchor" if geometry.get("anchor_source") == "parent_instance_center" else "none",
+        "local_cell_density": _matrix_value(stage_maps.get("density", {}).get("allcell_density"), row, col) if row is not None and col is not None else None,
+        "local_pin_density": _matrix_value(stage_maps.get("density", {}).get("allcell_pin_density"), row, col) if row is not None and col is not None else None,
+        "local_rudy": _matrix_value(stage_maps.get("rudy", {}).get("rudy_union"), row, col) if row is not None and col is not None else None,
+        "local_egr_overflow": _matrix_value(stage_maps.get("congestion", {}).get("union"), row, col) if row is not None and col is not None else None,
+        "nearby_pin_count": None,
+        "nearby_io_pin_count": None,
+        "nearby_macro_pin_count": None,
+    }
+
+
+def _pin_timing_context(pin_key: str, full_name: str, net: str, sta_report: dict[str, Any] | None, workspace_dir: Path) -> dict[str, Any]:
+    records = sta_report.get("records", []) if isinstance(sta_report, dict) else []
+    refs = []
+    slacks: list[float] = []
+    arrivals: list[float] = []
+    slews: list[float] = []
+    caps: list[float] = []
+    role = "unknown"
+    point_names = {full_name, full_name.replace("/", ":"), full_name.split("/", 1)[-1], pin_key.replace(":", "/")}
+    for idx, record in enumerate(records):
+        arc_names = {str(item.get("name")) for item in record.get("arc_sequence", []) if isinstance(item, dict)}
+        node_names = {str(item.get("point")) for item in record.get("wire_path_nodes", []) if isinstance(item, dict)}
+        endpoint = str(record.get("endpoint") or "")
+        start = str(record.get("start_point") or "")
+        if not point_names.intersection(arc_names | node_names | {endpoint, start}) and net not in " ".join(arc_names | node_names):
+            continue
+        refs.append(idx)
+        slack = _to_float(record.get("slack"))
+        if slack is not None:
+            slacks.append(slack)
+        if endpoint in point_names:
+            role = "endpoint"
+        elif start in point_names:
+            role = "startpoint"
+        elif role == "unknown":
+            role = "internal"
+        electrical = record.get("wire_electrical", {})
+        if isinstance(electrical, dict):
+            caps.extend(float(value) for value in electrical.get("capacitance_list", []) if value is not None)
+            slews.extend(float(value) for value in electrical.get("slew_list", []) if value is not None)
+        path_delay = _to_float(record.get("path_delay"))
+        if path_delay is not None:
+            arrivals.append(path_delay)
+    source = sta_report.get("source") if isinstance(sta_report, dict) else None
+    if source:
+        try:
+            source = str(Path(str(source)).relative_to(workspace_dir))
+        except ValueError:
+            source = str(source)
+    return {
+        "available": bool(sta_report and sta_report.get("available")),
+        "timing_path_count": len(refs),
+        "is_on_critical_path": bool(refs),
+        "timing_role": role,
+        "worst_slack_seen": min(slacks) if slacks else None,
+        "min_arrival": min(arrivals) if arrivals else None,
+        "max_arrival": max(arrivals) if arrivals else None,
+        "max_slew": max(slews) if slews else None,
+        "max_cap": max(caps) if caps else None,
+        "path_refs": refs[:5],
+        "source": source,
+    }
+
+
+def _pin_route_context(stage_name: str, net: str, geometry: dict[str, Any], parsed_def: DefData, stage_maps: dict[str, dict[str, MapMatrix]]) -> dict[str, Any] | None:
+    if stage_name != "route":
+        return None
+    net_wires = [wire for def_net in parsed_def.nets if def_net.name == net for wire in def_net.wires]
+    patch_id = geometry.get("patch_id")
+    local_final_overflow = None
+    if patch_id is not None:
+        patch = next((item for item in _grid_patches_from_stage_maps(stage_maps) if int(item.get("patch_id")) == int(patch_id)), None)
+        if patch:
+            local_final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), int(patch["row"]), int(patch["col"]))
+    return {
+        "route_only_oracle": True,
+        "nearby_wire_count": len(net_wires) if geometry.get("center") else None,
+        "nearby_via_count": sum(1 for wire in net_wires if wire.via),
+        "nearby_drc_count": None,
+        "local_final_overflow": local_final_overflow,
+        "pin_access_congestion": None,
+        "net_routed_length": sum(wire.length for wire in net_wires) if net_wires else 0.0,
+        "net_via_count": sum(1 for wire in net_wires if wire.via),
+        "net_detour_ratio": None,
+        "source": str(parsed_def.path.name),
+    }
+
+
+def _grid_patches_from_stage_maps(stage_maps: dict[str, dict[str, MapMatrix]]) -> list[dict[str, int]]:
+    for category in ("density", "congestion", "rudy", "margin"):
+        for matrix in stage_maps.get(category, {}).values():
+            return [
+                {"patch_id": row * len(matrix[0]) + col, "row": row, "col": col}
+                for row in range(len(matrix))
+                for col in range(len(matrix[row]))
+            ]
+    return []
+
+
+def _attach_pin_connectivity_context(records: list[dict[str, Any]], net_by_name: dict[str, DefNet]) -> None:
+    by_net: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        net = str(record.get("identity", {}).get("net") or "")
+        by_net.setdefault(net, []).append(record)
+    driver_by_net: dict[str, str | None] = {}
+    roles_by_key: dict[str, str] = {}
+    for net, pins in by_net.items():
+        drivers = []
+        for pin in pins:
+            direction = str(pin.get("electrical_context", {}).get("direction") or "UNKNOWN").upper()
+            pin_kind = pin.get("identity", {}).get("pin_kind")
+            role = "top_port" if pin_kind == "io_port" else "unknown"
+            if direction == "OUTPUT":
+                role = "driver"
+            elif direction == "INPUT":
+                role = "sink"
+            elif direction == "INOUT":
+                role = "bidirectional"
+            if role == "driver":
+                drivers.append(pin["pin_key"])
+            roles_by_key[pin["pin_key"]] = role
+        driver_by_net[net] = drivers[0] if len(drivers) == 1 else None
+    for record in records:
+        identity = record["identity"]
+        net = str(identity.get("net") or "")
+        pins = by_net.get(net, [])
+        centers = [pin.get("geometry", {}).get("center") for pin in pins if isinstance(pin.get("geometry", {}).get("center"), dict)]
+        bboxes = [pin.get("geometry", {}).get("bbox") for pin in pins if isinstance(pin.get("geometry", {}).get("bbox"), dict)]
+        patch_ids = {pin.get("patch_anchor", {}).get("primary_patch_id") for pin in pins}
+        patch_ids.discard(None)
+        connected_instances = {pin.get("identity", {}).get("parent_instance_key") for pin in pins if pin.get("identity", {}).get("parent_instance_key")}
+        pin_role = roles_by_key.get(record["pin_key"], "unknown")
+        sinks = [pin for pin in pins if roles_by_key.get(pin["pin_key"]) == "sink"]
+        net_bbox = _bbox_union(bboxes) if bboxes else _bbox_from_points(centers)
+        hpwl = _hpwl_from_points(centers)
+        record["connectivity_context"] = {
+            "net": net,
+            "net_degree": len(pins),
+            "net_fanout": len(sinks) if driver_by_net.get(net) else max(0, len(pins) - 1),
+            "pin_role": pin_role,
+            "is_driver": pin_role == "driver",
+            "is_sink": pin_role == "sink",
+            "driver_pin_key": driver_by_net.get(net),
+            "sink_count": len(sinks),
+            "same_net_pin_count": len(pins),
+            "connected_instance_count": len(connected_instances),
+            "connected_io_count": sum(1 for pin in pins if pin.get("identity", {}).get("is_io")),
+            "net_hpwl": hpwl,
+            "net_bbox": net_bbox,
+            "net_cross_patch": len(patch_ids) > 1 if patch_ids else None,
+            "cross_patch_count": len(patch_ids),
+            "classification_source": "def_io_direction" if identity.get("is_io") and record.get("electrical_context", {}).get("direction") != "UNKNOWN" else "unknown",
+        }
+        if hpwl is None:
+            record.setdefault("null_reason", {})["connectivity_hpwl"] = "not_available_before_placement"
+        if driver_by_net.get(net) is None and len(pins) > 1:
+            record.setdefault("null_reason", {})["connectivity_role"] = "ambiguous_driver_sink"
+
+
+def _attach_pin_progressive_metadata(stages: list[StageInfo], pins_dir: Path) -> None:
+    records_by_stage: dict[str, list[dict[str, Any]]] = {}
+    for stage in stages:
+        path = pins_dir / f"{stage.name}.jsonl"
+        if not path.exists():
+            records_by_stage[stage.name] = []
+            continue
+        records_by_stage[stage.name] = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    first_seen: dict[str, str] = {}
+    for stage in stages:
+        for record in records_by_stage.get(stage.name, []):
+            first_seen.setdefault(str(record.get("pin_key")), stage.name)
+    place_keys = {str(record.get("pin_key")) for record in records_by_stage.get("place", [])}
+    previous_by_key: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        current = records_by_stage.get(stage.name, [])
+        current_by_key = {str(record.get("pin_key")): record for record in current}
+        for key, record in current_by_key.items():
+            previous = previous_by_key.get(key)
+            center = record.get("geometry", {}).get("center")
+            previous_center = previous.get("geometry", {}).get("center") if previous else None
+            dx = dy = moved = None
+            if isinstance(center, dict) and isinstance(previous_center, dict):
+                dx = float(center["x"]) - float(previous_center["x"])
+                dy = float(center["y"]) - float(previous_center["y"])
+                if dx == 0.0 and dy == 0.0:
+                    current_parent_center = record.get("parent_instance", {}).get("center") if isinstance(record.get("parent_instance"), dict) else None
+                    previous_parent_center = previous.get("parent_instance", {}).get("center") if isinstance(previous.get("parent_instance"), dict) else None
+                    if isinstance(current_parent_center, dict) and isinstance(previous_parent_center, dict):
+                        dx = float(current_parent_center["x"]) - float(previous_parent_center["x"])
+                        dy = float(current_parent_center["y"]) - float(previous_parent_center["y"])
+                moved = dx != 0.0 or dy != 0.0
+            first_stage = first_seen.get(key, stage.name)
+            created_stage = "Synthesis" if first_stage in {"Floorplan", "place"} else first_stage
+            record["progressive_metadata"] = {
+                "available_from": first_stage,
+                "created_stage": created_stage,
+                "created_stage_source": "def_connection" if created_stage == "Synthesis" else "first_observed",
+                "exists_in_prev_stage": previous is not None,
+                "exists_in_place": key in place_keys,
+                "introduced_by_cts": first_stage == "CTS",
+                "prev_net": previous.get("identity", {}).get("net") if previous else None,
+                "net_changed_from_prev_stage": (previous.get("identity", {}).get("net") != record.get("identity", {}).get("net")) if previous else None,
+                "moved_from_prev_stage": moved,
+                "dx_from_prev_stage": dx,
+                "dy_from_prev_stage": dy,
+                "geometry_changed_from_prev_stage": (_pin_geometry_signature(record) != _pin_geometry_signature(previous)) if previous else None,
+                "route_only_oracle": isinstance(record.get("route_context"), dict) and bool(record["route_context"].get("route_only_oracle")),
+            }
+        previous_by_key = current_by_key
+        write_jsonl(pins_dir / f"{stage.name}.jsonl", [_ordered_pin_record(record, idx) for idx, record in enumerate(current)], sort_keys=False)
+
+
+def _ordered_pin_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "stage": record["stage"],
+        "pin_key": record["pin_key"],
+        "source": record["source"],
+        "identity": record["identity"],
+        "electrical_context": record["electrical_context"],
+        "parent_instance": record["parent_instance"],
+        "geometry": record["geometry"],
+        "connectivity_context": record["connectivity_context"],
+        "timing_context": record["timing_context"],
+        "patch_anchor": record["patch_anchor"],
+        "route_context": record["route_context"],
+        "progressive_metadata": record["progressive_metadata"],
+        "source_refs": record["source_refs"],
+        "null_reason": record["null_reason"],
+    }
+
+
+def _pin_key(raw_pin: dict[str, Any]) -> str:
+    pin_name = str(raw_pin.get("pin_name") or "")
+    if str(raw_pin.get("pin_kind") or "") == "io_port" or str(raw_pin.get("instance") or "") == "PIN":
+        return f"PIN:{pin_name}"
+    return f"{raw_pin.get('instance')}:{pin_name}"
+
+
+def _bbox_center(bbox: dict[str, Any]) -> dict[str, float]:
+    return {"x": (float(bbox["llx"]) + float(bbox["urx"])) / 2.0, "y": (float(bbox["lly"]) + float(bbox["ury"])) / 2.0}
+
+
+def _bbox_from_points(points: list[dict[str, Any]]) -> dict[str, float] | None:
+    if not points:
+        return None
+    xs = [float(point["x"]) for point in points]
+    ys = [float(point["y"]) for point in points]
+    return {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)}
+
+
+def _hpwl_from_points(points: list[dict[str, Any]]) -> float | None:
+    if len(points) < 2:
+        return None
+    xs = [float(point["x"]) for point in points]
+    ys = [float(point["y"]) for point in points]
+    return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+
+def _pin_geometry_signature(record: dict[str, Any] | None) -> tuple[Any, ...] | None:
+    if not record:
+        return None
+    geometry = record.get("geometry", {})
+    bbox = geometry.get("bbox")
+    bbox_sig = tuple(bbox.get(key) for key in ("llx", "lly", "urx", "ury")) if isinstance(bbox, dict) else None
+    return (geometry.get("geometry_status"), bbox_sig, tuple(geometry.get("layers") or []), geometry.get("shape_count"))
 
 
 def _is_clock_like(value: str) -> bool:

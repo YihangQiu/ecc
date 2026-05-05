@@ -58,6 +58,7 @@ class DefNet:
     pins: list[dict[str, Any]] = field(default_factory=list)
     wires: list[DefWire] = field(default_factory=list)
     special: bool = False
+    use: str | None = None
 
 
 @dataclass(frozen=True)
@@ -252,7 +253,13 @@ def _parse_pins(lines: list[str]) -> list[dict[str, Any]]:
             if current:
                 pins.append(current)
             tokens = stripped.split()
-            current = {"pin_name": tokens[1], "instance": "PIN", "source": "def_pins"}
+            current = {
+                "pin_name": tokens[1],
+                "instance": "PIN",
+                "source": "def_pins",
+                "def_index": len(pins),
+                "shapes": [],
+            }
         if current is None:
             continue
         net_match = re.search(r"\+\s+NET\s+(\S+)", stripped)
@@ -261,6 +268,22 @@ def _parse_pins(lines: list[str]) -> list[dict[str, Any]]:
         direction_match = re.search(r"\+\s+DIRECTION\s+(\S+)", stripped)
         if direction_match:
             current["direction"] = direction_match.group(1)
+        use_match = re.search(r"\+\s+USE\s+(\S+)", stripped)
+        if use_match:
+            current["use"] = use_match.group(1)
+        layer_match = re.search(
+            r"\+\s+LAYER\s+(\S+)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)",
+            stripped,
+        )
+        if layer_match:
+            llx, lly, urx, ury = (float(layer_match.group(i)) for i in range(2, 6))
+            current.setdefault("shapes", []).append(
+                {
+                    "layer": layer_match.group(1),
+                    "rect": {"llx": llx, "lly": lly, "urx": urx, "ury": ury},
+                    "source": "def_pin_layer_rect",
+                }
+            )
         placed = _PLACED_RE.search(stripped)
         if placed:
             current["origin"] = {"x": float(placed.group(1)), "y": float(placed.group(2))}
@@ -304,7 +327,8 @@ def _net_from_chunks(name: str, chunks: list[str], *, special: bool) -> DefNet:
         if not _looks_numeric(inst) and not _looks_numeric(pin) and "*" not in {inst, pin}
     ]
     wires = _parse_routed_wires(name, text, special=special)
-    return DefNet(name=name, pins=pins, wires=wires, special=special)
+    use_match = re.search(r"\+\s+USE\s+(\S+)", text)
+    return DefNet(name=name, pins=pins, wires=wires, special=special, use=use_match.group(1) if use_match else None)
 
 
 def _looks_numeric(value: str) -> bool:
