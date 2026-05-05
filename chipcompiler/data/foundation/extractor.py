@@ -570,9 +570,18 @@ class FoundationExtractor:
         native_demand_capacity_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_native_demand_capacity_records", [])
         }
+        instances_by_stage: dict[str, list[dict[str, Any]]] = {}
         for stage in stages:
-            instances = self._parse_instances(stage)
+            instances_by_stage[stage.name] = self._parse_instances(
+                stage,
+                def_data.get(stage.name),
+                canonical_grid,
+                canonical_maps.get(stage.name, {}),
+            )
+        _attach_progressive_metadata(stages, instances_by_stage)
+        for stage in stages:
             parsed_def = def_data.get(stage.name)
+            instances = instances_by_stage.get(stage.name, [])
             nets = self._net_records(stage, parsed_def)
             pins = self._pin_records(stage, parsed_def)
             wires = self._wire_records(stage, parsed_def)
@@ -605,8 +614,19 @@ class FoundationExtractor:
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
         return counts
 
-    def _parse_instances(self, stage: StageInfo) -> list[dict[str, Any]]:
+    def _parse_instances(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData | None,
+        canonical_grid: dict | None = None,
+        stage_maps: dict[str, dict[str, list[list[float]]]] | None = None,
+    ) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        components_by_name = {
+            _component_lookup_key(component.get("name")): component
+            for component in (parsed_def.components if parsed_def else [])
+            if component.get("name")
+        }
         for layout_path in sorted((stage.directory / "output").glob("*.json")):
             payload = self._read_json(layout_path)
             if not isinstance(payload.get("data"), list):
@@ -616,37 +636,94 @@ class FoundationExtractor:
                 if not isinstance(item, dict) or item.get("type") != "group":
                     continue
                 name = str(item.get("struct name") or f"instance_{index}")
-                bbox = self._bbox_from_children(item.get("children", []))
-                if bbox is None:
+                instance_key = _instance_key_from_layout_name(name)
+                component = components_by_name.get(_component_lookup_key(instance_key)) or components_by_name.get(_component_lookup_key(name))
+                record = self._instance_record_from_layout(stage, layout_path, name, instance_key, item, component)
+                if record is None:
                     continue
-                llx, lly, urx, ury = bbox
-                lower = name.lower()
-                records.append(
-                    {
-                        "id": len(records),
-                        "stage": stage.name,
-                        "name": name,
-                        "master": None,
-                        "bbox": {"llx": llx, "lly": lly, "urx": urx, "ury": ury},
-                        "center": {"x": (llx + urx) / 2.0, "y": (lly + ury) / 2.0},
-                        "width": urx - llx,
-                        "height": ury - lly,
-                        "area": max(0.0, (urx - llx) * (ury - lly)),
-                        "orientation": None,
-                        "is_macro": "macro" in lower or "sram" in lower or "mem" in lower,
-                        "source": str(layout_path.relative_to(self.workspace_dir)),
-                        "null_reason": {
-                            "master": "layout_json_missing_master",
-                            "orientation": "layout_json_missing_orientation",
-                        },
-                    }
-                )
+                _attach_patch_anchor(record, canonical_grid or {}, stage_maps or {})
+                records.append({**record, "id": len(records)})
             if records:
                 break
         self._quality.setdefault("availability", {}).setdefault("instances", {})[stage.name] = "available" if records else "missing"
+        if parsed_def:
+            _attach_connectivity_summaries(records, parsed_def)
         if not records:
             self._quality.setdefault("null_reason", {}).setdefault("instances", {})[stage.name] = "missing_layout_json_instances"
         return records
+
+    def _instance_record_from_layout(
+        self,
+        stage: StageInfo,
+        layout_path: Path,
+        name: str,
+        instance_key: str,
+        item: dict[str, Any],
+        component: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        raw_bbox = self._bbox_from_children(item.get("children", []))
+        origin = component.get("origin") if isinstance(component, dict) else None
+        has_origin = isinstance(origin, dict)
+        master = str(component.get("master") or "") if isinstance(component, dict) else None
+        orientation = component.get("orientation") if isinstance(component, dict) else None
+        physical_class = _physical_class(master or "", name)
+        is_macro = physical_class == "macro"
+        is_physical_only = _is_physical_only_cell_name(name, master or "")
+        null_reason: dict[str, str] = {}
+        bbox: dict[str, float] | None = None
+        if raw_bbox is not None:
+            llx, lly, urx, ury = raw_bbox
+            if urx > llx and ury > lly:
+                bbox = {"llx": llx, "lly": lly, "urx": urx, "ury": ury}
+        if bbox is None and has_origin and is_macro:
+            x = float(origin.get("x", 0.0))
+            y = float(origin.get("y", 0.0))
+            bbox = {"llx": x, "lly": y, "urx": x, "ury": y}
+        if bbox is None and not has_origin and raw_bbox is None:
+            return None
+        if bbox is None:
+            null_reason["physical_state_bbox"] = "not_available_before_placement"
+        if not master:
+            null_reason["identity_master"] = "def_component_missing_master" if component else "missing_def_component"
+        if orientation is None:
+            null_reason["physical_state_orientation"] = "def_component_missing_orientation" if component else "missing_def_component"
+        center = None if bbox is None else {"x": (bbox["llx"] + bbox["urx"]) / 2.0, "y": (bbox["lly"] + bbox["ury"]) / 2.0}
+        width = None if bbox is None else bbox["urx"] - bbox["llx"]
+        height = None if bbox is None else bbox["ury"] - bbox["lly"]
+        placement_status = "placed" if has_origin and bbox is not None else "unplaced"
+        return {
+            "stage": stage.name,
+            "name": name,
+            "source": str(layout_path.relative_to(self.workspace_dir)),
+            "identity": {
+                "instance_key": instance_key,
+                "master": master or None,
+                "cell_class": _cell_class(master or "", name),
+                "physical_class": physical_class,
+                "is_macro": is_macro,
+                "is_physical_only": is_physical_only,
+                "is_clock_related": _is_clock_related(master or "", name),
+                "classification_source": "heuristic_name_rule",
+            },
+            "physical_state": {
+                "placement_status": placement_status,
+                "origin": {"x": float(origin["x"]), "y": float(origin["y"])} if has_origin else None,
+                "bbox": bbox,
+                "center": center,
+                "width": width,
+                "height": height,
+                "area": None if width is None or height is None else max(0.0, width * height),
+                "orientation": orientation,
+                "patch_id": None,
+                "overlap_patch_ids": [],
+            },
+            "connectivity_summary": {},
+            "patch_anchor": {},
+            "progressive_metadata": {},
+            "clock_tree": None,
+            "route_analysis": None,
+            "null_reason": null_reason,
+        }
 
     def _net_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
         if not parsed_def:
@@ -825,7 +902,7 @@ class FoundationExtractor:
             row = int(patch["row"])
             col = int(patch["col"])
             bbox = patch["bbox"]
-            patch_instances = [item for item in instances if _point_in_bbox(item.get("center", {}).get("x"), item.get("center", {}).get("y"), bbox)]
+            patch_instances = [item for item in instances if _point_in_bbox(_instance_center(item).get("x"), _instance_center(item).get("y"), bbox)]
             patch_wires = [item for item in wires if _segment_intersects_bbox(item.get("x1"), item.get("y1"), item.get("x2"), item.get("y2"), bbox)]
             net_names = {item.get("net") for item in patch_wires if item.get("net")}
             wire_length_by_layer: dict[str, float] = {}
@@ -840,8 +917,8 @@ class FoundationExtractor:
                 "row": row,
                 "col": col,
                 "instance_count": len(patch_instances),
-                "instance_area": sum(float(item.get("area") or 0.0) for item in patch_instances),
-                "macro_area": sum(float(item.get("area") or 0.0) for item in patch_instances if item.get("is_macro")),
+                "instance_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances),
+                "macro_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances if item.get("identity", {}).get("is_macro") or item.get("is_macro")),
                 "net_count": len(net_names) if net_names else (len(nets) if not patch_wires and stage == "route" else 0),
                 "pin_count": len(pins) if stage == "route" and row == 0 and col == 0 else 0,
                 "wire_length_by_layer": wire_length_by_layer,
@@ -1195,6 +1272,200 @@ def _rebuild_allcell_maps(maps: dict[str, MapMatrix]) -> None:
 
     _replace_with_matrix_sum(maps, "allcell_density", "stdcell_density", "macro_density")
     _replace_with_matrix_sum(maps, "allcell_pin_density", "stdcell_pin_density", "macro_pin_density")
+
+
+def _instance_key_from_layout_name(name: str) -> str:
+    if name.startswith("Instance_"):
+        return name.removeprefix("Instance_")
+    if name.startswith("Macro_"):
+        return name.removeprefix("Macro_")
+    return name
+
+
+def _component_lookup_key(name: Any) -> str:
+    return str(name).strip()
+
+
+def _cell_class(master: str, name: str) -> str:
+    lower = f"{master} {name}".lower()
+    if "dff" in lower or "df" in lower or "latch" in lower or "reg" in lower:
+        return "sequential"
+    if "clk" in lower or "clock" in lower:
+        return "clock_related"
+    if "buf" in lower:
+        return "buffer"
+    if "inv" in lower:
+        return "inverter"
+    return "combinational"
+
+
+def _physical_class(master: str, name: str) -> str:
+    lower = f"{master} {name}".lower()
+    if "macro" in lower or "sram" in lower or "mem" in lower:
+        return "macro"
+    return "physical_only" if _is_physical_only_cell_name(name, master) else "stdcell"
+
+
+def _is_clock_related(master: str, name: str) -> bool:
+    lower = f"{master} {name}".lower()
+    return "clk" in lower or "clock" in lower or _cell_class(master, name) == "sequential"
+
+
+def _instance_center(instance: dict[str, Any]) -> dict[str, Any]:
+    center = instance.get("center")
+    if isinstance(center, dict):
+        return center
+    physical_state = instance.get("physical_state")
+    if isinstance(physical_state, dict) and isinstance(physical_state.get("center"), dict):
+        return physical_state["center"]
+    return {}
+
+
+
+def _attach_progressive_metadata(stages: list[StageInfo], instances_by_stage: dict[str, list[dict[str, Any]]]) -> None:
+    first_seen: dict[str, str] = {}
+    for stage in stages:
+        for record in instances_by_stage.get(stage.name, []):
+            key = str(record.get("identity", {}).get("instance_key"))
+            first_seen.setdefault(key, stage.name)
+    place_keys = {
+        str(record.get("identity", {}).get("instance_key"))
+        for record in instances_by_stage.get("place", [])
+    }
+    previous_by_key: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        current = instances_by_stage.get(stage.name, [])
+        current_by_key = {str(record.get("identity", {}).get("instance_key")): record for record in current}
+        for key, record in current_by_key.items():
+            previous = previous_by_key.get(key)
+            current_center = record.get("physical_state", {}).get("center")
+            previous_center = previous.get("physical_state", {}).get("center") if previous else None
+            dx = dy = moved = None
+            if isinstance(current_center, dict) and isinstance(previous_center, dict):
+                dx = float(current_center["x"]) - float(previous_center["x"])
+                dy = float(current_center["y"]) - float(previous_center["y"])
+                moved = dx != 0.0 or dy != 0.0
+            first_stage = first_seen.get(key, stage.name)
+            created_stage = "Synthesis" if first_stage in {"Floorplan", "place"} else first_stage
+            created_stage_source = "def_component" if created_stage == "Synthesis" else "first_observed"
+            record["progressive_metadata"] = {
+                "available_from": first_stage,
+                "created_stage": created_stage,
+                "created_stage_source": created_stage_source,
+                "exists_in_prev_stage": previous is not None,
+                "exists_in_place": key in place_keys,
+                "moved_from_prev_stage": moved,
+                "dx_from_prev_stage": dx,
+                "dy_from_prev_stage": dy,
+                "route_only_oracle": False,
+            }
+            record["clock_tree"] = _clock_tree_block(record)
+        previous_by_key = current_by_key
+
+
+def _clock_tree_block(record: dict[str, Any]) -> dict[str, Any] | None:
+    identity = record.get("identity", {})
+    master = str(identity.get("master") or "")
+    name = str(record.get("name") or identity.get("instance_key") or "")
+    summary = record.get("connectivity_summary", {})
+    clock_net_count = int(summary.get("clock_pin_count") or 0)
+    is_buffer = "buf" in f"{master} {name}".lower()
+    is_clock = _is_clock_like(name) or _is_clock_like(master) or clock_net_count > 0
+    if not (is_clock and is_buffer):
+        return None
+    return {
+        "is_clock_tree_node": True,
+        "clock_tree_role": "clock_buffer",
+        "clock_net_count": clock_net_count,
+    }
+
+
+def _attach_connectivity_summaries(records: list[dict[str, Any]], parsed_def: DefData) -> None:
+    by_key = {record.get("identity", {}).get("instance_key"): record for record in records}
+    centers = {key: record.get("physical_state", {}).get("center") for key, record in by_key.items()}
+    net_hpwl: dict[str, float | None] = {}
+    net_cross_patch: dict[str, bool | None] = {}
+    net_degrees = {net.name: len(net.pins) for net in parsed_def.nets}
+    for net in parsed_def.nets:
+        points = [centers.get(str(pin.get("instance"))) for pin in net.pins if str(pin.get("instance")) in centers]
+        valid = [point for point in points if isinstance(point, dict)]
+        if len(valid) >= 2:
+            xs = [float(point["x"]) for point in valid]
+            ys = [float(point["y"]) for point in valid]
+            net_hpwl[net.name] = (max(xs) - min(xs)) + (max(ys) - min(ys))
+        else:
+            net_hpwl[net.name] = None
+        patch_ids = {
+            by_key[str(pin.get("instance"))].get("physical_state", {}).get("patch_id")
+            for pin in net.pins
+            if str(pin.get("instance")) in by_key
+        }
+        patch_ids.discard(None)
+        net_cross_patch[net.name] = len(patch_ids) > 1 if patch_ids else None
+    pins_by_instance: dict[str, list[dict[str, Any]]] = {}
+    for net in parsed_def.nets:
+        for pin in net.pins:
+            instance = str(pin.get("instance"))
+            pins_by_instance.setdefault(instance, []).append({**pin, "net": net.name, "net_degree": net_degrees.get(net.name, 0)})
+    for key, record in by_key.items():
+        pins = pins_by_instance.get(str(key), [])
+        connected_nets = sorted({str(pin.get("net")) for pin in pins if pin.get("net")})
+        hpwls = [net_hpwl[net] for net in connected_nets if net_hpwl.get(net) is not None]
+        has_center = isinstance(record.get("physical_state", {}).get("center"), dict)
+        record["connectivity_summary"] = {
+            "pin_count": len(pins),
+            "connected_net_count": len(connected_nets),
+            "fanout_count": sum(max(0, int(pin.get("net_degree") or 0) - 1) for pin in pins),
+            "clock_pin_count": sum(1 for pin in pins if _is_clock_like(str(pin.get("net"))) or _is_clock_like(str(pin.get("pin_name")))),
+            "max_net_degree": max((int(pin.get("net_degree") or 0) for pin in pins), default=0),
+            "sum_connected_hpwl": sum(hpwls) if has_center and hpwls else (0.0 if has_center and connected_nets else None),
+            "max_connected_hpwl": max(hpwls) if has_center and hpwls else (0.0 if has_center and connected_nets else None),
+            "avg_connected_hpwl": (sum(hpwls) / len(hpwls)) if has_center and hpwls else (0.0 if has_center and connected_nets else None),
+            "cross_patch_net_count": sum(1 for net in connected_nets if net_cross_patch.get(net)) if has_center else None,
+        }
+        if connected_nets and not has_center:
+            record.setdefault("null_reason", {})["connectivity_hpwl"] = "not_available_before_placement"
+
+
+def _is_clock_like(value: str) -> bool:
+    lower = value.lower()
+    return "clk" in lower or "clock" in lower
+
+
+def _attach_patch_anchor(record: dict[str, Any], canonical_grid: dict, stage_maps: dict[str, dict[str, MapMatrix]]) -> None:
+    physical_state = record.get("physical_state", {})
+    center = physical_state.get("center") if isinstance(physical_state, dict) else None
+    bbox = physical_state.get("bbox") if isinstance(physical_state, dict) else None
+    patches = canonical_grid.get("patches", []) if isinstance(canonical_grid, dict) else []
+    primary_patch = _patch_for_point(patches, center) if isinstance(center, dict) else None
+    overlap_patch_ids = _overlap_patch_ids(patches, bbox) if isinstance(bbox, dict) else []
+    if primary_patch is not None and int(primary_patch["patch_id"]) not in overlap_patch_ids:
+        overlap_patch_ids = [int(primary_patch["patch_id"]), *overlap_patch_ids]
+    patch_id = int(primary_patch["patch_id"]) if primary_patch is not None else None
+    row = int(primary_patch["row"]) if primary_patch is not None else None
+    col = int(primary_patch["col"]) if primary_patch is not None else None
+    physical_state["patch_id"] = patch_id
+    physical_state["overlap_patch_ids"] = overlap_patch_ids
+    record["patch_anchor"] = {
+        "primary_patch_id": patch_id,
+        "overlap_patch_ids": overlap_patch_ids,
+        "local_cell_density": _matrix_value(stage_maps.get("density", {}).get("allcell_density"), row, col) if row is not None and col is not None else None,
+        "local_pin_density": _matrix_value(stage_maps.get("density", {}).get("allcell_pin_density"), row, col) if row is not None and col is not None else None,
+        "local_rudy": _matrix_value(stage_maps.get("rudy", {}).get("rudy_union"), row, col) if row is not None and col is not None else None,
+        "local_egr_overflow": _matrix_value(stage_maps.get("congestion", {}).get("union"), row, col) if row is not None and col is not None else None,
+    }
+
+
+def _patch_for_point(patches: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any] | None:
+    return next((patch for patch in patches if _point_in_bbox(point.get("x"), point.get("y"), patch.get("bbox", {}))), None)
+
+
+def _overlap_patch_ids(patches: list[dict[str, Any]], bbox: dict[str, Any]) -> list[int]:
+    return [
+        int(patch["patch_id"])
+        for patch in patches
+        if isinstance(patch.get("bbox"), dict) and _bbox_overlap_area(bbox, patch["bbox"]) > 0
+    ]
 
 
 def _strip_stage_prefix_from_density_maps(maps: dict[str, MapMatrix], stage: str) -> dict[str, MapMatrix]:

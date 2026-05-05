@@ -567,7 +567,9 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     instances = [json.loads(line) for line in (foundation_dir / "vectors" / "instances" / "place.jsonl").read_text().splitlines()]
     assert {item["name"] for item in instances} == {"Instance_U1", "Macro_SRAM0"}
     assert all("availability" not in item for item in instances)
-    assert any(item["is_macro"] for item in instances)
+    assert all("availability" not in item for item in instances)
+    assert any(item["identity"]["is_macro"] for item in instances)
+    assert all("is_macro" not in item for item in instances)
 
     assert not (foundation_dir / "labels" / "route_patch_overflow.jsonl").exists()
     assert not (foundation_dir / "labels" / "route_hotspot_top5.jsonl").exists()
@@ -638,6 +640,286 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "route_reconstructed_congestion_count" not in summary["labels"]
     assert "route_reconstructed_demand_capacity_count" not in summary["labels"]
 
+
+
+
+def test_iccd_full_v1_enriches_instances_from_def_components(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 DFFHQNX1H7L + PLACED ( 10 20 ) N ;
+- U2 BUFX1P4H7L + PLACED ( 50 60 ) FS ;
+END COMPONENTS
+NETS 1 ;
+- clk ( U1 CK ) ( U2 A ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "place_dreamplace" / "output" / "gcd_place.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {
+                    "type": "group",
+                    "struct name": "Instance_U1",
+                    "children": [
+                        {"type": "box", "layer": 0, "path": [[10, 20], [30, 20], [30, 40], [10, 40], [10, 20]]}
+                    ],
+                },
+                {
+                    "type": "group",
+                    "struct name": "Instance_U2",
+                    "children": [
+                        {"type": "box", "layer": 0, "path": [[50, 60], [60, 60], [60, 70], [50, 70], [50, 60]]}
+                    ],
+                },
+            ],
+        },
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    instances = [
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "instances" / "place.jsonl").read_text().splitlines()
+    ]
+    first = instances[0]
+    assert first["identity"]["instance_key"] == "U1"
+    assert first["identity"]["master"] == "DFFHQNX1H7L"
+    assert first["identity"]["cell_class"] == "sequential"
+    assert first["physical_state"]["origin"] == {"x": 10.0, "y": 20.0}
+    assert first["physical_state"]["orientation"] == "N"
+    assert first["physical_state"]["placement_status"] == "placed"
+    assert "master" not in first
+    assert "orientation" not in first
+
+
+def test_iccd_full_v1_uses_semantic_null_for_floorplan_unplaced_stdcells(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 NAND2 ;
+END COMPONENTS
+NETS 1 ;
+- n1 ( U1 A ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {
+                    "type": "group",
+                    "struct name": "Instance_U1",
+                    "children": [
+                        {"type": "box", "layer": 0, "path": [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]}
+                    ],
+                }
+            ],
+        },
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["Floorplan"])
+
+    row = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "Floorplan.jsonl").read_text())
+    assert row["physical_state"]["placement_status"] == "unplaced"
+    assert row["physical_state"]["origin"] is None
+    assert row["physical_state"]["bbox"] is None
+    assert row["physical_state"]["center"] is None
+    assert row["physical_state"]["area"] is None
+    assert row["null_reason"]["physical_state_bbox"] == "not_available_before_placement"
+
+
+def test_iccd_full_v1_adds_instance_patch_anchor(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_density.csv", [[0.5, 0.0], [0.0, 0.0]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map" / "place_allcell_pin_density.csv", [[2.0, 0.0], [0.0, 0.0]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map" / "place_rudy_union.csv", [[0.01, 0.0], [0.0, 0.0]])
+    _write_csv(ws / "place_dreamplace" / "feature" / "egr_congestion_map" / "place_egr_union_overflow.csv", [[3.0, 0.0], [0.0, 0.0]])
+    for path in (ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "density_map").glob("place_*density.csv"):
+        if path.name not in {"place_allcell_density.csv", "place_allcell_pin_density.csv"}:
+            path.unlink()
+    for path in (ws / "place_dreamplace" / "feature" / "gcell_patch_map" / "RUDY_map").glob("place_*rudy*.csv"):
+        if path.name != "place_rudy_union.csv":
+            path.unlink()
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+
+    record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()[0])
+    assert record["patch_anchor"]["primary_patch_id"] == 0
+    assert record["patch_anchor"]["overlap_patch_ids"] == [0]
+    assert record["physical_state"]["patch_id"] == 0
+    assert record["physical_state"]["overlap_patch_ids"] == [0]
+    assert record["patch_anchor"]["local_cell_density"] == 0.5
+    assert record["patch_anchor"]["local_pin_density"] == 2.0
+    assert record["patch_anchor"]["local_rudy"] == 0.01
+    assert record["patch_anchor"]["local_egr_overflow"] == 3.0
+
+
+def test_iccd_full_v1_adds_instance_connectivity_summary(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 240 200 ) ;
+COMPONENTS 3 ;
+- U1 DFFHQNX1H7L + PLACED ( 10 20 ) N ;
+- U2 BUFX1P4H7L + PLACED ( 180 20 ) N ;
+- U3 NAND2 + PLACED ( 10 140 ) N ;
+END COMPONENTS
+NETS 2 ;
+- clk ( U1 CK ) ( U2 A ) ( U3 A ) ;
+- data ( U1 D ) ( U2 Y ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "place_dreamplace" / "output" / "gcd_place.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [240, 0], [240, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {"type": "group", "struct name": "Instance_U1", "children": [{"type": "box", "layer": 0, "path": [[10, 20], [30, 20], [30, 40], [10, 40], [10, 20]]}]},
+                {"type": "group", "struct name": "Instance_U2", "children": [{"type": "box", "layer": 0, "path": [[180, 20], [200, 20], [200, 40], [180, 40], [180, 20]]}]},
+                {"type": "group", "struct name": "Instance_U3", "children": [{"type": "box", "layer": 0, "path": [[10, 140], [30, 140], [30, 160], [10, 160], [10, 140]]}]},
+            ],
+        },
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+
+    rows = [json.loads(line) for line in (ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()]
+    record = next(row for row in rows if row["identity"]["instance_key"] == "U1")
+    summary = record["connectivity_summary"]
+    assert summary["pin_count"] == 2
+    assert summary["connected_net_count"] == 2
+    assert summary["clock_pin_count"] == 1
+    assert summary["max_net_degree"] >= 2
+    assert summary["sum_connected_hpwl"] is not None
+    assert summary["max_connected_hpwl"] is not None
+    assert summary["cross_patch_net_count"] >= 1
+    assert "route_wire_length" not in summary
+    assert "rudy" not in summary
+    assert "egr_overflow" not in summary
+
+
+def test_iccd_full_v1_tracks_cts_inserted_instances(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 DFFHQNX1H7L + PLACED ( 10 20 ) N ;
+END COMPONENTS
+NETS 1 ;
+- clk ( U1 CK ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "place_dreamplace" / "output" / "gcd_place.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {"type": "group", "struct name": "Instance_U1", "children": [{"type": "box", "layer": 0, "path": [[10, 20], [30, 20], [30, 40], [10, 40], [10, 20]]}]}
+            ],
+        },
+    )
+    _write_text(
+        ws / "CTS_ecc" / "output" / "gcd_CTS.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 DFFHQNX1H7L + PLACED ( 12 22 ) N ;
+- clk_leaf_0_0_buf BUFX1P4H7L + PLACED ( 80 80 ) N ;
+END COMPONENTS
+NETS 2 ;
+- clk ( clk_leaf_0_0_buf A ) ;
+- clk_leaf ( clk_leaf_0_0_buf Y ) ( U1 CK ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "CTS_ecc" / "output" / "gcd_CTS.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {"type": "group", "struct name": "Instance_U1", "children": [{"type": "box", "layer": 0, "path": [[12, 22], [32, 22], [32, 42], [12, 42], [12, 22]]}]},
+                {"type": "group", "struct name": "clk_leaf_0_0_buf", "children": [{"type": "box", "layer": 0, "path": [[80, 80], [90, 80], [90, 90], [80, 90], [80, 80]]}]},
+            ],
+        },
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "CTS"])
+
+    cts_instances = [json.loads(line) for line in (ws / "foundation_data" / "ecc" / "vectors" / "instances" / "CTS.jsonl").read_text().splitlines()]
+    cts_buf = next(item for item in cts_instances if item["name"] == "clk_leaf_0_0_buf")
+    assert cts_buf["progressive_metadata"]["created_stage"] == "CTS"
+    assert cts_buf["progressive_metadata"]["created_stage_source"] == "first_observed"
+    assert cts_buf["progressive_metadata"]["exists_in_prev_stage"] is False
+    assert cts_buf["progressive_metadata"]["exists_in_place"] is False
+    assert cts_buf["clock_tree"]["is_clock_tree_node"] is True
+    assert cts_buf["clock_tree"]["clock_tree_role"] in {"root_buffer", "internal_buffer", "leaf_buffer", "clock_buffer"}
+    moved = next(item for item in cts_instances if item["identity"]["instance_key"] == "U1")
+    assert moved["progressive_metadata"]["exists_in_prev_stage"] is True
+    assert moved["progressive_metadata"]["moved_from_prev_stage"] is True
+    assert moved["progressive_metadata"]["dx_from_prev_stage"] == 2.0
+    assert moved["progressive_metadata"]["dy_from_prev_stage"] == 2.0
 
 
 def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tmp_path: Path):
