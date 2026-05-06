@@ -639,6 +639,7 @@ class FoundationExtractor:
         native_demand_capacity_by_patch = {
             item["patch_id"]: item for item in labels.get("_route_native_demand_capacity_records", [])
         }
+        stage_order = [stage.name for stage in stages]
         instances_by_stage: dict[str, list[dict[str, Any]]] = {}
         for stage in stages:
             instances_by_stage[stage.name] = self._parse_instances(
@@ -701,6 +702,8 @@ class FoundationExtractor:
                 native_demand_capacity_by_patch if stage.name == "route" else {},
                 timing_paths,
                 drc_reports.get(stage.name),
+                parsed_def,
+                stage_order,
             )
             counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches, sort_keys=False)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
@@ -979,6 +982,8 @@ class FoundationExtractor:
         native_demand_capacity_by_patch: dict[int, dict[str, Any]],
         timing_paths: list[dict[str, Any]],
         drc_report: dict[str, Any] | None,
+        parsed_def: DefData | None,
+        stage_order: list[str],
     ) -> list[dict[str, Any]]:
         records = []
         density_maps = stage_maps.get("density", {})
@@ -989,36 +994,103 @@ class FoundationExtractor:
         cols = int(canonical_grid.get("cols") or 0)
         die_bbox = canonical_grid.get("die_bbox")
         patch_count = len(canonical_grid.get("patches", []))
+        stage_index = stage_order.index(stage) if stage in stage_order else None
+        prev_stage = stage_order[stage_index - 1] if isinstance(stage_index, int) and stage_index > 0 else None
+        def_source = _workspace_relative_from_parsed_def(parsed_def) if parsed_def else None
         for patch in canonical_grid.get("patches", []):
             patch_id = int(patch["patch_id"])
             row = int(patch["row"])
             col = int(patch["col"])
             bbox = patch["bbox"]
             center = _bbox_center(bbox)
-            patch_instances = [item for item in instances if _point_in_bbox(_instance_center(item).get("x"), _instance_center(item).get("y"), bbox)]
+            patch_instances = [item for item in instances if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id or item.get("physical_state", {}).get("patch_id") == patch_id]
+            overlap_instances = [item for item in instances if patch_id in (item.get("patch_anchor", {}).get("overlap_patch_ids") or item.get("physical_state", {}).get("overlap_patch_ids") or [])]
             patch_pins = [item for item in pins if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id]
+            overlap_pins = [item for item in pins if patch_id in (item.get("patch_anchor", {}).get("overlap_patch_ids") or item.get("geometry", {}).get("overlap_patch_ids") or [])]
             patch_wires = [item for item in wires if patch_id in item.get("patch_anchor", {}).get("overlap_patch_ids", [])]
-            patch_nets = [item for item in nets if patch_id in item.get("geometry_proxy", {}).get("patch_ids", [])]
+            patch_nets = [item for item in nets if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id]
+            overlap_nets = [item for item in nets if patch_id in item.get("geometry_proxy", {}).get("patch_ids", [])]
             wire_length_by_layer: dict[str, float] = {}
+            wire_length = 0.0
             for wire in patch_wires:
                 layer = str(wire.get("geometry", {}).get("layer") or wire.get("layer"))
-                wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("geometry", {}).get("length") if isinstance(wire.get("geometry"), dict) else wire.get("length") or 0.0)
+                length = _wire_length_for_patch(wire, patch_id)
+                wire_length += length
+                wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + length
             native_demand_capacity = native_demand_capacity_by_patch.get(patch_id, {})
             patch_drc = _drc_for_patch(drc_report, bbox)
             route_label = _demand_capacity_label(native_demand_capacity)
+            native_route_oracle = _route_native_demand_capacity_oracle(route_label)
             route_oracle = None
             if stage == "route":
                 route_oracle = {
-                    "route_only_oracle": True,
+                    "feature_role": "route_only_oracle",
                     "available_for_training_input": False,
-                    "horizontal_overflow": route_label.get("horizontal"),
-                    "vertical_overflow": route_label.get("vertical"),
-                    "union_overflow": route_label.get("union"),
+                    "route_only_oracle": True,
+                    "wire_length": wire_length,
                     "wire_length_by_layer": wire_length_by_layer,
                     "via_count": sum(1 for wire in patch_wires if wire.get("identity", {}).get("segment_kind") == "via"),
+                    "native_demand_capacity": native_route_oracle,
                     "source": route_label.get("source") or "routed_def_reconstruction",
                 }
             neighbor_ids = _neighbor_patch_ids(row, col, rows, cols)
+            adjacent_ids = _adjacent_patch_ids(row, col, rows, cols)
+            stdcell_instances = [item for item in overlap_instances if item.get("identity", {}).get("physical_class") == "stdcell"]
+            macro_instances = [item for item in overlap_instances if item.get("identity", {}).get("physical_class") == "macro"]
+            physical_only_instances = [item for item in overlap_instances if item.get("identity", {}).get("physical_class") == "physical_only"]
+            stdcell_area = _instance_overlap_area(stdcell_instances, bbox)
+            macro_area = _instance_overlap_area(macro_instances, bbox)
+            instance_area = _instance_overlap_area(overlap_instances, bbox)
+            pin_density = _value_from_named_map(density_maps, "allcell_pin_density", row, col)
+            if pin_density is None:
+                pin_density = _value_from_named_map(density_maps, "pin_density", row, col)
+            net_density = _value_from_named_map(density_maps, "allnet_density", row, col)
+            if net_density is None:
+                net_density = _value_from_named_map(density_maps, "net_density", row, col)
+            rudy_union = _value_from_named_map(rudy_maps, "rudy_union", row, col)
+            egr_horizontal = _matrix_value(congestion_maps.get("horizontal"), row, col)
+            egr_vertical = _matrix_value(congestion_maps.get("vertical"), row, col)
+            egr_union = _matrix_value(congestion_maps.get("union"), row, col)
+            window_cell_values = [_value_from_patch_id(canonical_grid, density_maps, "allcell_density", item) for item in neighbor_ids]
+            window_pin_density_values = [_value_from_patch_id(canonical_grid, density_maps, "allcell_pin_density", item) for item in neighbor_ids]
+            if not any(value is not None for value in window_pin_density_values):
+                window_pin_density_values = [_value_from_patch_id(canonical_grid, density_maps, "pin_density", item) for item in neighbor_ids]
+            window_rudy_values = [_value_from_patch_id(canonical_grid, rudy_maps, "rudy_union", item) for item in neighbor_ids]
+            window_egr_values = [_matrix_value_for_patch_id(canonical_grid, congestion_maps.get("union"), item) for item in neighbor_ids]
+            timing_context = _timing_for_patch(timing_paths, patch_id, stage)
+            electrical_context = _electrical_for_patch(timing_paths, patch_id, stage)
+            drc_context = {
+                "feature_role": "route_or_drc_analysis",
+                "available_for_training_input": False,
+                "availability": patch_drc.get("availability", "available" if patch_drc.get("count") is not None else "missing"),
+                "count": patch_drc.get("count"),
+                "by_type": patch_drc.get("by_type", {}),
+                "by_layer": patch_drc.get("by_layer", {}),
+                "unlocalized_count": patch_drc.get("unlocalized_count"),
+                "source": "drc_artifacts" if patch_drc.get("availability") != "missing" else None,
+            }
+            input_blocks = [
+                "local_density",
+                "local_connectivity",
+                "pre_route_estimators",
+                "neighbor_context",
+                "entity_refs",
+            ]
+            if timing_context.get("available_for_training_input"):
+                input_blocks.append("timing_context")
+            if electrical_context.get("available_for_training_input"):
+                input_blocks.append("electrical_context")
+            null_reason = _patch_null_reason(
+                stage,
+                density_maps,
+                rudy_maps,
+                congestion_maps,
+                timing_context,
+                electrical_context,
+                route_oracle,
+                native_demand_capacity,
+                drc_context,
+            )
             record = {
                 "id": patch_id,
                 "stage": stage,
@@ -1026,43 +1098,19 @@ class FoundationExtractor:
                 "source": "canonical_grid.json",
                 "identity": {"patch_id": patch_id, "row": row, "col": col, "grid_rows": rows, "grid_cols": cols, "grid_source": canonical_grid.get("grid_source"), "grid_patch_count": patch_count},
                 "geometry": {"bbox": bbox, "center": center, "width": float(bbox["urx"]) - float(bbox["llx"]), "height": float(bbox["ury"]) - float(bbox["lly"]), "area": _bbox_area(bbox), "die_bbox": die_bbox, "distance_to_die_boundary": _distance_to_die_boundary(bbox, die_bbox), "edge_position": _edge_position(row, col, rows, cols)},
-                "local_density": {"feature_role": "progressive_input", "available_for_training_input": True, "instance_count_center": len(patch_instances), "instance_count_overlap": len(patch_instances), "stdcell_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "stdcell"), "macro_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "macro"), "instance_area": sum(float(item.get("physical_state", {}).get("area") or 0.0) for item in patch_instances), "macro_area": sum(float(item.get("physical_state", {}).get("area") or 0.0) for item in patch_instances if item.get("identity", {}).get("physical_class") == "macro"), "pin_count": len(patch_pins), "wire_length_by_layer": wire_length_by_layer, "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col), "pin_density": _value_from_named_map(density_maps, "pin_density", row, col), "net_density": _value_from_named_map(density_maps, "net_density", row, col), "macro_density": _value_from_named_map(density_maps, "macro_density", row, col), "source": "maps_and_vectors"},
-                "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": True, "net_count": len(patch_nets), "cross_patch_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "clock_net_count": sum(1 for net in patch_nets if net.get("identity", {}).get("is_clock")), "high_fanout_net_count": sum(1 for net in patch_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "source": "vectors/nets"},
-                "pre_route_estimators": {"feature_role": "progressive_input", "available_for_training_input": stage != "route", "rudy_congestion": _value_from_named_map(rudy_maps, "rudy_union", row, col), "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col), "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col), "congestion_horizontal": _matrix_value(congestion_maps.get("horizontal"), row, col), "congestion_vertical": _matrix_value(congestion_maps.get("vertical"), row, col), "congestion_union": _matrix_value(congestion_maps.get("union"), row, col), "source": "canonical_maps"},
-                "neighbor_context": {"adjacent_patch_ids": _adjacent_patch_ids(row, col, rows, cols), "window_patch_ids": neighbor_ids, "window_size": 3, "source": "canonical_grid"},
-                "entity_refs": {"ref_limit": 32, "counts": {"instances": len(patch_instances), "pins": len(patch_pins), "nets": len(patch_nets), "wires": len(patch_wires), "timing_paths": len(timing_paths), "drc": patch_drc.get("count")}, "sample_refs": {"instances": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "pins": [item.get("pin_key") for item in patch_pins[:32]], "nets": [item.get("net_key") for item in patch_nets[:32]], "wires": [item.get("wire_key") for item in patch_wires[:32]]}},
-                "timing_context": {"feature_role": "progressive_input", "available_for_training_input": True, **_timing_for_patch(timing_paths)},
-                "electrical_context": {"feature_role": "progressive_input", "available_for_training_input": True, **_electrical_for_patch(timing_paths)},
+                "local_density": {"feature_role": "progressive_input", "available_for_training_input": True, "instance_count_center": len(patch_instances), "instance_count_overlap": len(overlap_instances), "stdcell_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "stdcell"), "macro_count_overlap": len(macro_instances), "physical_only_count_overlap": len(physical_only_instances), "stdcell_area_overlap": stdcell_area, "macro_area_overlap": macro_area, "instance_area_overlap": instance_area, "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col), "macro_density": _value_from_named_map(density_maps, "macro_density", row, col), "pin_count_anchor": len(patch_pins), "pin_count_overlap": len(overlap_pins), "pin_density": pin_density, "net_density": net_density, "wire_length": wire_length, "wire_length_by_layer": wire_length_by_layer, "via_count": sum(1 for wire in patch_wires if wire.get("identity", {}).get("segment_kind") == "via"), "source": "maps_and_vectors"},
+                "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": True, "net_count_anchor": len(patch_nets), "net_count_overlap": len(overlap_nets), "cross_patch_net_count": sum(1 for net in overlap_nets if net.get("connectivity_summary", {}).get("cross_patch")), "entering_net_count": sum(1 for net in overlap_nets if patch_id != net.get("patch_anchor", {}).get("primary_patch_id")), "leaving_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "internal_net_count": sum(1 for net in patch_nets if not net.get("connectivity_summary", {}).get("cross_patch")), "high_fanout_net_count": sum(1 for net in overlap_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "clock_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_clock")), "reset_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_reset")), "pg_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_power_ground")), "signal_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_signal")), "local_hpwl_sum": _sum_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_max": _max_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_mean": _mean_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "source": f"vectors/nets/{stage}.jsonl"},
+                "pre_route_estimators": {"feature_role": "progressive_input", "available_for_training_input": stage != "route", "rudy_horizontal": _value_from_named_map(rudy_maps, "rudy_horizontal", row, col), "rudy_vertical": _value_from_named_map(rudy_maps, "rudy_vertical", row, col), "rudy_union": rudy_union, "egr_overflow_horizontal": egr_horizontal, "egr_overflow_vertical": egr_vertical, "egr_overflow_union": egr_union, "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col), "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col), "source": "canonical_maps"},
+                "neighbor_context": {"feature_role": "progressive_input", "available_for_training_input": True, "adjacent_patch_ids": adjacent_ids, "window_3x3_patch_ids": neighbor_ids, "window_3x3_valid_count": len(neighbor_ids), "edge_position": _edge_position(row, col, rows, cols), "window_3x3_cell_density_mean": _mean_optional(window_cell_values), "window_3x3_pin_density_sum": _sum_optional(window_pin_density_values), "window_3x3_pin_count_sum": sum(1 for pin in pins if pin.get("patch_anchor", {}).get("primary_patch_id") in neighbor_ids), "window_3x3_rudy_max": _max_optional(window_rudy_values), "window_3x3_egr_overflow_max": _max_optional(window_egr_values), "source": f"vectors/patches/{stage}.jsonl"},
+                "entity_refs": {"anchor_semantics": "primary_patch_or_center", "overlap_semantics": "bbox_or_segment_intersection", "instance_count": len(patch_instances), "instance_overlap_count": len(overlap_instances), "pin_count": len(patch_pins), "pin_overlap_count": len(overlap_pins), "net_count": len(patch_nets), "net_overlap_count": len(overlap_nets), "wire_count": len(patch_wires), "timing_path_count": sum(1 for path in timing_paths if patch_id in _timing_path_patch_ids(path)), "drc_count": patch_drc.get("count"), "sample_instance_keys": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "sample_pin_keys": [item.get("pin_key") for item in patch_pins[:32]], "sample_net_keys": [item.get("net_key") for item in patch_nets[:32]], "sample_wire_ids": [item.get("wire_key") for item in patch_wires[:32]], "sample_timing_path_ids": [item.get("id") for item in timing_paths if patch_id in _timing_path_patch_ids(item)][:32], "sample_drc_ids": [], "refs_truncated": any(count > 32 for count in (len(patch_instances), len(patch_pins), len(patch_nets), len(patch_wires), sum(1 for path in timing_paths if patch_id in _timing_path_patch_ids(path)))), "ref_limit": 32},
+                "timing_context": timing_context,
+                "electrical_context": electrical_context,
                 "route_oracle": route_oracle,
-                "label_refs": {"route_native_demand_capacity": f"labels/route_native_demand_capacity.jsonl#patch_id={patch_id}" if native_demand_capacity else None, "label_source_status": "available" if native_demand_capacity else "missing"},
-                "drc_context": patch_drc,
-                "progressive_metadata": {"grid_stable_across_stages": True, "route_only_oracle": stage == "route", "available_for_training_input": stage != "route"},
-                "source_refs": {"canonical_grid": "foundation_data/ecc/canonical_grid.json", "maps": f"foundation_data/ecc/maps/{stage}", "instances": f"foundation_data/ecc/vectors/instances/{stage}.jsonl", "pins": f"foundation_data/ecc/vectors/pins/{stage}.jsonl", "nets": f"foundation_data/ecc/vectors/nets/{stage}.jsonl", "wires": f"foundation_data/ecc/vectors/wires/{stage}.jsonl", "timing_paths": f"foundation_data/ecc/vectors/timing_paths/{stage}.jsonl", "labels": "foundation_data/ecc/labels/route_native_demand_capacity.jsonl" if native_demand_capacity else None},
-                "null_reason": {"route_oracle": "not_route_stage"} if stage != "route" else {},
-                "patch_id": patch_id,
-                "row": row,
-                "col": col,
-                "instance_count": len(patch_instances),
-                "instance_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances),
-                "macro_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances if item.get("identity", {}).get("is_macro") or item.get("is_macro")),
-                "net_count": len(patch_nets) if patch_nets else (len(nets) if not patch_wires and stage == "route" else 0),
-                "pin_count": len(patch_pins) if not (stage == "route" and row == 0 and col == 0) else max(len(patch_pins), len(pins)),
-                "wire_length_by_layer": wire_length_by_layer,
-                "route_native_demand_capacity": route_label,
-                "route_demand_capacity": route_label,
-                "drc": patch_drc,
-                "timing": _timing_for_patch(timing_paths),
-                "electrical": _electrical_for_patch(timing_paths),
-                "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col),
-                "pin_density": _value_from_named_map(density_maps, "pin_density", row, col),
-                "net_density": _value_from_named_map(density_maps, "net_density", row, col),
-                "macro_density": _value_from_named_map(density_maps, "macro_density", row, col),
-                "rudy_congestion": _value_from_named_map(rudy_maps, "rudy_union", row, col),
-                "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col),
-                "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col),
-                "congestion_horizontal": _matrix_value(congestion_maps.get("horizontal"), row, col),
-                "congestion_vertical": _matrix_value(congestion_maps.get("vertical"), row, col),
-                "congestion_union": _matrix_value(congestion_maps.get("union"), row, col),
+                "label_refs": {"route_patch_overflow": None, "route_native_demand_capacity": f"labels/route_native_demand_capacity.jsonl#patch_id={patch_id}" if native_demand_capacity else None, "route_reconstructed_congestion": None, "label_source_status": "available" if native_demand_capacity else "missing"},
+                "drc_context": drc_context,
+                "progressive_metadata": {"available_from": "Floorplan" if stage_order else stage, "grid_stable_across_stages": True, "stage_order_index": stage_index, "is_progressive_input_stage": stage != "route", "is_route_oracle_stage": stage == "route", "input_blocks": [] if stage == "route" else input_blocks, "oracle_blocks": ["route_oracle"] if stage == "route" else [], "prev_stage": prev_stage, "density_delta_from_prev_stage": None, "pin_count_delta_from_prev_stage": None, "rudy_delta_from_prev_stage": None, "egr_overflow_delta_from_prev_stage": None},
+                "source_refs": {"canonical_grid": "canonical_grid.json", "stage_def": def_source, "density_maps": f"maps/{stage}/density.json" if density_maps else None, "rudy_maps": f"maps/{stage}/rudy.json" if rudy_maps else None, "egr_maps": f"maps/{stage}/congestion.json" if congestion_maps else None, "instances": f"vectors/instances/{stage}.jsonl", "pins": f"vectors/pins/{stage}.jsonl", "nets": f"vectors/nets/{stage}.jsonl", "wires": f"vectors/wires/{stage}.jsonl", "timing_paths": f"vectors/timing_paths/{stage}.jsonl", "route": def_source if stage == "route" else None, "drc": "drc_artifacts" if drc_context.get("availability") == "available" else None, "route_label_definition": "route_oracle.native_demand_capacity.union_overflow=max(horizontal_overflow,vertical_overflow); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={overflow,near_capacity,relaxed,unknown}" if stage == "route" and native_demand_capacity else None},
+                "null_reason": null_reason,
             }
             records.append(record)
         return records
@@ -2830,26 +2878,98 @@ def _drc_for_patch(drc_report: dict[str, Any] | None, bbox: dict[str, Any]) -> d
     return {"count": count, "by_type": by_type, "by_layer": by_layer, "unlocalized_count": unlocalized}
 
 
-def _timing_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
+def _wire_length_for_patch(wire: dict[str, Any], patch_id: int) -> float:
+    for item in wire.get("patch_intersections", []):
+        if int(item.get("patch_id", -1)) == patch_id:
+            return float(item.get("length") or 0.0)
+    geometry = wire.get("geometry", {}) if isinstance(wire.get("geometry"), dict) else {}
+    return float(geometry.get("length") or wire.get("length") or 0.0)
+
+
+def _instance_overlap_area(instances: list[dict[str, Any]], bbox: dict[str, Any]) -> float:
+    total = 0.0
+    for item in instances:
+        item_bbox = item.get("physical_state", {}).get("bbox")
+        if isinstance(item_bbox, dict):
+            total += _bbox_overlap_area(item_bbox, bbox)
+    return total
+
+
+def _sum_optional(values: Any) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return sum(present) if present else None
+
+
+def _max_optional(values: Any) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return max(present) if present else None
+
+
+def _mean_optional(values: Any) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return sum(present) / len(present) if present else None
+
+
+def _value_from_patch_id(canonical_grid: dict, maps: dict[str, list[list[float]]], token: str, patch_id: int) -> float | None:
+    row_col = _patch_row_col(canonical_grid, patch_id)
+    return _value_from_named_map(maps, token, row_col[0], row_col[1]) if row_col else None
+
+
+def _matrix_value_for_patch_id(canonical_grid: dict, matrix: list[list[float]] | None, patch_id: int) -> float | None:
+    row_col = _patch_row_col(canonical_grid, patch_id)
+    return _matrix_value(matrix, row_col[0], row_col[1]) if row_col else None
+
+
+def _timing_path_patch_ids(record: dict[str, Any]) -> set[int]:
+    out = set()
+    spatial = record.get("path_spatial", {}) if isinstance(record.get("path_spatial"), dict) else {}
+    out.update(int(item) for item in spatial.get("touched_patch_ids", []) if item is not None)
+    for endpoint in (record.get("endpoints", {}) if isinstance(record.get("endpoints"), dict) else {}).values():
+        if isinstance(endpoint, dict) and endpoint.get("patch_id") is not None:
+            out.add(int(endpoint["patch_id"]))
+    for key in ("path_points", "wire_path_nodes"):
+        for point in record.get(key, []):
+            if isinstance(point, dict) and point.get("patch_id") is not None:
+                out.add(int(point["patch_id"]))
+    return out
+
+
+def _timing_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
+    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
     slacks = [
         float(item.get("path_timing", {}).get("slack") if isinstance(item.get("path_timing"), dict) else item.get("slack"))
-        for item in timing_paths
+        for item in scoped_paths
         if (item.get("path_timing", {}).get("slack") if isinstance(item.get("path_timing"), dict) else item.get("slack")) is not None
     ]
+    endpoint_count = sum(1 for item in scoped_paths if item.get("endpoints", {}).get("endpoint", {}).get("patch_id") == patch_id)
+    startpoint_count = sum(1 for item in scoped_paths if item.get("endpoints", {}).get("startpoint", {}).get("patch_id") == patch_id)
+    max_slews = [item.get("path_electrical", {}).get("max_slew") for item in scoped_paths if item.get("path_electrical", {}).get("max_slew") is not None]
+    max_caps = [
+        max(item.get("path_electrical", {}).get("capacitance_list", []) or [])
+        for item in scoped_paths
+        if item.get("path_electrical", {}).get("capacitance_list")
+    ]
     return {
-        "worst_slack": min(slacks) if slacks else None,
-        "path_count": len(timing_paths) if timing_paths else 0,
-        "availability": "available" if timing_paths else "missing",
-        "scope": "stage",
+        "feature_role": "stage_qor_context",
+        "available_for_training_input": stage != "route",
+        "availability": "available" if scoped_paths else "missing",
+        "critical_path_count": len(scoped_paths),
+        "worst_slack_min": min(slacks) if slacks else None,
+        "endpoint_count": endpoint_count,
+        "startpoint_count": startpoint_count,
+        "max_slew": max(max_slews) if max_slews else None,
+        "max_cap": max(max_caps) if max_caps else None,
+        "source": f"vectors/timing_paths/{stage}.jsonl" if stage else None,
     }
 
 
-def _electrical_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
+def _electrical_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
+    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
     caps: list[float] = []
     slews: list[float] = []
     resistances: list[float] = []
     incrs: list[float] = []
-    for path in timing_paths:
+    for path in scoped_paths:
         electrical = path.get("path_electrical", {})
         if not isinstance(electrical, dict):
             continue
@@ -2858,13 +2978,77 @@ def _electrical_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
         resistances.extend(float(value) for value in electrical.get("resistance_list", []) if value is not None)
         incrs.extend(float(value) for value in electrical.get("incr_delay_list", []) if value is not None)
     return {
+        "feature_role": "stage_qor_context",
+        "available_for_training_input": stage != "route",
+        "availability": "available" if caps or slews or resistances or incrs else "missing",
         "capacitance_sum": sum(caps) if caps else None,
-        "max_slew": max(slews) if slews else None,
         "resistance_sum": sum(resistances) if resistances else None,
         "incr_delay_sum": sum(incrs) if incrs else None,
-        "availability": "available" if caps or slews or resistances or incrs else "missing",
-        "scope": "stage",
+        "max_slew": max(slews) if slews else None,
+        "scope": "patch" if patch_id is not None else "stage",
+        "source": f"vectors/timing_paths/{stage}.jsonl" if stage else None,
     }
+
+
+def _route_native_demand_capacity_oracle(label: dict[str, Any]) -> dict[str, Any]:
+    h_overflow = label.get("horizontal")
+    v_overflow = label.get("vertical")
+    h_util = label.get("horizontal_utilization")
+    v_util = label.get("vertical_utilization")
+    union_overflow = _max_optional([h_overflow, v_overflow])
+    union_utilization = _max_optional([h_util, v_util])
+    return {
+        "horizontal_demand": label.get("horizontal_demand"),
+        "horizontal_capacity": label.get("horizontal_capacity"),
+        "horizontal_overflow": h_overflow,
+        "horizontal_utilization": h_util,
+        "vertical_demand": label.get("vertical_demand"),
+        "vertical_capacity": label.get("vertical_capacity"),
+        "vertical_overflow": v_overflow,
+        "vertical_utilization": v_util,
+        "union_overflow": union_overflow,
+        "union_utilization": union_utilization,
+        "tightness_class": _tightness_class(union_overflow, union_utilization),
+    }
+
+
+def _tightness_class(union_overflow: Any, union_utilization: Any) -> str:
+    if union_overflow is None and union_utilization is None:
+        return "unknown"
+    if union_overflow is not None and float(union_overflow) > 0:
+        return "overflow"
+    if union_utilization is not None and float(union_utilization) >= 0.9:
+        return "near_capacity"
+    return "relaxed"
+
+
+def _patch_null_reason(
+    stage: str,
+    density_maps: dict[str, MapMatrix],
+    rudy_maps: dict[str, MapMatrix],
+    congestion_maps: dict[str, MapMatrix],
+    timing_context: dict[str, Any],
+    electrical_context: dict[str, Any],
+    route_oracle: dict[str, Any] | None,
+    native_demand_capacity: dict[str, Any],
+    drc_context: dict[str, Any],
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not density_maps:
+        out["local_density"] = "missing_density_maps"
+    if not rudy_maps and not congestion_maps:
+        out["pre_route_estimators"] = "missing_pre_route_maps" if stage != "route" else "not_applicable_for_stage"
+    if timing_context.get("availability") == "missing":
+        out["timing_context"] = "missing_sta_artifacts"
+    if electrical_context.get("availability") == "missing":
+        out["electrical_context"] = "missing_electrical_artifacts"
+    if stage != "route":
+        out["route_oracle"] = "not_route_stage"
+    elif route_oracle is not None and not native_demand_capacity:
+        out["route_oracle"] = "missing_router_native_route_overflow_artifact"
+    if drc_context.get("availability") == "missing":
+        out["drc_context"] = "missing_drc_artifacts"
+    return out
 
 
 def _bbox_intersects_bbox(a: dict[str, Any], b: dict[str, Any]) -> bool:

@@ -638,26 +638,57 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert timing_path["path_spatial"]["anchor_source_policy"] == "prefer_pin_geometry_fallback_parent_instance"
 
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
-    assert patches[0]["net_count"] >= 1
-    assert "bbox" not in patches[0]
-    assert "availability" not in patches[0]
-    assert patches[0]["wire_length_by_layer"]["MET2"] > 0
-    assert "route_true_overflow" not in patches[0]
-    assert "route_reconstructed_congestion" not in patches[0]
-    assert patches[0]["route_native_demand_capacity"]["horizontal"] == 3.0
-    assert patches[0]["route_native_demand_capacity"]["vertical"] == 2.0
-    assert "route_reconstructed_demand_capacity" not in patches[0]
-    assert patches[0]["route_demand_capacity"]["horizontal"] == 3.0
-    assert patches[0]["route_demand_capacity"]["vertical"] == 2.0
-    assert patches[0]["route_demand_capacity"]["source"] == "irt_space_router_native"
-    assert patches[0]["timing"]["worst_slack"] == 1.0
-    assert patches[0]["electrical"]["capacitance_sum"] == 0.5
-    assert patches[0]["electrical"]["max_slew"] == 0.6
+    patch0 = patches[0]
+    assert list(patch0) == [
+        "id",
+        "stage",
+        "patch_key",
+        "source",
+        "identity",
+        "geometry",
+        "local_density",
+        "local_connectivity",
+        "pre_route_estimators",
+        "neighbor_context",
+        "entity_refs",
+        "timing_context",
+        "electrical_context",
+        "route_oracle",
+        "label_refs",
+        "drc_context",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+    ]
+    assert "bbox" not in patch0
+    assert "availability" not in patch0
+    assert "route_true_overflow" not in patch0
+    assert "route_reconstructed_congestion" not in patch0
+    assert "route_native_demand_capacity" not in patch0
+    assert "route_reconstructed_demand_capacity" not in patch0
+    assert "route_demand_capacity" not in patch0
+    assert "timing" not in patch0
+    assert "electrical" not in patch0
+    assert patch0["entity_refs"]["net_count"] >= 1
+    assert patch0["route_oracle"]["wire_length_by_layer"]["MET2"] > 0
+    native = patch0["route_oracle"]["native_demand_capacity"]
+    assert native["horizontal_demand"] == 6.0
+    assert native["horizontal_capacity"] == 3.0
+    assert native["horizontal_overflow"] == 3.0
+    assert native["vertical_overflow"] == 2.0
+    assert native["union_overflow"] == 3.0
+    assert native["union_utilization"] == 2.0
+    assert native["tightness_class"] == "overflow"
+    assert patch0["route_oracle"]["feature_role"] == "route_only_oracle"
+    assert patch0["route_oracle"]["available_for_training_input"] is False
+    assert patch0["timing_context"]["worst_slack_min"] == 1.0
+    assert patch0["electrical_context"]["capacitance_sum"] == 0.5
+    assert patch0["electrical_context"]["max_slew"] == 0.6
 
     drc_patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "drc.jsonl").read_text().splitlines()]
-    assert drc_patches[0]["drc"]["count"] == 2
-    assert drc_patches[0]["drc"]["by_type"] == {"short": 2}
-    assert drc_patches[-1]["drc"]["count"] == 1
+    assert drc_patches[0]["drc_context"]["count"] == 2
+    assert drc_patches[0]["drc_context"]["by_type"] == {"short": 2}
+    assert drc_patches[-1]["drc_context"]["count"] == 1
 
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
     assert "profile" not in quality
@@ -1121,10 +1152,13 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
     assert not (foundation_dir / "labels" / "route_reconstructed_demand_capacity.jsonl").exists()
     native = (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8")
     assert "route_true_overflow" not in patches[0]
-    assert patches[0]["route_native_demand_capacity"]["union"] is None
+    assert "route_native_demand_capacity" not in patches[0]
+    assert patches[0]["route_oracle"]["native_demand_capacity"]["union_overflow"] is None
     assert "route_reconstructed_demand_capacity" not in patches[0]
     assert "route_reconstructed_congestion" not in patches[0]
-    assert patches[0]["route_demand_capacity"]["union"] is None
+    assert "route_demand_capacity" not in patches[0]
+    assert patches[0]["label_refs"]["label_source_status"] == "missing"
+    assert patches[0]["null_reason"]["route_oracle"] == "missing_router_native_route_overflow_artifact"
     assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
     assert native == ""
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
@@ -1132,6 +1166,168 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
     assert "route_patch_overflow" not in quality["availability"].get("labels", {})
     assert "route_reconstructed_congestion" not in quality["availability"]["labels"]
     assert "route_reconstructed_demand_capacity" not in quality["availability"]["labels"]
+
+
+def test_iccd_full_v1_patch_records_follow_vec_patches_schema(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    place_patches = [
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "patches" / "place.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    route_patches = [
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    place0 = place_patches[0]
+    route0 = route_patches[0]
+
+    assert list(place0) == [
+        "id",
+        "stage",
+        "patch_key",
+        "source",
+        "identity",
+        "geometry",
+        "local_density",
+        "local_connectivity",
+        "pre_route_estimators",
+        "neighbor_context",
+        "entity_refs",
+        "timing_context",
+        "electrical_context",
+        "route_oracle",
+        "label_refs",
+        "drc_context",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+    ]
+    legacy_flat_fields = {
+        "patch_id",
+        "row",
+        "col",
+        "instance_count",
+        "instance_area",
+        "macro_area",
+        "net_count",
+        "pin_count",
+        "wire_length_by_layer",
+        "route_native_demand_capacity",
+        "route_demand_capacity",
+        "drc",
+        "timing",
+        "electrical",
+        "cell_density",
+        "pin_density",
+        "net_density",
+        "macro_density",
+        "rudy_congestion",
+        "margin_horizontal",
+        "margin_vertical",
+        "congestion_horizontal",
+        "congestion_vertical",
+        "congestion_union",
+    }
+    assert not (set(place0) & legacy_flat_fields)
+    assert place0["local_density"] == {
+        "feature_role": "progressive_input",
+        "available_for_training_input": True,
+        "instance_count_center": 2,
+        "instance_count_overlap": 2,
+        "stdcell_count_center": 1,
+        "macro_count_overlap": 1,
+        "physical_only_count_overlap": 0,
+        "stdcell_area_overlap": 200.0,
+        "macro_area_overlap": 1500.0,
+        "instance_area_overlap": 1700.0,
+        "cell_density": 10.0,
+        "macro_density": 0.0,
+        "pin_count_anchor": 1,
+        "pin_count_overlap": 0,
+        "pin_density": 20.0,
+        "net_density": 30.0,
+        "wire_length": 0.0,
+        "wire_length_by_layer": {},
+        "via_count": 0,
+        "source": "maps_and_vectors",
+    }
+    assert place0["local_connectivity"]["net_count_anchor"] == 1
+    assert place0["local_connectivity"]["cross_patch_net_count"] == 1
+    assert place0["local_connectivity"]["signal_net_count"] == 1
+    assert place0["local_connectivity"]["local_hpwl_sum"] == 215.0
+    assert place0["pre_route_estimators"] == {
+        "feature_role": "progressive_input",
+        "available_for_training_input": True,
+        "rudy_horizontal": None,
+        "rudy_vertical": None,
+        "rudy_union": 50.0,
+        "egr_overflow_horizontal": 1.0,
+        "egr_overflow_vertical": 3.0,
+        "egr_overflow_union": 3.0,
+        "margin_horizontal": None,
+        "margin_vertical": None,
+        "source": "canonical_maps",
+    }
+    assert place0["neighbor_context"]["feature_role"] == "progressive_input"
+    assert place0["neighbor_context"]["available_for_training_input"] is True
+    assert place0["neighbor_context"]["window_3x3_patch_ids"] == [0, 1, 2, 3]
+    assert place0["neighbor_context"]["window_3x3_valid_count"] == 4
+    assert place0["neighbor_context"]["edge_position"] == "corner"
+    assert place0["neighbor_context"]["window_3x3_cell_density_mean"] == 11.5
+    assert place0["neighbor_context"]["window_3x3_pin_count_sum"] == 2
+    assert place0["entity_refs"]["anchor_semantics"] == "primary_patch_or_center"
+    assert place0["entity_refs"]["overlap_semantics"] == "bbox_or_segment_intersection"
+    assert place0["entity_refs"]["instance_count"] == 2
+    assert place0["entity_refs"]["pin_count"] == 1
+    assert place0["entity_refs"]["net_count"] == 1
+    assert place0["entity_refs"]["refs_truncated"] is False
+    assert place0["entity_refs"]["sample_instance_keys"] == ["U1", "SRAM0"]
+    assert place0["timing_context"]["feature_role"] == "stage_qor_context"
+    assert place0["timing_context"]["available_for_training_input"] is True
+    assert place0["timing_context"]["critical_path_count"] == 0
+    assert place0["timing_context"]["worst_slack_min"] is None
+    assert place0["electrical_context"]["feature_role"] == "stage_qor_context"
+    assert place0["electrical_context"]["scope"] == "patch"
+    assert place0["electrical_context"]["availability"] == "missing"
+    assert place0["route_oracle"] is None
+    assert place0["label_refs"]["label_source_status"] == "missing"
+    assert place0["drc_context"]["feature_role"] == "route_or_drc_analysis"
+    assert place0["drc_context"]["available_for_training_input"] is False
+    assert place0["progressive_metadata"]["available_from"] == "Floorplan"
+    assert place0["progressive_metadata"]["stage_order_index"] == 1
+    assert place0["progressive_metadata"]["is_progressive_input_stage"] is True
+    assert place0["progressive_metadata"]["is_route_oracle_stage"] is False
+    assert "route_oracle" not in place0["progressive_metadata"]["input_blocks"]
+    assert place0["progressive_metadata"]["oracle_blocks"] == []
+    assert place0["source_refs"]["stage_def"] == "place_dreamplace/output/gcd_place.def"
+    assert place0["source_refs"]["density_maps"] == "maps/place/density.json"
+    assert place0["source_refs"]["route_label_definition"] is None
+    assert place0["null_reason"]["route_oracle"] == "not_route_stage"
+
+    native = route0["route_oracle"]["native_demand_capacity"]
+    assert route0["route_oracle"]["feature_role"] == "route_only_oracle"
+    assert route0["route_oracle"]["wire_length"] > 0
+    assert native["horizontal_demand"] == 6.0
+    assert native["horizontal_capacity"] == 3.0
+    assert native["horizontal_overflow"] == 3.0
+    assert native["horizontal_utilization"] == 2.0
+    assert native["vertical_demand"] == 4.0
+    assert native["vertical_capacity"] == 2.0
+    assert native["vertical_overflow"] == 2.0
+    assert native["vertical_utilization"] == 2.0
+    assert native["union_overflow"] == 3.0
+    assert native["union_utilization"] == 2.0
+    assert native["tightness_class"] == "overflow"
+    assert route0["label_refs"]["route_native_demand_capacity"] == "labels/route_native_demand_capacity.jsonl#patch_id=0"
+    assert route0["label_refs"]["label_source_status"] == "available"
+    assert route0["progressive_metadata"]["is_progressive_input_stage"] is False
+    assert route0["progressive_metadata"]["is_route_oracle_stage"] is True
+    assert route0["progressive_metadata"]["oracle_blocks"] == ["route_oracle"]
+    assert route0["source_refs"]["route_label_definition"] == "route_oracle.native_demand_capacity.union_overflow=max(horizontal_overflow,vertical_overflow); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={overflow,near_capacity,relaxed,unknown}"
 
 
 def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
@@ -1634,8 +1830,8 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
     assert patch["patch_key"] == "patch:0"
     assert patch["identity"]["grid_patch_count"] == 4
     assert patch["local_density"]["available_for_training_input"] is True
-    assert patch["neighbor_context"]["window_patch_ids"]
-    assert patch["entity_refs"]["counts"]["wires"] >= 1
+    assert patch["neighbor_context"]["window_3x3_patch_ids"]
+    assert patch["entity_refs"]["wire_count"] >= 1
     assert patch["route_oracle"]["route_only_oracle"] is True
     assert patch["label_refs"]["route_native_demand_capacity"] == "labels/route_native_demand_capacity.jsonl#patch_id=0"
 
