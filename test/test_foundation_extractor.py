@@ -1371,3 +1371,160 @@ END DESIGN
     assert route_pin["route_context"]["route_only_oracle"] is True
     assert route_pin["progressive_metadata"]["route_only_oracle"] is True
     assert route_pin["route_context"]["net_routed_length"] == 40.0
+
+
+def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
+    n1 = next(row for row in nets if row["net_key"] == "n1")
+    assert list(n1) == [
+        "id",
+        "stage",
+        "net_key",
+        "name",
+        "source",
+        "identity",
+        "connectivity_summary",
+        "terminal_refs",
+        "geometry_proxy",
+        "patch_anchor",
+        "timing_context",
+        "route_analysis",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+    ]
+    assert n1["identity"]["net_class"] == "signal"
+    assert n1["connectivity_summary"]["terminal_count"] >= 2
+    assert n1["connectivity_summary"]["pin_count"] == n1["connectivity_summary"]["terminal_count"]
+    assert n1["terminal_refs"]
+    assert n1["geometry_proxy"]["hpwl"] is not None
+    assert n1["route_analysis"]["route_only_oracle"] is True
+    assert n1["route_analysis"]["routed_wire_length"] > 0
+    assert n1["route_analysis"]["via_count"] >= 0
+    assert n1["source_refs"]["def"] == "route_ecc/output/gcd_route.def"
+
+    wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route.jsonl").read_text().splitlines()]
+    wire = next(row for row in wires if row["identity"]["net_key"] == "n1" and row["identity"]["segment_kind"] == "wire_segment")
+    assert list(wire) == [
+        "id",
+        "stage",
+        "wire_key",
+        "source",
+        "identity",
+        "geometry",
+        "layer_context",
+        "track_context",
+        "capacity_context",
+        "patch_anchor",
+        "patch_intersections",
+        "net_context",
+        "endpoint_context",
+        "timing_context",
+        "route_context",
+        "via_context",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+        "net",
+        "layer",
+        "direction",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "length",
+        "width",
+        "via",
+        "special",
+    ]
+    assert wire["wire_key"].startswith("route:NETS:n1:")
+    assert wire["geometry"]["segment_kind"] == "wire_segment"
+    assert wire["geometry"]["bbox"] is not None
+    assert wire["patch_intersections"]
+    assert wire["net_context"]["terminal_count"] >= 2
+    assert wire["route_context"]["route_only_oracle"] is True
+    assert any(row["identity"]["segment_kind"] == "wire_segment" for row in wires)
+
+    pre_route_graphs = (foundation_dir / "vectors" / "routing_graphs" / "place.jsonl").read_text(encoding="utf-8")
+    assert pre_route_graphs == ""
+    route_graphs = [json.loads(line) for line in (foundation_dir / "vectors" / "routing_graphs" / "route.jsonl").read_text().splitlines()]
+    graph = next(row for row in route_graphs if row["net_key"] == "n1")
+    assert list(graph) == [
+        "id",
+        "stage",
+        "graph_key",
+        "net_key",
+        "name",
+        "source",
+        "identity",
+        "graph_semantics",
+        "vertices",
+        "edges",
+        "patch_footprint",
+        "graph_metrics",
+        "terminal_matching",
+        "timing_context",
+        "route_context",
+        "progressive_metadata",
+        "source_refs",
+        "coverage",
+        "null_reason",
+    ]
+    assert graph["identity"]["has_routed_geometry"] is True
+    assert graph["graph_metrics"]["wire_edge_count"] > 0
+    assert graph["graph_metrics"]["via_edge_count"] >= 0
+    assert graph["patch_footprint"]["patch_count"] >= 1
+    assert graph["coverage"]["patch_intersection_count"] >= 1
+
+    patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
+    patch = patches[0]
+    assert list(patch)[:19] == [
+        "id",
+        "stage",
+        "patch_key",
+        "source",
+        "identity",
+        "geometry",
+        "local_density",
+        "local_connectivity",
+        "pre_route_estimators",
+        "neighbor_context",
+        "entity_refs",
+        "timing_context",
+        "electrical_context",
+        "route_oracle",
+        "label_refs",
+        "drc_context",
+        "progressive_metadata",
+        "source_refs",
+        "null_reason",
+    ]
+    assert patch["patch_key"] == "patch:0"
+    assert patch["identity"]["grid_patch_count"] == 4
+    assert patch["local_density"]["available_for_training_input"] is True
+    assert patch["neighbor_context"]["window_patch_ids"]
+    assert patch["entity_refs"]["counts"]["wires"] >= 1
+    assert patch["route_oracle"]["route_only_oracle"] is True
+    assert patch["label_refs"]["route_native_demand_capacity"] == "labels/route_native_demand_capacity.jsonl#patch_id=0"
+
+    layers = json.loads((foundation_dir / "vectors" / "tech" / "layers.json").read_text(encoding="utf-8"))
+    cells = json.loads((foundation_dir / "vectors" / "tech" / "cells.json").read_text(encoding="utf-8"))
+    vias = json.loads((foundation_dir / "vectors" / "tech" / "vias.json").read_text(encoding="utf-8"))
+    tech_summary = json.loads((foundation_dir / "vectors" / "tech" / "tech_summary.json").read_text(encoding="utf-8"))
+    assert layers[0]["identity"]["name"] == layers[0]["name"]
+    assert "routing_properties" in layers[0]
+    assert cells[0]["identity"]["name"] == cells[0]["name"]
+    assert cells[0]["usage_summary"]["instance_count"] >= 1
+    assert vias[0]["identity"]["name"] == vias[0]["name"]
+    assert "layer_stack" in vias[0]
+    assert tech_summary["counts"] == {
+        "layer_count": len(layers),
+        "cell_count": len(cells),
+        "via_count": len(vias),
+        "stage_count": 5,
+    }

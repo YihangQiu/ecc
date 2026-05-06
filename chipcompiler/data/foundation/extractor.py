@@ -92,7 +92,7 @@ class FoundationExtractor:
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         labels = self._write_labels(native_demand_capacity.get("labels", []))
-        self._write_tech(def_data, rt_logs)
+        self._write_tech(def_data, rt_logs, selected_stages)
         entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
         stage_index = self._build_stage_index(selected_stages)
@@ -513,7 +513,7 @@ class FoundationExtractor:
                 }
                 write_json(self.foundation_dir / "maps" / stage / f"{category}.json", payload)
 
-    def _write_tech(self, def_data: dict[str, DefData], rt_logs: dict[str, dict[str, Any]]) -> None:
+    def _write_tech(self, def_data: dict[str, DefData], rt_logs: dict[str, dict[str, Any]], stages: list[StageInfo]) -> None:
         layers_by_name: dict[str, dict[str, Any]] = {}
         cells_by_name: dict[str, dict[str, Any]] = {}
         vias_by_name: dict[str, dict[str, Any]] = {}
@@ -526,35 +526,104 @@ class FoundationExtractor:
                         "track_axes": [],
                         "preferred_direction": None,
                         "source": "def_tracks",
+                        "stage_set": set(),
                     },
                 )
                 item["track_axes"].append({"axis": track.axis, "start": track.start, "count": track.count, "step": track.step, "stage": stage_name})
+                item["stage_set"].add(stage_name)
             for component in parsed.components:
                 cell = cells_by_name.setdefault(
                     component["master"],
-                    {"name": component["master"], "instance_count": 0, "source": "def_components"},
+                    {"name": component["master"], "instance_count": 0, "stage_instance_counts": {}, "source": "def_components"},
                 )
                 cell["instance_count"] += 1
+                cell["stage_instance_counts"][stage_name] = cell["stage_instance_counts"].get(stage_name, 0) + 1
             for via in parsed.vias:
-                vias_by_name.setdefault(via["name"], via)
+                vias_by_name.setdefault(via["name"], {**via, "usage_count": 0, "stage_usage_counts": {}})
             for net in parsed.nets:
                 for wire in net.wires:
                     if wire.via:
-                        vias_by_name.setdefault(wire.via, {"name": wire.via, "layers": [], "source": "def_routed_wires"})
+                        via = vias_by_name.setdefault(wire.via, {"name": wire.via, "layers": [], "source": "def_routed_wires", "usage_count": 0, "stage_usage_counts": {}})
+                        via["usage_count"] = int(via.get("usage_count", 0)) + 1
+                        via["stage_usage_counts"][stage_name] = via["stage_usage_counts"].get(stage_name, 0) + 1
         for parsed in rt_logs.values():
             for layer in parsed.get("layers", []):
                 item = layers_by_name.setdefault(
                     layer["name"],
-                    {"name": layer["name"], "track_axes": [], "source": "rt_log"},
+                    {"name": layer["name"], "track_axes": [], "source": "rt_log", "stage_set": set()},
                 )
                 item["preferred_direction"] = layer.get("preferred_direction")
                 item["order"] = layer.get("order")
-        write_json(self.foundation_dir / "vectors" / "tech" / "layers.json", list(layers_by_name.values()))
-        write_json(self.foundation_dir / "vectors" / "tech" / "cells.json", list(cells_by_name.values()))
-        write_json(self.foundation_dir / "vectors" / "tech" / "vias.json", list(vias_by_name.values()))
-        self._mark("tech", "layers", "available" if layers_by_name else "missing", "" if layers_by_name else "missing_def_or_rt_layers")
-        self._mark("tech", "cells", "available" if cells_by_name else "missing", "" if cells_by_name else "missing_def_components")
-        self._mark("tech", "vias", "available" if vias_by_name else "missing", "" if vias_by_name else "missing_def_vias")
+        layer_records = []
+        for idx, item in enumerate(sorted(layers_by_name.values(), key=lambda value: str(value.get("name")))):
+            stage_set = sorted(item.pop("stage_set", set()))
+            axes = item.get("track_axes", [])
+            track_count_by_axis: dict[str, int] = {}
+            for axis in axes:
+                axis_name = str(axis.get("axis"))
+                track_count_by_axis[axis_name] = max(track_count_by_axis.get(axis_name, 0), int(axis.get("count") or 0))
+            layer_records.append({
+                "id": idx,
+                "name": item["name"],
+                "track_axes": axes,
+                "preferred_direction": item.get("preferred_direction"),
+                "order": item.get("order"),
+                "source": item.get("source"),
+                "identity": {"name": item["name"], "layer_key": item["name"], "order": item.get("order"), "layer_type": "routing", "classification_source": "rt_log_or_def_tracks"},
+                "routing_properties": {"preferred_direction": item.get("preferred_direction"), "track_axes": axes, "track_count_by_axis": track_count_by_axis},
+                "capacity_summary": {"estimated_track_count": sum(track_count_by_axis.values()) if track_count_by_axis else None, "source": "def_tracks" if axes else None},
+                "stage_metadata": {"available_stages": stage_set, "stage_count": len(stage_set)},
+                "source_refs": {"def": "stage_def_tracks" if axes else None, "rt_log": "stage_rt_log" if item.get("source") == "rt_log" else None, "lef": None, "liberty": None},
+                "null_reason": {"source_refs_lef": "lef_not_parsed", "source_refs_liberty": "liberty_reserved_not_parsed"},
+            })
+        cell_records = []
+        for idx, item in enumerate(sorted(cells_by_name.values(), key=lambda value: str(value.get("name")))):
+            name = str(item["name"])
+            stage_counts = item.get("stage_instance_counts", {})
+            cell_records.append({
+                "id": idx,
+                "name": name,
+                "instance_count": item.get("instance_count", 0),
+                "source": item.get("source"),
+                "identity": {"name": name, "cell_key": name, "cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "classification_source": "heuristic_name_rule"},
+                "classification": {"cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "is_clock_related": _is_clock_related(name, name), "is_physical_only": _is_physical_only_cell_name(name, name)},
+                "physical_properties": {"observed_bbox_stats": None, "source": "def_components_only"},
+                "pin_summary": {"pin_count": None, "source": "lef_not_parsed"},
+                "usage_summary": {"instance_count": item.get("instance_count", 0), "stage_instance_counts": stage_counts},
+                "stage_metadata": {"available_stages": sorted(stage_counts), "stage_count": len(stage_counts)},
+                "source_refs": {"def": "stage_def_components", "lef": None, "liberty": None},
+                "null_reason": {"lef": "lef_not_parsed", "liberty": "liberty_reserved_not_parsed"},
+            })
+        via_records = []
+        for idx, item in enumerate(sorted(vias_by_name.values(), key=lambda value: str(value.get("name")))):
+            layers = item.get("layers", [])
+            usage_counts = item.get("stage_usage_counts", {})
+            via_records.append({
+                "id": idx,
+                "name": item["name"],
+                "layers": layers,
+                "source": item.get("source"),
+                "identity": {"name": item["name"], "via_key": item["name"], "classification_source": item.get("source")},
+                "layer_stack": {"layers": layers, "bottom_layer": layers[0] if layers else None, "cut_layer": layers[1] if len(layers) > 2 else None, "top_layer": layers[-1] if layers else None},
+                "geometry": {"available": False, "source": None},
+                "routing_properties": {"is_direction_change": None},
+                "usage_summary": {"usage_count": item.get("usage_count", 0), "stage_usage_counts": usage_counts, "route_only_usage": True},
+                "stage_metadata": {"available_stages": sorted(usage_counts), "stage_count": len(usage_counts)},
+                "source_refs": {"def": "stage_def_vias_or_wires", "lef": None},
+                "null_reason": {"geometry": "via_rect_not_parsed", "lef": "lef_not_parsed"},
+            })
+        write_json(self.foundation_dir / "vectors" / "tech" / "layers.json", layer_records)
+        write_json(self.foundation_dir / "vectors" / "tech" / "cells.json", cell_records)
+        write_json(self.foundation_dir / "vectors" / "tech" / "vias.json", via_records)
+        write_json(self.foundation_dir / "vectors" / "tech" / "tech_summary.json", {
+            "counts": {"layer_count": len(layer_records), "cell_count": len(cell_records), "via_count": len(via_records), "stage_count": len(stages)},
+            "canonical_grid_ref": "foundation_data/ecc/canonical_grid.json",
+            "quality_flags": [],
+            "source_refs": {"lef": None, "liberty": None},
+        })
+        self._mark("tech", "layers", "available" if layer_records else "missing", "" if layer_records else "missing_def_or_rt_layers")
+        self._mark("tech", "cells", "available" if cell_records else "missing", "" if cell_records else "missing_def_components")
+        self._mark("tech", "vias", "available" if via_records else "missing", "" if via_records else "missing_def_vias")
 
     def _write_vectors(
         self,
@@ -582,7 +651,6 @@ class FoundationExtractor:
         for stage in stages:
             parsed_def = def_data.get(stage.name)
             instances = instances_by_stage.get(stage.name, [])
-            nets = self._net_records(stage, parsed_def)
             pins = self._pin_records(
                 stage,
                 parsed_def,
@@ -591,8 +659,9 @@ class FoundationExtractor:
                 canonical_maps.get(stage.name, {}),
                 sta_reports.get(stage.name),
             )
-            wires = self._wire_records(stage, parsed_def)
-            routing_graphs = self._routing_graph_records(stage, parsed_def)
+            nets = self._net_records(stage, parsed_def, pins, canonical_grid, canonical_maps.get(stage.name, {}), sta_reports.get(stage.name))
+            wires = self._wire_records(stage, parsed_def, canonical_grid, canonical_maps.get(stage.name, {}), nets)
+            routing_graphs = self._routing_graph_records(stage, parsed_def, canonical_grid, pins, nets)
             timing_paths = self._timing_path_records(
                 stage,
                 sta_reports.get(stage.name),
@@ -615,8 +684,12 @@ class FoundationExtractor:
                 "timing_paths": timing_paths,
             }
             for entity, records in stage_vectors.items():
-                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths"))
-                self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
+                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths", "nets", "wires", "routing_graphs", "patches"))
+                if entity == "routing_graphs" and stage.name != "route" and not records:
+                    self._quality.setdefault("availability", {}).setdefault(entity, {})[stage.name] = "not_available_before_route"
+                    self._quality.setdefault("null_reason", {}).setdefault(entity, {})[stage.name] = "not_available_before_route"
+                else:
+                    self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
                 stage.name,
                 canonical_grid,
@@ -629,7 +702,7 @@ class FoundationExtractor:
                 timing_paths,
                 drc_reports.get(stage.name),
             )
-            counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches)
+            counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches, sort_keys=False)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
         _attach_pin_progressive_metadata(stages, self.foundation_dir / "vectors" / "pins")
         return counts
@@ -745,29 +818,26 @@ class FoundationExtractor:
             "null_reason": null_reason,
         }
 
-    def _net_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
+    def _net_records(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData | None,
+        pins: list[dict[str, Any]],
+        canonical_grid: dict,
+        stage_maps: dict[str, dict[str, MapMatrix]],
+        sta_report: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
+        pins_by_net: dict[str, list[dict[str, Any]]] = {}
+        for pin in pins:
+            net_name = str(pin.get("identity", {}).get("net") or "")
+            if net_name:
+                pins_by_net.setdefault(net_name, []).append(pin)
         records = []
         for idx, net in enumerate(parsed_def.nets):
-            wires = [wire for wire in net.wires if not wire.special]
-            pins = net.pins
-            xs = [coord for wire in wires for coord in (wire.x1, wire.x2)]
-            ys = [coord for wire in wires for coord in (wire.y1, wire.y2)]
-            records.append(
-                {
-                    "id": idx,
-                    "stage": stage.name,
-                    "name": net.name,
-                    "pin_count": len(pins),
-                    "wire_count": len(wires),
-                    "wire_length": sum(wire.length for wire in wires),
-                    "via_count": sum(1 for wire in wires if wire.via),
-                    "bbox": {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)} if xs and ys else None,
-                    "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                    "null_reason": {"bbox": "no_routed_wires"} if not xs or not ys else {},
-                }
-            )
+            net_pins = pins_by_net.get(net.name, [])
+            records.append(_ordered_net_record(_build_net_record(stage, parsed_def, net, idx, net_pins, canonical_grid, stage_maps, sta_report), idx))
         return records
 
     def _pin_records(
@@ -791,58 +861,51 @@ class FoundationExtractor:
             self.workspace_dir,
         )
 
-    def _wire_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
+    def _wire_records(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData | None,
+        canonical_grid: dict,
+        stage_maps: dict[str, dict[str, MapMatrix]],
+        nets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
-        records = []
+        records: list[dict[str, Any]] = []
+        net_records = {str(record.get("net_key")): record for record in nets}
+        net_segment_index: dict[str, int] = {}
         for net in parsed_def.nets:
             for wire in net.wires:
-                records.append(self._wire_record(stage, parsed_def, wire, len(records)))
+                segment_index = net_segment_index.get(net.name, 0)
+                net_segment_index[net.name] = segment_index + 1
+                records.append(_ordered_wire_record(_build_wire_record(stage, parsed_def, net, wire, len(records), segment_index, canonical_grid, stage_maps, net_records.get(net.name))))
         return records
 
-    def _wire_record(self, stage: StageInfo, parsed_def: DefData, wire: DefWire, idx: int) -> dict[str, Any]:
-        return {
-            "id": idx,
-            "stage": stage.name,
-            "net": wire.net,
-            "layer": wire.layer,
-            "direction": wire.direction,
-            "x1": wire.x1,
-            "y1": wire.y1,
-            "x2": wire.x2,
-            "y2": wire.y2,
-            "length": wire.length,
-            "width": wire.width,
-            "via": wire.via,
-            "special": wire.special,
-            "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-            "null_reason": {"width": "def_route_missing_width"} if wire.width is None else {},
-        }
-
-    def _routing_graph_records(self, stage: StageInfo, parsed_def: DefData | None) -> list[dict[str, Any]]:
+    def _routing_graph_records(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData | None,
+        canonical_grid: dict,
+        pins: list[dict[str, Any]],
+        nets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
+        if stage.name != "route":
+            self._quality.setdefault("availability", {}).setdefault("routing_graphs", {})[stage.name] = "not_available_before_route"
+            self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = "not_available_before_route"
+            return []
+        net_records = {str(record.get("net_key")): record for record in nets}
+        pins_by_net: dict[str, list[dict[str, Any]]] = {}
+        for pin in pins:
+            net_name = str(pin.get("identity", {}).get("net") or "")
+            if net_name:
+                pins_by_net.setdefault(net_name, []).append(pin)
         records = []
-        for idx, net in enumerate(parsed_def.nets):
-            vertices: dict[tuple[float, float, str], int] = {}
-            edges = []
-            for wire in net.wires:
-                a = (wire.x1, wire.y1, wire.layer)
-                b = (wire.x2, wire.y2, wire.layer)
-                for point in (a, b):
-                    vertices.setdefault(point, len(vertices))
-                if a != b:
-                    edges.append({"source_id": vertices[a], "target_id": vertices[b], "path": [{"x": wire.x1, "y": wire.y1, "layer": wire.layer}, {"x": wire.x2, "y": wire.y2, "layer": wire.layer}]})
-            records.append(
-                {
-                    "id": idx,
-                    "stage": stage.name,
-                    "net": net.name,
-                    "vertices": [{"id": vid, "x": x, "y": y, "layer": layer} for (x, y, layer), vid in vertices.items()],
-                    "edges": edges,
-                    "source": str(parsed_def.path.relative_to(self.workspace_dir)),
-                }
-            )
+        for net in parsed_def.nets:
+            if not net.wires:
+                continue
+            records.append(_ordered_routing_graph_record(_build_routing_graph_record(stage, parsed_def, net, len(records), canonical_grid, pins_by_net.get(net.name, []), net_records.get(net.name))))
         return records
 
     def _timing_path_records(
@@ -920,32 +983,71 @@ class FoundationExtractor:
         congestion_maps = stage_maps.get("congestion", {})
         rudy_maps = stage_maps.get("rudy", {})
         margin_maps = stage_maps.get("margin", {})
+        rows = int(canonical_grid.get("rows") or 0)
+        cols = int(canonical_grid.get("cols") or 0)
+        die_bbox = canonical_grid.get("die_bbox")
+        patch_count = len(canonical_grid.get("patches", []))
         for patch in canonical_grid.get("patches", []):
+            patch_id = int(patch["patch_id"])
             row = int(patch["row"])
             col = int(patch["col"])
             bbox = patch["bbox"]
+            center = _bbox_center(bbox)
             patch_instances = [item for item in instances if _point_in_bbox(_instance_center(item).get("x"), _instance_center(item).get("y"), bbox)]
-            patch_wires = [item for item in wires if _segment_intersects_bbox(item.get("x1"), item.get("y1"), item.get("x2"), item.get("y2"), bbox)]
-            net_names = {item.get("net") for item in patch_wires if item.get("net")}
+            patch_pins = [item for item in pins if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id]
+            patch_wires = [item for item in wires if patch_id in item.get("patch_anchor", {}).get("overlap_patch_ids", [])]
+            patch_nets = [item for item in nets if patch_id in item.get("geometry_proxy", {}).get("patch_ids", [])]
             wire_length_by_layer: dict[str, float] = {}
             for wire in patch_wires:
-                layer = str(wire.get("layer"))
-                wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("length") or 0.0)
-            native_demand_capacity = native_demand_capacity_by_patch.get(int(patch["patch_id"]), {})
+                layer = str(wire.get("geometry", {}).get("layer") or wire.get("layer"))
+                wire_length_by_layer[layer] = wire_length_by_layer.get(layer, 0.0) + float(wire.get("geometry", {}).get("length") if isinstance(wire.get("geometry"), dict) else wire.get("length") or 0.0)
+            native_demand_capacity = native_demand_capacity_by_patch.get(patch_id, {})
             patch_drc = _drc_for_patch(drc_report, bbox)
+            route_label = _demand_capacity_label(native_demand_capacity)
+            route_oracle = None
+            if stage == "route":
+                route_oracle = {
+                    "route_only_oracle": True,
+                    "available_for_training_input": False,
+                    "horizontal_overflow": route_label.get("horizontal"),
+                    "vertical_overflow": route_label.get("vertical"),
+                    "union_overflow": route_label.get("union"),
+                    "wire_length_by_layer": wire_length_by_layer,
+                    "via_count": sum(1 for wire in patch_wires if wire.get("identity", {}).get("segment_kind") == "via"),
+                    "source": route_label.get("source") or "routed_def_reconstruction",
+                }
+            neighbor_ids = _neighbor_patch_ids(row, col, rows, cols)
             record = {
-                "patch_id": patch["patch_id"],
+                "id": patch_id,
                 "stage": stage,
+                "patch_key": f"patch:{patch_id}",
+                "source": "canonical_grid.json",
+                "identity": {"patch_id": patch_id, "row": row, "col": col, "grid_rows": rows, "grid_cols": cols, "grid_source": canonical_grid.get("grid_source"), "grid_patch_count": patch_count},
+                "geometry": {"bbox": bbox, "center": center, "width": float(bbox["urx"]) - float(bbox["llx"]), "height": float(bbox["ury"]) - float(bbox["lly"]), "area": _bbox_area(bbox), "die_bbox": die_bbox, "distance_to_die_boundary": _distance_to_die_boundary(bbox, die_bbox), "edge_position": _edge_position(row, col, rows, cols)},
+                "local_density": {"feature_role": "progressive_input", "available_for_training_input": True, "instance_count_center": len(patch_instances), "instance_count_overlap": len(patch_instances), "stdcell_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "stdcell"), "macro_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "macro"), "instance_area": sum(float(item.get("physical_state", {}).get("area") or 0.0) for item in patch_instances), "macro_area": sum(float(item.get("physical_state", {}).get("area") or 0.0) for item in patch_instances if item.get("identity", {}).get("physical_class") == "macro"), "pin_count": len(patch_pins), "wire_length_by_layer": wire_length_by_layer, "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col), "pin_density": _value_from_named_map(density_maps, "pin_density", row, col), "net_density": _value_from_named_map(density_maps, "net_density", row, col), "macro_density": _value_from_named_map(density_maps, "macro_density", row, col), "source": "maps_and_vectors"},
+                "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": True, "net_count": len(patch_nets), "cross_patch_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "clock_net_count": sum(1 for net in patch_nets if net.get("identity", {}).get("is_clock")), "high_fanout_net_count": sum(1 for net in patch_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "source": "vectors/nets"},
+                "pre_route_estimators": {"feature_role": "progressive_input", "available_for_training_input": stage != "route", "rudy_congestion": _value_from_named_map(rudy_maps, "rudy_union", row, col), "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col), "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col), "congestion_horizontal": _matrix_value(congestion_maps.get("horizontal"), row, col), "congestion_vertical": _matrix_value(congestion_maps.get("vertical"), row, col), "congestion_union": _matrix_value(congestion_maps.get("union"), row, col), "source": "canonical_maps"},
+                "neighbor_context": {"adjacent_patch_ids": _adjacent_patch_ids(row, col, rows, cols), "window_patch_ids": neighbor_ids, "window_size": 3, "source": "canonical_grid"},
+                "entity_refs": {"ref_limit": 32, "counts": {"instances": len(patch_instances), "pins": len(patch_pins), "nets": len(patch_nets), "wires": len(patch_wires), "timing_paths": len(timing_paths), "drc": patch_drc.get("count")}, "sample_refs": {"instances": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "pins": [item.get("pin_key") for item in patch_pins[:32]], "nets": [item.get("net_key") for item in patch_nets[:32]], "wires": [item.get("wire_key") for item in patch_wires[:32]]}},
+                "timing_context": {"feature_role": "progressive_input", "available_for_training_input": True, **_timing_for_patch(timing_paths)},
+                "electrical_context": {"feature_role": "progressive_input", "available_for_training_input": True, **_electrical_for_patch(timing_paths)},
+                "route_oracle": route_oracle,
+                "label_refs": {"route_native_demand_capacity": f"labels/route_native_demand_capacity.jsonl#patch_id={patch_id}" if native_demand_capacity else None, "label_source_status": "available" if native_demand_capacity else "missing"},
+                "drc_context": patch_drc,
+                "progressive_metadata": {"grid_stable_across_stages": True, "route_only_oracle": stage == "route", "available_for_training_input": stage != "route"},
+                "source_refs": {"canonical_grid": "foundation_data/ecc/canonical_grid.json", "maps": f"foundation_data/ecc/maps/{stage}", "instances": f"foundation_data/ecc/vectors/instances/{stage}.jsonl", "pins": f"foundation_data/ecc/vectors/pins/{stage}.jsonl", "nets": f"foundation_data/ecc/vectors/nets/{stage}.jsonl", "wires": f"foundation_data/ecc/vectors/wires/{stage}.jsonl", "timing_paths": f"foundation_data/ecc/vectors/timing_paths/{stage}.jsonl", "labels": "foundation_data/ecc/labels/route_native_demand_capacity.jsonl" if native_demand_capacity else None},
+                "null_reason": {"route_oracle": "not_route_stage"} if stage != "route" else {},
+                "patch_id": patch_id,
                 "row": row,
                 "col": col,
                 "instance_count": len(patch_instances),
                 "instance_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances),
                 "macro_area": sum(float(item.get("physical_state", {}).get("area") or item.get("area") or 0.0) for item in patch_instances if item.get("identity", {}).get("is_macro") or item.get("is_macro")),
-                "net_count": len(net_names) if net_names else (len(nets) if not patch_wires and stage == "route" else 0),
-                "pin_count": len(pins) if stage == "route" and row == 0 and col == 0 else 0,
+                "net_count": len(patch_nets) if patch_nets else (len(nets) if not patch_wires and stage == "route" else 0),
+                "pin_count": len(patch_pins) if not (stage == "route" and row == 0 and col == 0) else max(len(patch_pins), len(pins)),
                 "wire_length_by_layer": wire_length_by_layer,
-                "route_native_demand_capacity": _demand_capacity_label(native_demand_capacity),
-                "route_demand_capacity": _demand_capacity_label(native_demand_capacity),
+                "route_native_demand_capacity": route_label,
+                "route_demand_capacity": route_label,
                 "drc": patch_drc,
                 "timing": _timing_for_patch(timing_paths),
                 "electrical": _electrical_for_patch(timing_paths),
@@ -959,7 +1061,6 @@ class FoundationExtractor:
                 "congestion_horizontal": _matrix_value(congestion_maps.get("horizontal"), row, col),
                 "congestion_vertical": _matrix_value(congestion_maps.get("vertical"), row, col),
                 "congestion_union": _matrix_value(congestion_maps.get("union"), row, col),
-                "source": "canonical_grid",
             }
             records.append(record)
         return records
@@ -3124,3 +3225,567 @@ def _delta(current: Any, previous: Any) -> float | None:
     if current is None or previous is None:
         return None
     return float(current) - float(previous)
+
+
+def _net_identity(net: DefNet) -> dict[str, Any]:
+    use = str(net.use or "UNKNOWN").upper()
+    lower = net.name.lower()
+    is_pg = use in {"POWER", "GROUND"} or lower in {"vdd", "vss", "vcc", "gnd"} or any(token in lower for token in ("vdd", "vss", "gnd"))
+    is_clock = use == "CLOCK" or _is_clock_like(lower)
+    is_reset = "reset" in lower or "rst" in lower
+    is_special = bool(net.special or any(wire.special for wire in net.wires))
+    if is_pg:
+        net_class = "power_ground"
+    elif is_clock:
+        net_class = "clock"
+    elif is_reset:
+        net_class = "reset"
+    elif is_special:
+        net_class = "special"
+    else:
+        net_class = "signal"
+    return {
+        "net_key": net.name,
+        "name": net.name,
+        "use": use,
+        "net_class": net_class,
+        "is_special": is_special,
+        "is_clock": is_clock,
+        "is_reset": is_reset,
+        "is_power_ground": is_pg,
+        "is_signal": net_class == "signal",
+        "classification_source": "def_use_and_heuristic_name_rule",
+    }
+
+
+def _terminal_refs_for_net(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for pin in pins[:64]:
+        identity = pin.get("identity", {}) if isinstance(pin.get("identity"), dict) else {}
+        parent = pin.get("parent_instance") if isinstance(pin.get("parent_instance"), dict) else None
+        connectivity = pin.get("connectivity_context", {}) if isinstance(pin.get("connectivity_context"), dict) else {}
+        patch_anchor = pin.get("patch_anchor", {}) if isinstance(pin.get("patch_anchor"), dict) else {}
+        geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
+        refs.append(
+            {
+                "pin_key": pin.get("pin_key"),
+                "pin_kind": identity.get("pin_kind"),
+                "pin_name": identity.get("pin_name"),
+                "parent_instance_key": identity.get("parent_instance_key"),
+                "parent_master": identity.get("parent_master"),
+                "parent_cell_class": parent.get("cell_class") if parent else None,
+                "parent_physical_class": parent.get("physical_class") if parent else None,
+                "pin_role": connectivity.get("pin_role"),
+                "patch_id": patch_anchor.get("primary_patch_id"),
+                "geometry_status": geometry.get("geometry_status"),
+                "center": geometry.get("center"),
+                "bbox": geometry.get("bbox"),
+            }
+        )
+    return refs
+
+
+def _build_net_record(
+    stage: StageInfo,
+    parsed_def: DefData,
+    net: DefNet,
+    idx: int,
+    pins: list[dict[str, Any]],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+    sta_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source_rel = _workspace_relative_from_parsed_def(parsed_def)
+    terminal_refs = _terminal_refs_for_net(pins) or [
+        {
+            "pin_key": _pin_key({**pin, "pin_kind": "io_port" if pin.get("instance") == "PIN" else "instance_terminal"}),
+            "pin_kind": "io_port" if pin.get("instance") == "PIN" else "instance_terminal",
+            "pin_name": pin.get("pin_name"),
+            "parent_instance_key": None if pin.get("instance") == "PIN" else pin.get("instance"),
+            "parent_master": None,
+            "parent_cell_class": None,
+            "parent_physical_class": None,
+            "pin_role": "unknown",
+            "patch_id": None,
+            "geometry_status": "missing",
+            "center": None,
+            "bbox": None,
+        }
+        for pin in net.pins
+    ]
+    centers = [ref["center"] for ref in terminal_refs if isinstance(ref.get("center"), dict)]
+    bboxes = [ref["bbox"] for ref in terminal_refs if isinstance(ref.get("bbox"), dict)]
+    patch_ids = sorted({int(ref["patch_id"]) for ref in terminal_refs if ref.get("patch_id") is not None})
+    role_counts = {role: sum(1 for ref in terminal_refs if ref.get("pin_role") == role) for role in ("driver", "sink", "bidirectional", "unknown")}
+    hpwl = _hpwl_from_points(centers)
+    bbox = _bbox_union(bboxes) if bboxes else _bbox_from_points(centers)
+    route_wires = [wire for wire in net.wires if not wire.special]
+    wire_length = sum(wire.length for wire in route_wires)
+    via_count = sum(1 for wire in net.wires if wire.via)
+    identity = _net_identity(net)
+    primary_patch_id = patch_ids[0] if patch_ids else None
+    row_col = _patch_row_col(canonical_grid, primary_patch_id)
+    null_reason: dict[str, str] = {}
+    if hpwl is None:
+        null_reason["geometry_proxy"] = "missing_terminal_geometry"
+    if stage.name != "route":
+        null_reason["route_analysis"] = "not_route_stage"
+    timing_records = sta_report.get("records", []) if isinstance(sta_report, dict) else []
+    timing_hits = [record for record in timing_records if net.name in json.dumps(record)]
+    return {
+        "stage": stage.name,
+        "net_key": net.name,
+        "name": net.name,
+        "source": source_rel,
+        "identity": identity,
+        "connectivity_summary": {
+            "terminal_count": len(terminal_refs),
+            "pin_count": len(terminal_refs),
+            "connected_instance_count": len({ref.get("parent_instance_key") for ref in terminal_refs if ref.get("parent_instance_key")}),
+            "connected_io_count": sum(1 for ref in terminal_refs if ref.get("pin_kind") == "io_port"),
+            "macro_pin_count": sum(1 for ref in terminal_refs if ref.get("parent_physical_class") == "macro"),
+            "driver_count": role_counts["driver"],
+            "sink_count": role_counts["sink"],
+            "bidirectional_count": role_counts["bidirectional"],
+            "unknown_role_count": role_counts["unknown"],
+            "fanout": role_counts["sink"] if role_counts["driver"] == 1 else max(0, len(terminal_refs) - 1),
+            "clock_sink_count": sum(1 for ref in terminal_refs if ref.get("pin_role") == "sink" and _is_clock_like(str(ref.get("pin_name") or ""))),
+            "sequential_sink_count": sum(1 for ref in terminal_refs if ref.get("pin_role") == "sink" and ref.get("parent_cell_class") == "sequential"),
+            "physical_only_terminal_count": sum(1 for ref in terminal_refs if ref.get("parent_physical_class") == "physical_only"),
+            "max_terminals_per_patch": max([sum(1 for ref in terminal_refs if ref.get("patch_id") == patch_id) for patch_id in patch_ids], default=0),
+            "cross_patch": len(patch_ids) > 1 if patch_ids else None,
+            "cross_patch_count": len(patch_ids),
+            "classification_source": "pin_connectivity_context" if pins else "def_net_connections",
+        },
+        "terminal_refs": terminal_refs,
+        "geometry_proxy": {
+            "bbox": bbox,
+            "hpwl": hpwl,
+            "x_span": None if bbox is None else float(bbox["urx"]) - float(bbox["llx"]),
+            "y_span": None if bbox is None else float(bbox["ury"]) - float(bbox["lly"]),
+            "patch_ids": patch_ids,
+            "patch_span_count": len(patch_ids),
+            "anchor_quality": "exact" if centers else "missing",
+            "exact_terminal_count": sum(1 for ref in terminal_refs if ref.get("geometry_status") == "exact"),
+            "missing_anchor_terminal_count": sum(1 for ref in terminal_refs if not ref.get("center") and not ref.get("bbox")),
+        },
+        "patch_anchor": {
+            "primary_patch_id": primary_patch_id,
+            "overlap_patch_ids": patch_ids,
+            "local_cell_density": _matrix_value(stage_maps.get("density", {}).get("allcell_density"), row_col[0], row_col[1]) if row_col else None,
+            "local_pin_density": _matrix_value(stage_maps.get("density", {}).get("allcell_pin_density"), row_col[0], row_col[1]) if row_col else None,
+            "local_rudy": _matrix_value(stage_maps.get("rudy", {}).get("rudy_union"), row_col[0], row_col[1]) if row_col else None,
+            "local_egr_overflow": _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1]) if row_col else None,
+            "anchor_source": "terminal_geometry" if primary_patch_id is not None else "missing_terminal_geometry",
+        },
+        "timing_context": {
+            "available": bool(timing_records),
+            "timing_path_count": len(timing_hits),
+            "is_on_critical_path": bool(timing_hits),
+            "worst_slack_seen": min([_to_float(record.get("path_timing", {}).get("slack")) for record in timing_hits if isinstance(record, dict) and _to_float(record.get("path_timing", {}).get("slack")) is not None], default=None),
+            "source": sta_report.get("source") if isinstance(sta_report, dict) else None,
+        },
+        "route_analysis": {
+            "route_only_oracle": True,
+            "routed_wire_length": wire_length,
+            "wire_count": len(route_wires),
+            "via_count": via_count,
+            "covered_layers": sorted({wire.layer for wire in net.wires}),
+            "routed_patch_ids": patch_ids,
+            "patch_attribution_refs": [{"patch_id": patch_id, "source": "vectors/wires/route.jsonl"} for patch_id in patch_ids[:16]],
+            "source": "routed_def",
+        } if stage.name == "route" else None,
+        "progressive_metadata": {"available_from": stage.name, "route_only_oracle": stage.name == "route"},
+        "source_refs": {
+            "def": _workspace_relative_from_parsed_def(parsed_def),
+            "pins": f"foundation_data/ecc/vectors/pins/{stage.name}.jsonl",
+            "instances": f"foundation_data/ecc/vectors/instances/{stage.name}.jsonl",
+            "maps": "foundation_data/ecc/maps",
+            "wires": "foundation_data/ecc/vectors/wires/route.jsonl" if stage.name == "route" else None,
+            "routing_graph": "foundation_data/ecc/vectors/routing_graphs/route.jsonl" if stage.name == "route" else None,
+        },
+        "null_reason": null_reason,
+    }
+
+
+def _workspace_relative_from_parsed_def(parsed_def: DefData) -> str:
+    parts = parsed_def.path.parts
+    for marker in ("Floorplan_ecc", "place_dreamplace", "CTS_ecc", "route_ecc", "drc_ecc", "fixFanout_ecc", "legalization_dreamplace"):
+        if marker in parts:
+            index = parts.index(marker)
+            return str(Path(*parts[index:]))
+    return parsed_def.path.name
+
+
+def _ordered_net_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "stage": record["stage"],
+        "net_key": record["net_key"],
+        "name": record["name"],
+        "source": record.get("source"),
+        "identity": record["identity"],
+        "connectivity_summary": record["connectivity_summary"],
+        "terminal_refs": record["terminal_refs"],
+        "geometry_proxy": record["geometry_proxy"],
+        "patch_anchor": record["patch_anchor"],
+        "timing_context": record["timing_context"],
+        "route_analysis": record["route_analysis"],
+        "progressive_metadata": record["progressive_metadata"],
+        "source_refs": record["source_refs"],
+        "null_reason": record["null_reason"],
+    }
+
+
+
+def _wire_class(net: DefNet) -> str:
+    identity = _net_identity(net)
+    return str(identity["net_class"])
+
+
+def _wire_geometry(wire: DefWire) -> dict[str, Any]:
+    segment_kind = "via" if wire.via else "wire_segment"
+    bbox = {"llx": min(wire.x1, wire.x2), "lly": min(wire.y1, wire.y2), "urx": max(wire.x1, wire.x2), "ury": max(wire.y1, wire.y2)}
+    center = {"x": (wire.x1 + wire.x2) / 2.0, "y": (wire.y1 + wire.y2) / 2.0}
+    direction = "point" if segment_kind == "via" else wire.direction
+    length = 0.0 if segment_kind == "via" else wire.length
+    return {
+        "segment_kind": segment_kind,
+        "layer": wire.layer,
+        "start": {"x": wire.x1, "y": wire.y1, "layer": wire.layer},
+        "end": {"x": wire.x2, "y": wire.y2, "layer": wire.layer},
+        "bbox": bbox,
+        "center": center,
+        "direction": direction,
+        "length": length,
+        "manhattan_length": length,
+        "width": wire.width,
+        "area_proxy": None if wire.width is None else length * float(wire.width),
+        "shape_type": "point_via" if segment_kind == "via" else "orthogonal_segment",
+        "geometry_status": "exact",
+    }
+
+
+def _patch_row_col(canonical_grid: dict, patch_id: int | None) -> tuple[int, int] | None:
+    if patch_id is None:
+        return None
+    for patch in canonical_grid.get("patches", []):
+        if int(patch.get("patch_id")) == int(patch_id):
+            return int(patch["row"]), int(patch["col"])
+    return None
+
+
+def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) -> list[dict[str, Any]]:
+    bbox = geometry.get("bbox")
+    if not isinstance(bbox, dict):
+        return []
+    total_length = float(geometry.get("length") or 0.0)
+    intersections: list[dict[str, Any]] = []
+    for patch in canonical_grid.get("patches", []):
+        patch_bbox = patch.get("bbox", {})
+        if not isinstance(patch_bbox, dict) or not _bbox_intersects_bbox(bbox, patch_bbox):
+            continue
+        length = _clipped_segment_length(geometry, patch_bbox)
+        if total_length > 0 and length <= 0:
+            continue
+        intersections.append(
+            {
+                "patch_id": int(patch["patch_id"]),
+                "row": int(patch["row"]),
+                "col": int(patch["col"]),
+                "length": length,
+                "length_fraction": (length / total_length) if total_length > 0 else None,
+                "area_proxy": None if geometry.get("width") is None else length * float(geometry["width"]),
+                "is_primary_patch": False,
+                "intersection_bbox": _bbox_intersection(bbox, patch_bbox),
+            }
+        )
+    if not intersections:
+        primary = _patch_for_point(canonical_grid.get("patches", []), geometry.get("center", {}))
+        if primary:
+            intersections.append({"patch_id": int(primary["patch_id"]), "row": int(primary["row"]), "col": int(primary["col"]), "length": total_length, "length_fraction": 1.0 if total_length > 0 else None, "area_proxy": None, "is_primary_patch": True, "intersection_bbox": bbox})
+    if intersections:
+        primary_patch_id = intersections[0]["patch_id"]
+        for item in intersections:
+            item["is_primary_patch"] = item["patch_id"] == primary_patch_id
+    return intersections
+
+
+def _bbox_intersection(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
+    return {"llx": max(float(a["llx"]), float(b["llx"])), "lly": max(float(a["lly"]), float(b["lly"])), "urx": min(float(a["urx"]), float(b["urx"])), "ury": min(float(a["ury"]), float(b["ury"]))}
+
+
+def _clipped_segment_length(geometry: dict[str, Any], bbox: dict[str, Any]) -> float:
+    start = geometry.get("start", {})
+    end = geometry.get("end", {})
+    x1 = float(start.get("x", 0.0)); y1 = float(start.get("y", 0.0)); x2 = float(end.get("x", 0.0)); y2 = float(end.get("y", 0.0))
+    if x1 == x2 and y1 == y2:
+        return 0.0 if _point_in_bbox(x1, y1, bbox) else 0.0
+    if y1 == y2:
+        if not (float(bbox["lly"]) <= y1 <= float(bbox["ury"])):
+            return 0.0
+        return max(0.0, min(max(x1, x2), float(bbox["urx"])) - max(min(x1, x2), float(bbox["llx"])))
+    if x1 == x2:
+        if not (float(bbox["llx"]) <= x1 <= float(bbox["urx"])):
+            return 0.0
+        return max(0.0, min(max(y1, y2), float(bbox["ury"])) - max(min(y1, y2), float(bbox["lly"])))
+    return 0.0
+
+
+def _build_wire_record(stage: StageInfo, parsed_def: DefData, net: DefNet, wire: DefWire, idx: int, segment_index: int, canonical_grid: dict, stage_maps: dict[str, dict[str, MapMatrix]], net_record: dict[str, Any] | None) -> dict[str, Any]:
+    source_section = "SPECIALNETS" if wire.special or net.special else "NETS"
+    segment_kind = "via" if wire.via else "wire_segment"
+    wire_key = f"{stage.name}:{source_section}:{net.name}:{segment_index}"
+    identity_base = _net_identity(net)
+    geometry = _wire_geometry(wire)
+    intersections = _wire_patch_intersections(geometry, canonical_grid)
+    primary_patch_id = intersections[0]["patch_id"] if intersections else None
+    row_col = _patch_row_col(canonical_grid, primary_patch_id)
+    route_context = None
+    null_reason: dict[str, str] = {}
+    if stage.name == "route":
+        local_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1]) if row_col else None
+        route_context = {"route_only_oracle": True, "local_final_overflow": local_overflow, "layer_demand_capacity_ratio": None, "patch_layer_usage": sum(float(item["length"]) for item in intersections), "nearby_wire_count": None, "nearby_via_count": None, "nearby_drc_count": None, "contributes_to_overflow_patch": bool(local_overflow and local_overflow > 0), "source": "routed_def_reconstruction"}
+    else:
+        null_reason["route_context"] = "not_route_stage"
+    track = _track_for_layer(parsed_def, wire.layer)
+    if track is None:
+        null_reason["track_context"] = "missing_track_context"
+    return {
+        "id": idx,
+        "stage": stage.name,
+        "wire_key": wire_key,
+        "source": _workspace_relative_from_parsed_def(parsed_def),
+        "identity": {
+            "wire_key": wire_key,
+            "net": net.name,
+            "net_key": net.name,
+            "source_section": source_section,
+            "segment_index": segment_index,
+            "wire_class": _wire_class(net),
+            "segment_kind": segment_kind,
+            "is_signal": identity_base["is_signal"],
+            "is_clock": identity_base["is_clock"],
+            "is_power_ground": identity_base["is_power_ground"],
+            "is_special": identity_base["is_special"],
+            "classification_source": "def_net_use_and_name_rule",
+        },
+        "geometry": geometry,
+        "layer_context": {"layer": wire.layer, "preferred_direction": None, "source": "def_tracks" if track else None},
+        "track_context": {"available": track is not None, "axis": track.axis if track else None, "start": track.start if track else None, "step": track.step if track else None, "count": track.count if track else None, "source": "def_tracks" if track else None},
+        "capacity_context": {"available": False, "source": None},
+        "patch_anchor": {"primary_patch_id": primary_patch_id, "overlap_patch_ids": [item["patch_id"] for item in intersections], "anchor_source": "geometry_center" if primary_patch_id is not None else "missing_patch_anchor"},
+        "patch_intersections": intersections,
+        "net_context": _wire_net_context(net, net_record),
+        "endpoint_context": {"available": False, "source": None},
+        "timing_context": {"available": False, "source": None},
+        "route_context": route_context,
+        "via_context": {"via_name": wire.via, "tech_via_key": wire.via, "source": "def_routed_wire_via"} if wire.via else None,
+        "progressive_metadata": {"route_only_oracle": stage.name == "route", "available_from": stage.name},
+        "source_refs": {"def": _workspace_relative_from_parsed_def(parsed_def), "section": source_section, "net": net.name, "segment_index": segment_index, "tech_layer": "foundation_data/ecc/vectors/tech/layers.json", "tech_via": "foundation_data/ecc/vectors/tech/vias.json" if wire.via else None},
+        "null_reason": null_reason,
+        "net": wire.net,
+        "layer": wire.layer,
+        "direction": wire.direction,
+        "x1": wire.x1,
+        "y1": wire.y1,
+        "x2": wire.x2,
+        "y2": wire.y2,
+        "length": wire.length,
+        "width": wire.width,
+        "via": wire.via,
+        "special": wire.special,
+    }
+
+
+def _track_for_layer(parsed_def: DefData, layer: str) -> DefTrack | None:
+    return next((track for track in parsed_def.tracks if track.layer == layer), None)
+
+
+def _wire_net_context(net: DefNet, net_record: dict[str, Any] | None) -> dict[str, Any]:
+    identity = _net_identity(net)
+    summary = net_record.get("connectivity_summary", {}) if isinstance(net_record, dict) else {}
+    wires = [wire for wire in net.wires]
+    xs = [coord for wire in wires for coord in (wire.x1, wire.x2)]
+    ys = [coord for wire in wires for coord in (wire.y1, wire.y2)]
+    patch_ids = net_record.get("geometry_proxy", {}).get("patch_ids", []) if isinstance(net_record, dict) else []
+    return {
+        "net": net.name,
+        "net_key": net.name,
+        "net_use": identity["use"],
+        "is_clock": identity["is_clock"],
+        "is_power_ground": identity["is_power_ground"],
+        "is_special": identity["is_special"],
+        "net_degree": summary.get("terminal_count", len(net.pins)),
+        "net_fanout": summary.get("fanout", max(0, len(net.pins) - 1)),
+        "driver_pin_key": None,
+        "sink_count": summary.get("sink_count"),
+        "net_total_routed_length": sum(wire.length for wire in wires),
+        "net_via_count": sum(1 for wire in wires if wire.via),
+        "net_bbox": {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)} if xs and ys else None,
+        "net_cross_patch": len(patch_ids) > 1 if patch_ids else None,
+        "cross_patch_count": len(patch_ids),
+        "terminal_count": summary.get("terminal_count", len(net.pins)),
+    }
+
+
+def _ordered_wire_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record.get("id"),
+        "stage": record["stage"],
+        "wire_key": record["wire_key"],
+        "source": record["source"],
+        "identity": record["identity"],
+        "geometry": record["geometry"],
+        "layer_context": record["layer_context"],
+        "track_context": record["track_context"],
+        "capacity_context": record["capacity_context"],
+        "patch_anchor": record["patch_anchor"],
+        "patch_intersections": record["patch_intersections"],
+        "net_context": record["net_context"],
+        "endpoint_context": record["endpoint_context"],
+        "timing_context": record["timing_context"],
+        "route_context": record["route_context"],
+        "via_context": record["via_context"],
+        "progressive_metadata": record["progressive_metadata"],
+        "source_refs": record["source_refs"],
+        "null_reason": record["null_reason"],
+        "net": record["net"],
+        "layer": record["layer"],
+        "direction": record["direction"],
+        "x1": record["x1"],
+        "y1": record["y1"],
+        "x2": record["x2"],
+        "y2": record["y2"],
+        "length": record["length"],
+        "width": record["width"],
+        "via": record["via"],
+        "special": record["special"],
+    }
+
+
+def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefNet, idx: int, canonical_grid: dict, pins: list[dict[str, Any]], net_record: dict[str, Any] | None) -> dict[str, Any]:
+    graph_key = f"{stage.name}:{net.name}"
+    vertex_ids: dict[tuple[float, float, str], int] = {}
+    edges: list[dict[str, Any]] = []
+    def vertex_id(point: tuple[float, float, str]) -> int:
+        if point not in vertex_ids:
+            vertex_ids[point] = len(vertex_ids)
+        return vertex_ids[point]
+    for edge_id, wire in enumerate(net.wires):
+        a = (wire.x1, wire.y1, wire.layer)
+        b = (wire.x2, wire.y2, wire.layer)
+        source_id = vertex_id(a)
+        target_id = vertex_id(b)
+        geometry = _wire_geometry(wire)
+        intersections = _wire_patch_intersections(geometry, canonical_grid)
+        edge_kind = "via_transition" if wire.via else "wire_segment"
+        edges.append({"edge_id": edge_id, "source_id": source_id, "target_id": target_id, "edge_kind": edge_kind, "geometry": geometry, "patch_intersections": intersections})
+    incident: dict[int, list[int]] = {vid: [] for vid in vertex_ids.values()}
+    for edge in edges:
+        incident.setdefault(edge["source_id"], []).append(edge["edge_id"])
+        incident.setdefault(edge["target_id"], []).append(edge["edge_id"])
+    vertices = []
+    for (x, y, layer), vid in sorted(vertex_ids.items(), key=lambda item: item[1]):
+        patch = _patch_for_point(canonical_grid.get("patches", []), {"x": x, "y": y})
+        degree = len(incident.get(vid, []))
+        vertices.append({"vertex_id": vid, "vertex_key": f"{graph_key}:v{vid}", "coordinate": {"x": x, "y": y, "layer": layer}, "vertex_kind": "branch" if degree > 2 else "endpoint" if degree <= 1 else "junction", "degree": degree, "incident_edge_ids": incident.get(vid, []), "patch_id": int(patch["patch_id"]) if patch else None, "terminal_ref": None})
+    patch_ids = sorted({item["patch_id"] for edge in edges for item in edge.get("patch_intersections", [])})
+    comps = _connected_components(len(vertices), [(edge["source_id"], edge["target_id"]) for edge in edges])
+    identity = _net_identity(net)
+    source = _workspace_relative_from_parsed_def(parsed_def)
+    return {
+        "id": idx,
+        "stage": stage.name,
+        "graph_key": graph_key,
+        "net_key": net.name,
+        "name": net.name,
+        "source": source,
+        "identity": {"graph_key": graph_key, "net_key": net.name, "name": net.name, "use": identity["use"], "source_section": "SPECIALNETS" if net.special else "NETS", "net_class": identity["net_class"], "is_signal": identity["is_signal"], "is_clock": identity["is_clock"], "is_reset": identity["is_reset"], "is_power_ground": identity["is_power_ground"], "is_special": identity["is_special"], "has_routed_geometry": bool(net.wires), "classification_source": identity["classification_source"]},
+        "graph_semantics": {"topology_direction": "undirected", "root_vertex_id": None, "root_source": "unknown", "driver_terminal_refs": [], "sink_terminal_refs": [], "direction_annotation_source": "pins_connectivity_context" if pins else "missing_pin_context"},
+        "vertices": vertices,
+        "edges": edges,
+        "patch_footprint": {"patch_ids": patch_ids, "patch_count": len(patch_ids), "total_routed_length": sum(wire.length for wire in net.wires), "length_by_patch": {str(pid): sum(float(item["length"]) for edge in edges for item in edge.get("patch_intersections", []) if item["patch_id"] == pid) for pid in patch_ids}},
+        "graph_metrics": {"vertex_count": len(vertices), "edge_count": len(edges), "wire_edge_count": sum(1 for edge in edges if edge["edge_kind"] == "wire_segment"), "via_edge_count": sum(1 for edge in edges if edge["edge_kind"] == "via_transition"), "branch_vertex_count": sum(1 for vertex in vertices if vertex["vertex_kind"] == "branch"), "connected_component_count": comps, "has_cycle": len(edges) >= len(vertices) if vertices else False},
+        "terminal_matching": {"nearest_terminal_distance_threshold": 1000, "unmatched_count": len(pins), "matched_terminal_count": 0, "exact_match_count": 0, "nearest_match_count": 0},
+        "timing_context": {"available": False, "source": None},
+        "route_context": {"route_only_oracle": True, "source": "routed_def"},
+        "progressive_metadata": {"route_only_oracle": True, "pre_route_placeholder_policy": "empty_stage_file"},
+        "source_refs": {"def": source, "net_index": idx, "wires": "foundation_data/ecc/vectors/wires/route.jsonl", "pins": "foundation_data/ecc/vectors/pins/route.jsonl"},
+        "coverage": {"vertex_count": len(vertices), "edge_count": len(edges), "patch_intersection_count": sum(len(edge.get("patch_intersections", [])) for edge in edges), "matched_terminal_count": 0, "unmatched_terminal_count": len(pins)},
+        "null_reason": {},
+    }
+
+
+def _connected_components(vertex_count: int, edges: list[tuple[int, int]]) -> int:
+    if vertex_count == 0:
+        return 0
+    parent = list(range(vertex_count))
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    return len({find(i) for i in range(vertex_count)})
+
+
+def _ordered_routing_graph_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record.get("id", 0),
+        "stage": record["stage"],
+        "graph_key": record["graph_key"],
+        "net_key": record["net_key"],
+        "name": record["name"],
+        "source": record["source"],
+        "identity": record["identity"],
+        "graph_semantics": record["graph_semantics"],
+        "vertices": record["vertices"],
+        "edges": record["edges"],
+        "patch_footprint": record["patch_footprint"],
+        "graph_metrics": record["graph_metrics"],
+        "terminal_matching": record["terminal_matching"],
+        "timing_context": record["timing_context"],
+        "route_context": record["route_context"],
+        "progressive_metadata": record["progressive_metadata"],
+        "source_refs": record["source_refs"],
+        "coverage": record["coverage"],
+        "null_reason": record["null_reason"],
+    }
+
+
+def _neighbor_patch_ids(row: int, col: int, rows: int, cols: int) -> list[int]:
+    ids = []
+    for rr in range(max(0, row - 1), min(rows, row + 2)):
+        for cc in range(max(0, col - 1), min(cols, col + 2)):
+            ids.append(rr * cols + cc)
+    return ids
+
+
+def _adjacent_patch_ids(row: int, col: int, rows: int, cols: int) -> list[int]:
+    out = []
+    for rr, cc in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+        if 0 <= rr < rows and 0 <= cc < cols:
+            out.append(rr * cols + cc)
+    return out
+
+
+def _distance_to_die_boundary(bbox: dict[str, Any], die_bbox: dict[str, Any] | None) -> dict[str, float] | None:
+    if not isinstance(die_bbox, dict):
+        return None
+    return {"left": float(bbox["llx"]) - float(die_bbox["llx"]), "right": float(die_bbox["urx"]) - float(bbox["urx"]), "bottom": float(bbox["lly"]) - float(die_bbox["lly"]), "top": float(die_bbox["ury"]) - float(bbox["ury"])}
+
+
+def _edge_position(row: int, col: int, rows: int, cols: int) -> str:
+    vertical = "top" if row == 0 else "bottom" if row == rows - 1 else ""
+    horizontal = "left" if col == 0 else "right" if col == cols - 1 else ""
+    if vertical and horizontal:
+        return "corner"
+    if vertical:
+        return f"{vertical}_edge"
+    if horizontal:
+        return f"{horizontal}_edge"
+    return "interior"
