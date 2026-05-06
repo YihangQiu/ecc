@@ -599,11 +599,43 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert all("availability" not in item for item in [*nets, *pins, *wires, *timing_paths])
     assert any(pin["identity"]["pin_name"] == "OUT" for pin in pins)
     assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
-    assert timing_paths and timing_paths[0]["slack"] == 1.0
-    assert timing_paths[0]["arc_sequence"][0]["name"] == "U1/A"
-    assert timing_paths[0]["wire_electrical"]["capacitance_sum"] == 0.5
-    assert timing_paths[0]["wire_electrical"]["max_slew"] == 0.6
-    assert timing_paths[0]["wire_electrical"]["resistance_sum"] == 1.5
+    assert timing_paths
+    timing_path = timing_paths[0]
+    assert list(timing_path) == [
+        "id",
+        "stage",
+        "path_key",
+        "source",
+        "identity",
+        "analysis_context",
+        "endpoints",
+        "path_timing",
+        "path_electrical",
+        "path_points",
+        "timing_edges",
+        "wire_path_nodes",
+        "path_spatial",
+        "progressive_metadata",
+        "coverage",
+        "source_refs",
+        "null_reason",
+    ]
+    assert timing_path["path_timing"]["slack"] == 1.0
+    assert timing_path["path_timing"]["rank_in_stage"] == 0
+    assert timing_path["path_timing"]["is_worst_path"] is True
+    assert timing_path["path_timing"]["is_near_critical"] is True
+    assert timing_path["path_timing"]["normalized_criticality"] is None
+    assert timing_path["null_reason"]["path_timing"]["normalized_criticality"] == "constant_slack_range"
+    assert timing_path["path_points"][0]["raw_name"] == "U1/A"
+    assert timing_path["path_points"][0]["pin_key"] == "U1:A"
+    assert timing_path["timing_edges"][0]["edge_kind"] == "cell_arc"
+    assert timing_path["timing_edges"][0]["net_key"] is None
+    assert timing_path["path_electrical"]["capacitance_sum"] == 0.5
+    assert timing_path["path_electrical"]["max_slew"] == 0.6
+    assert timing_path["path_electrical"]["resistance_sum"] == 1.5
+    assert timing_path["wire_path_nodes"][0]["pin_key"] == "U1:A"
+    assert timing_path["coverage"]["has_wire_path"] is True
+    assert timing_path["path_spatial"]["anchor_source_policy"] == "prefer_pin_geometry_fallback_parent_instance"
 
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
     assert patches[0]["net_count"] >= 1

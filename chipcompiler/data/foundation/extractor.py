@@ -593,7 +593,15 @@ class FoundationExtractor:
             )
             wires = self._wire_records(stage, parsed_def)
             routing_graphs = self._routing_graph_records(stage, parsed_def)
-            timing_paths = self._timing_path_records(stage, sta_reports.get(stage.name))
+            timing_paths = self._timing_path_records(
+                stage,
+                sta_reports.get(stage.name),
+                instances,
+                pins,
+                parsed_def,
+                canonical_grid,
+                canonical_maps.get(stage.name, {}),
+            )
             counts["instances"][stage.name] = write_jsonl(
                 self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl",
                 instances,
@@ -607,7 +615,7 @@ class FoundationExtractor:
                 "timing_paths": timing_paths,
             }
             for entity, records in stage_vectors.items():
-                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity != "pins")
+                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths"))
                 self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
                 stage.name,
@@ -837,43 +845,43 @@ class FoundationExtractor:
             )
         return records
 
-    def _timing_path_records(self, stage: StageInfo, sta_report: dict[str, Any] | None) -> list[dict[str, Any]]:
-        if sta_report:
-            records = []
-            for idx, item in enumerate(sta_report.get("records", [])):
-                record = {**item, "id": idx, "stage": stage.name}
-                for key in ("source", "wire_path_source"):
-                    value = record.get(key)
-                    if value:
-                        try:
-                            record[key] = str(Path(str(value)).relative_to(self.workspace_dir))
-                        except ValueError:
-                            record[key] = str(value)
-                records.append(record)
-            return records
+    def _timing_path_records(
+        self,
+        stage: StageInfo,
+        sta_report: dict[str, Any] | None,
+        instances: list[dict[str, Any]],
+        pins: list[dict[str, Any]],
+        parsed_def: DefData | None,
+        canonical_grid: dict,
+        stage_maps: dict[str, dict[str, MapMatrix]],
+    ) -> list[dict[str, Any]]:
+        if not sta_report:
+            return []
         records = []
-        rpt = self._read_json(stage.directory / "data" / "sta" / "gcd.rpt.json")
-        for idx, item in enumerate(rpt.get("summary", []) if isinstance(rpt.get("summary"), list) else []):
-            if not isinstance(item, dict):
-                continue
-            records.append(
-                {
-                    "id": idx,
-                    "stage": stage.name,
-                    "endpoint": item.get("endpoint"),
-                    "clock_group": item.get("clock_group"),
-                    "delay_type": item.get("delay_type"),
-                    "path_delay": _to_float(item.get("path_delay")),
-                    "path_required": _to_float(item.get("path_required")),
-                    "slack": _to_float(item.get("slack")),
-                    "source": str((stage.directory / "data" / "sta" / "gcd.rpt.json").relative_to(self.workspace_dir)),
-                }
-            )
-        for path in sorted((stage.directory / "data" / "sta" / "wire_paths").glob("*.json")):
-            if records:
-                records[0].setdefault("wire_path_sources", []).append(str(path.relative_to(self.workspace_dir)))
-                break
+        instance_by_key = {str(record.get("identity", {}).get("instance_key")): record for record in instances}
+        pin_by_key = {str(record.get("pin_key")): record for record in pins}
+        net_by_pin_pair = _net_lookup_by_pin_pair(parsed_def)
+        for idx, item in enumerate(sta_report.get("records", [])):
+            record = {**item, "id": idx, "stage": stage.name}
+            source = record.get("source")
+            record["source"] = self._workspace_relative_string(source) if source else None
+            refs = record.get("source_refs", {}) if isinstance(record.get("source_refs"), dict) else {}
+            for ref in (refs.get("sta_report"), refs.get("wire_path")):
+                if isinstance(ref, dict) and ref.get("path"):
+                    ref["path"] = self._workspace_relative_string(ref.get("path"))
+            record = _enrich_timing_path_record(record, instance_by_key, pin_by_key, net_by_pin_pair, canonical_grid, stage_maps)
+            path_key = _timing_path_key(stage.name, record)
+            record["path_key"] = path_key
+            record["identity"]["path_key"] = path_key
+            records.append(_ordered_timing_path_record(record, idx))
+        _attach_timing_progressive_metadata(stage.name, records, self.foundation_dir / "vectors" / "timing_paths")
         return records
+
+    def _workspace_relative_string(self, value: Any) -> str:
+        try:
+            return str(Path(str(value)).relative_to(self.workspace_dir))
+        except ValueError:
+            return str(value)
 
     @staticmethod
     def _bbox_from_children(children: Any) -> tuple[float, float, float, float] | None:
@@ -1161,7 +1169,11 @@ class FoundationExtractor:
                 )
             sta_report = sta_reports.get(stage.name)
             if sta_report:
-                slacks = [_to_float(record.get("slack")) for record in sta_report.get("records", []) if isinstance(record, dict)]
+                slacks = [
+                    _to_float(record.get("path_timing", {}).get("slack") if isinstance(record.get("path_timing"), dict) else record.get("slack"))
+                    for record in sta_report.get("records", [])
+                    if isinstance(record, dict)
+                ]
                 slacks = [value for value in slacks if value is not None]
                 if slacks:
                     stage_metrics["worst_slack"] = min(slacks)
@@ -1794,29 +1806,33 @@ def _pin_timing_context(pin_key: str, full_name: str, net: str, sta_report: dict
     slews: list[float] = []
     caps: list[float] = []
     role = "unknown"
-    point_names = {full_name, full_name.replace("/", ":"), full_name.split("/", 1)[-1], pin_key.replace(":", "/")}
+    point_names = {full_name, full_name.replace("/", ":"), full_name.split("/", 1)[-1], pin_key, pin_key.replace(":", "/")}
     for idx, record in enumerate(records):
-        arc_names = {str(item.get("name")) for item in record.get("arc_sequence", []) if isinstance(item, dict)}
-        node_names = {str(item.get("point")) for item in record.get("wire_path_nodes", []) if isinstance(item, dict)}
-        endpoint = str(record.get("endpoint") or "")
-        start = str(record.get("start_point") or "")
-        if not point_names.intersection(arc_names | node_names | {endpoint, start}) and net not in " ".join(arc_names | node_names):
+        points = [item for item in record.get("path_points", []) if isinstance(item, dict)]
+        nodes = [item for item in record.get("wire_path_nodes", []) if isinstance(item, dict)]
+        point_keys = {str(item.get("pin_key")) for item in [*points, *nodes] if item.get("pin_key")}
+        point_raw_names = {str(item.get("raw_name") or item.get("raw_point")) for item in [*points, *nodes] if item.get("raw_name") or item.get("raw_point")}
+        endpoints = record.get("endpoints", {}) if isinstance(record.get("endpoints"), dict) else {}
+        endpoint_key = str(endpoints.get("endpoint", {}).get("pin_key") or "") if isinstance(endpoints.get("endpoint"), dict) else ""
+        start_key = str(endpoints.get("startpoint", {}).get("pin_key") or "") if isinstance(endpoints.get("startpoint"), dict) else ""
+        if pin_key not in point_keys and not point_names.intersection(point_raw_names) and net not in " ".join(point_raw_names):
             continue
         refs.append(idx)
-        slack = _to_float(record.get("slack"))
+        timing = record.get("path_timing", {}) if isinstance(record.get("path_timing"), dict) else {}
+        slack = _to_float(timing.get("slack"))
         if slack is not None:
             slacks.append(slack)
-        if endpoint in point_names:
+        if pin_key == endpoint_key:
             role = "endpoint"
-        elif start in point_names:
+        elif pin_key == start_key:
             role = "startpoint"
         elif role == "unknown":
             role = "internal"
-        electrical = record.get("wire_electrical", {})
+        electrical = record.get("path_electrical", {})
         if isinstance(electrical, dict):
             caps.extend(float(value) for value in electrical.get("capacitance_list", []) if value is not None)
             slews.extend(float(value) for value in electrical.get("slew_list", []) if value is not None)
-        path_delay = _to_float(record.get("path_delay"))
+        path_delay = _to_float(timing.get("path_delay"))
         if path_delay is not None:
             arrivals.append(path_delay)
     source = sta_report.get("source") if isinstance(sta_report, dict) else None
@@ -2668,7 +2684,11 @@ def _drc_for_patch(drc_report: dict[str, Any] | None, bbox: dict[str, Any]) -> d
 
 
 def _timing_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
-    slacks = [float(item["slack"]) for item in timing_paths if item.get("slack") is not None]
+    slacks = [
+        float(item.get("path_timing", {}).get("slack") if isinstance(item.get("path_timing"), dict) else item.get("slack"))
+        for item in timing_paths
+        if (item.get("path_timing", {}).get("slack") if isinstance(item.get("path_timing"), dict) else item.get("slack")) is not None
+    ]
     return {
         "worst_slack": min(slacks) if slacks else None,
         "path_count": len(timing_paths) if timing_paths else 0,
@@ -2683,7 +2703,7 @@ def _electrical_for_patch(timing_paths: list[dict[str, Any]]) -> dict[str, Any]:
     resistances: list[float] = []
     incrs: list[float] = []
     for path in timing_paths:
-        electrical = path.get("wire_electrical", {})
+        electrical = path.get("path_electrical", {})
         if not isinstance(electrical, dict):
             continue
         caps.extend(float(value) for value in electrical.get("capacitance_list", []) if value is not None)
@@ -2862,3 +2882,245 @@ def _segment_intersects_bbox(x1: Any, y1: Any, x2: Any, y2: Any, bbox: dict[str,
         or sy2 < float(bbox["lly"])
         or sy1 > float(bbox["ury"])
     )
+
+
+def _ordered_timing_path_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "stage": record["stage"],
+        "path_key": record["path_key"],
+        "source": record["source"],
+        "identity": record["identity"],
+        "analysis_context": record["analysis_context"],
+        "endpoints": record["endpoints"],
+        "path_timing": record["path_timing"],
+        "path_electrical": record["path_electrical"],
+        "path_points": record["path_points"],
+        "timing_edges": record["timing_edges"],
+        "wire_path_nodes": record["wire_path_nodes"],
+        "path_spatial": record["path_spatial"],
+        "progressive_metadata": record["progressive_metadata"],
+        "coverage": record["coverage"],
+        "source_refs": record["source_refs"],
+        "null_reason": record["null_reason"],
+    }
+
+
+def _timing_path_key(stage: str, record: dict[str, Any]) -> str:
+    delay_type = str(record.get("analysis_context", {}).get("delay_type") or "unknown")
+    rank = int(record.get("path_timing", {}).get("rank_in_stage") or 0)
+    endpoint = record.get("identity", {}).get("endpoint_key") or record.get("endpoints", {}).get("endpoint", {}).get("raw_name") or "unknown_endpoint"
+    return f"{stage}|{delay_type}|rank{rank}|{endpoint}"
+
+
+def _enrich_timing_path_record(
+    record: dict[str, Any],
+    instance_by_key: dict[str, dict[str, Any]],
+    pin_by_key: dict[str, dict[str, Any]],
+    net_by_pin_pair: dict[frozenset[str], dict[str, Any]],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+) -> dict[str, Any]:
+    for endpoint in record.get("endpoints", {}).values():
+        if isinstance(endpoint, dict):
+            _enrich_timing_point(endpoint, instance_by_key, pin_by_key)
+    for point in record.get("path_points", []):
+        if isinstance(point, dict):
+            _enrich_timing_point(point, instance_by_key, pin_by_key)
+    for node in record.get("wire_path_nodes", []):
+        if isinstance(node, dict):
+            _enrich_timing_point(node, instance_by_key, pin_by_key)
+    points_by_id = {point.get("point_id"): point for point in record.get("path_points", []) if isinstance(point, dict)}
+    for edge in record.get("timing_edges", []):
+        if isinstance(edge, dict):
+            _enrich_timing_edge(edge, points_by_id, net_by_pin_pair)
+    record["path_spatial"] = _timing_path_spatial(record.get("path_points", []), canonical_grid, stage_maps)
+    record["coverage"] = _timing_path_coverage(record)
+    return record
+
+
+def _enrich_timing_point(point: dict[str, Any], instance_by_key: dict[str, dict[str, Any]], pin_by_key: dict[str, dict[str, Any]]) -> None:
+    pin_key = point.get("pin_key")
+    pin = pin_by_key.get(str(pin_key)) if pin_key else None
+    if isinstance(pin, dict):
+        point["pin_join_status"] = "joined"
+        identity = pin.get("identity", {})
+        if not point.get("instance_key"):
+            point["instance_key"] = identity.get("parent_instance_key")
+        if not point.get("instance_name"):
+            point["instance_name"] = identity.get("instance")
+        if not point.get("pin_name"):
+            point["pin_name"] = identity.get("pin_name")
+        point["net_key"] = identity.get("net_key")
+        geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
+        point["center"] = geometry.get("center")
+        point["patch_id"] = geometry.get("patch_id")
+        point["spatial_anchor_source"] = pin.get("patch_anchor", {}).get("anchor_source")
+        return
+    instance_key = point.get("instance_key")
+    inst = instance_by_key.get(str(instance_key)) if instance_key else None
+    if isinstance(inst, dict):
+        point["pin_join_status"] = "missing_pin_fallback_instance"
+        physical = inst.get("physical_state", {}) if isinstance(inst.get("physical_state"), dict) else {}
+        point["center"] = physical.get("center")
+        point["patch_id"] = physical.get("patch_id")
+        point["spatial_anchor_source"] = "parent_instance_anchor" if physical.get("center") else "missing"
+        return
+    point["pin_join_status"] = "missing"
+    point["center"] = None
+    point["patch_id"] = None
+    point["spatial_anchor_source"] = "missing"
+
+
+def _enrich_timing_edge(edge: dict[str, Any], points_by_id: dict[Any, dict[str, Any]], net_by_pin_pair: dict[frozenset[str], dict[str, Any]]) -> None:
+    from_pin = edge.get("from_pin_key")
+    to_pin = edge.get("to_pin_key")
+    lookup = net_by_pin_pair.get(frozenset([str(from_pin), str(to_pin)])) if from_pin and to_pin else None
+    if lookup:
+        edge["net_name"] = lookup.get("net_name")
+        edge["net_key"] = lookup.get("net_key")
+        edge["net_degree"] = lookup.get("net_degree")
+        edge["net_hpwl"] = lookup.get("net_hpwl")
+        edge["net_cross_patch"] = lookup.get("net_cross_patch")
+        edge["net_join_status"] = "joined"
+    elif edge.get("edge_kind") == "net_arc":
+        edge["net_join_status"] = "missing"
+    from_point = points_by_id.get(edge.get("from_point_id"), {})
+    to_point = points_by_id.get(edge.get("to_point_id"), {})
+    if edge.get("edge_kind") == "cell_arc" and str(from_point.get("instance_key") or "") == str(to_point.get("instance_key") or ""):
+        pair_lookup = net_by_pin_pair.get(frozenset([str(from_pin), str(to_pin)])) if from_pin and to_pin else None
+        if pair_lookup:
+            edge["net_name"] = pair_lookup.get("net_name")
+            edge["net_key"] = pair_lookup.get("net_key")
+            edge["net_degree"] = pair_lookup.get("net_degree")
+            edge["net_hpwl"] = pair_lookup.get("net_hpwl")
+            edge["net_cross_patch"] = pair_lookup.get("net_cross_patch")
+            edge["net_join_status"] = "joined"
+
+
+def _net_lookup_by_pin_pair(parsed_def: DefData | None) -> dict[frozenset[str], dict[str, Any]]:
+    if parsed_def is None:
+        return {}
+    out: dict[frozenset[str], dict[str, Any]] = {}
+    for net in parsed_def.nets:
+        pin_keys = [_pin_key(pin) for pin in net.pins]
+        summary = {
+            "net_name": net.name,
+            "net_key": net.name,
+            "net_degree": len(pin_keys),
+            "net_hpwl": None,
+            "net_cross_patch": None,
+        }
+        for left in pin_keys:
+            for right in pin_keys:
+                if left != right:
+                    out[frozenset([left, right])] = summary
+    return out
+
+
+def _timing_path_spatial(points: list[dict[str, Any]], canonical_grid: dict, stage_maps: dict[str, dict[str, MapMatrix]]) -> dict[str, Any]:
+    anchored = [point for point in points if isinstance(point.get("center"), dict)]
+    patch_ids = []
+    centers = []
+    counts = {"exact_pin_geometry": 0, "parent_instance_anchor": 0, "missing": 0}
+    for point in points:
+        source = point.get("spatial_anchor_source") or "missing"
+        if source not in counts:
+            source = "missing"
+        counts[source] += 1
+        if isinstance(point.get("center"), dict):
+            centers.append(point["center"])
+        if point.get("patch_id") is not None:
+            patch_ids.append(int(point["patch_id"]))
+    unique_patch_ids = sorted(set(patch_ids))
+    patches = canonical_grid.get("patches", []) if isinstance(canonical_grid, dict) else []
+    patch_by_id = {int(patch["patch_id"]): patch for patch in patches if "patch_id" in patch}
+    return {
+        "anchor_source_policy": "prefer_pin_geometry_fallback_parent_instance",
+        "start_patch_id": patch_ids[0] if patch_ids else None,
+        "end_patch_id": patch_ids[-1] if patch_ids else None,
+        "touched_patch_ids": unique_patch_ids,
+        "patch_count": len(unique_patch_ids),
+        "cross_patch_count": max(0, len(unique_patch_ids) - 1),
+        "path_bbox": _bbox_from_points(centers),
+        "anchor_source_counts": counts,
+        "has_missing_spatial_anchor": counts["missing"] > 0,
+        "stage_map_summary": {
+            "cell_density": _matrix_stats_for_patch_ids(stage_maps.get("density", {}).get("allcell_density"), unique_patch_ids, patch_by_id),
+            "pin_density": _matrix_stats_for_patch_ids(stage_maps.get("density", {}).get("allcell_pin_density"), unique_patch_ids, patch_by_id),
+            "rudy": _matrix_stats_for_patch_ids(stage_maps.get("rudy", {}).get("rudy_union"), unique_patch_ids, patch_by_id),
+            "egr_overflow": _matrix_stats_for_patch_ids(stage_maps.get("congestion", {}).get("union"), unique_patch_ids, patch_by_id),
+        },
+    }
+
+
+def _matrix_stats_for_patch_ids(matrix: MapMatrix | None, patch_ids: list[int], patch_by_id: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    values = []
+    for patch_id in patch_ids:
+        patch = patch_by_id.get(patch_id)
+        if not patch:
+            continue
+        value = _matrix_value(matrix, int(patch["row"]), int(patch["col"]))
+        if value is not None:
+            values.append(float(value))
+    return {"min": min(values) if values else None, "max": max(values) if values else None, "avg": sum(values) / len(values) if values else None, "count": len(values)}
+
+
+def _timing_path_coverage(record: dict[str, Any]) -> dict[str, Any]:
+    points = record.get("path_points", [])
+    edges = record.get("timing_edges", [])
+    wire_nodes = record.get("wire_path_nodes", [])
+    return {
+        "point_count": len(points),
+        "parsed_point_count": sum(1 for point in points if point.get("parse_status") == "parsed"),
+        "pin_join_count": sum(1 for point in points if point.get("pin_join_status") == "joined"),
+        "edge_count": len(edges),
+        "net_join_count": sum(1 for edge in edges if edge.get("net_join_status") == "joined"),
+        "wire_node_count": len(wire_nodes),
+        "matched_wire_node_count": sum(1 for node in wire_nodes if node.get("matched_point_id") is not None),
+        "spatial_anchor_count": sum(1 for point in points if isinstance(point.get("center"), dict)),
+        "missing_spatial_anchor_count": sum(1 for point in points if not isinstance(point.get("center"), dict)),
+        "has_complete_endpoint_join": all(record.get("endpoints", {}).get(key, {}).get("pin_join_status") == "joined" for key in ("startpoint", "endpoint")),
+        "has_wire_path": bool(wire_nodes),
+        "coverage_notes": [],
+    }
+
+
+def _attach_timing_progressive_metadata(stage_name: str, records: list[dict[str, Any]], timing_dir: Path) -> None:
+    stage_order = ["Synthesis", "Floorplan", "fixFanout", "place", "CTS", "legalization", "route", "drc", "filler"]
+    previous_stage = None
+    if stage_name in stage_order:
+        idx = stage_order.index(stage_name)
+        for candidate in reversed(stage_order[:idx]):
+            if (timing_dir / f"{candidate}.jsonl").exists():
+                previous_stage = candidate
+                break
+    prev_by_endpoint: dict[str, dict[str, Any]] = {}
+    if previous_stage:
+        for line in (timing_dir / f"{previous_stage}.jsonl").read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                item = json.loads(line)
+                endpoint = item.get("identity", {}).get("endpoint_key")
+                if endpoint and endpoint not in prev_by_endpoint:
+                    prev_by_endpoint[endpoint] = item
+    for record in records:
+        endpoint = record.get("identity", {}).get("endpoint_key")
+        prev = prev_by_endpoint.get(endpoint) if endpoint else None
+        current_timing = record.get("path_timing", {})
+        prev_timing = prev.get("path_timing", {}) if isinstance(prev, dict) else {}
+        record["progressive_metadata"] = {
+            "available_from": stage_name,
+            "endpoint_seen_in_prev_stage": prev is not None,
+            "exists_in_prev_stage": prev is not None,
+            "slack_delta_from_prev_stage": _delta(current_timing.get("slack"), prev_timing.get("slack")),
+            "delay_delta_from_prev_stage": _delta(current_timing.get("path_delay"), prev_timing.get("path_delay")),
+            "rank_delta_from_prev_stage": _delta(current_timing.get("rank_in_stage"), prev_timing.get("rank_in_stage")),
+            "endpoint_best_slack_delta_from_prev_stage": _delta(current_timing.get("slack"), prev_timing.get("slack")),
+            "tracking_key_source": "endpoint_key",
+        }
+
+
+def _delta(current: Any, previous: Any) -> float | None:
+    if current is None or previous is None:
+        return None
+    return float(current) - float(previous)
