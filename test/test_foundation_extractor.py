@@ -1330,6 +1330,76 @@ def test_iccd_full_v1_patch_records_follow_vec_patches_schema(tmp_path: Path):
     assert route0["source_refs"]["route_label_definition"] == "route_oracle.native_demand_capacity.union_overflow=max(horizontal_overflow,vertical_overflow); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={overflow,near_capacity,relaxed,unknown}"
 
 
+def test_iccd_full_v1_patch_records_compute_progressive_deltas_and_quality_stats(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_sample_gcell_info(ws / "CTS_ecc")
+    _write_sample_egr_demand_capacity(ws / "CTS_ecc")
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_density.csv", [[100, 101], [102, 103]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allcell_pin_density.csv", [[104, 105], [106, 107]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_allnet_density.csv", [[108, 109], [110, 111]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_density.csv", [[100, 101], [102, 103]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_stdcell_pin_density.csv", [[104, 105], [106, 107]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_pin_density.csv", [[0, 0], [0, 0]])
+    _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[110, 111], [112, 113]])
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    place0 = json.loads((foundation_dir / "vectors" / "patches" / "place.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    cts0 = json.loads((foundation_dir / "vectors" / "patches" / "CTS.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    route0 = json.loads((foundation_dir / "vectors" / "patches" / "route.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    drc0 = json.loads((foundation_dir / "vectors" / "patches" / "drc.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+
+    assert place0["progressive_metadata"]["density_delta_from_prev_stage"] == 10.0
+    assert place0["progressive_metadata"]["pin_count_delta_from_prev_stage"] == -1.0
+    assert place0["progressive_metadata"]["rudy_delta_from_prev_stage"] is None
+    assert place0["progressive_metadata"]["egr_overflow_delta_from_prev_stage"] is None
+    assert cts0["progressive_metadata"]["density_delta_from_prev_stage"] == 90.0
+    assert cts0["progressive_metadata"]["pin_count_delta_from_prev_stage"] == -1.0
+    assert cts0["progressive_metadata"]["rudy_delta_from_prev_stage"] == 60.0
+    assert cts0["progressive_metadata"]["egr_overflow_delta_from_prev_stage"] == 0.0
+
+    for block_name in (
+        "local_density",
+        "local_connectivity",
+        "pre_route_estimators",
+        "neighbor_context",
+        "timing_context",
+        "electrical_context",
+        "drc_context",
+    ):
+        assert route0[block_name]["available_for_training_input"] is False
+    assert route0["route_oracle"]["available_for_training_input"] is False
+    assert drc0["progressive_metadata"]["is_progressive_input_stage"] is False
+    assert drc0["progressive_metadata"]["input_blocks"] == []
+    for block_name in (
+        "local_density",
+        "local_connectivity",
+        "pre_route_estimators",
+        "neighbor_context",
+        "timing_context",
+        "electrical_context",
+        "drc_context",
+    ):
+        assert drc0[block_name]["available_for_training_input"] is False
+
+    patch_quality = quality["patches"]
+    assert patch_quality["rows_by_stage"] == {"Floorplan": 4, "place": 4, "CTS": 4, "route": 4, "drc": 4}
+    assert patch_quality["schema_coverage_by_stage"]["route"]["complete_records"] == 4
+    assert patch_quality["pre_route_estimators_availability_by_stage"]["place"] == {"available": 4, "missing": 0, "not_applicable": 0}
+    assert patch_quality["pre_route_estimators_availability_by_stage"]["route"] == {"available": 0, "missing": 0, "not_applicable": 4}
+    assert patch_quality["route_label_availability"] == {"available": 4, "missing": 0, "partial": 0}
+    assert patch_quality["route_oracle_tightness_class_distribution"] == {"overflow": 2, "near_capacity": 0, "relaxed": 2, "unknown": 0}
+    assert patch_quality["refs_truncated_count_by_stage"]["route"] == 0
+    assert patch_quality["timing_context_availability_by_stage"]["route"] == {"available": 1, "missing": 3, "not_applicable": 0}
+    assert patch_quality["electrical_context_availability_by_stage"]["route"] == {"available": 1, "missing": 3, "not_applicable": 0}
+    assert patch_quality["drc_context_availability_by_stage"]["drc"]["available"] == 4
+    null_reason_counts = {item["reason"]: item["count"] for item in patch_quality["null_reason_topk"]}
+    assert null_reason_counts["route_oracle=not_route_stage"] == 16
+
+
 def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     foundation_dir = ws / "foundation_data" / "ecc"
@@ -1829,7 +1899,10 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
     ]
     assert patch["patch_key"] == "patch:0"
     assert patch["identity"]["grid_patch_count"] == 4
-    assert patch["local_density"]["available_for_training_input"] is True
+    assert patch["local_density"]["available_for_training_input"] is False
+    assert patch["local_connectivity"]["available_for_training_input"] is False
+    assert patch["pre_route_estimators"]["available_for_training_input"] is False
+    assert patch["neighbor_context"]["available_for_training_input"] is False
     assert patch["neighbor_context"]["window_3x3_patch_ids"]
     assert patch["entity_refs"]["wire_count"] >= 1
     assert patch["route_oracle"]["route_only_oracle"] is True
