@@ -1402,11 +1402,138 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
     assert n1["connectivity_summary"]["terminal_count"] >= 2
     assert n1["connectivity_summary"]["pin_count"] == n1["connectivity_summary"]["terminal_count"]
     assert n1["terminal_refs"]
+    terminal_ref = n1["terminal_refs"][0]
+    assert {
+        "pin_key",
+        "pin_kind",
+        "instance",
+        "parent_instance_key",
+        "parent_master",
+        "pin_name",
+        "full_name",
+        "pin_role",
+        "is_driver",
+        "is_sink",
+        "is_io",
+        "is_macro_pin",
+        "patch_id",
+        "geometry_status",
+        "anchor_source",
+        "is_on_critical_path",
+    } <= set(terminal_ref)
     assert n1["geometry_proxy"]["hpwl"] is not None
+    assert {
+        "anchor_source",
+        "anchor_quality",
+        "terminal_bbox",
+        "terminal_center",
+        "hpwl",
+        "x_span",
+        "y_span",
+        "area",
+        "aspect_ratio",
+        "patch_ids",
+        "patch_span_count",
+        "cross_patch",
+        "exact_terminal_count",
+        "fallback_terminal_count",
+        "missing_anchor_terminal_count",
+    } <= set(n1["geometry_proxy"])
+    assert n1["geometry_proxy"]["cross_patch"] == (n1["geometry_proxy"]["patch_span_count"] > 1)
+    assert n1["geometry_proxy"]["anchor_quality"] in {
+        "all_exact",
+        "mixed_exact_and_fallback",
+        "all_fallback",
+        "missing",
+    }
+    assert {
+        "primary_patch_id",
+        "patch_ids",
+        "patch_span_count",
+        "anchor_source",
+        "local_cell_density_mean",
+        "local_pin_density_mean",
+        "local_rudy_mean",
+        "local_rudy_max",
+        "local_egr_overflow_mean",
+        "local_egr_overflow_max",
+        "terminal_count_by_patch",
+    } <= set(n1["patch_anchor"])
+    assert {
+        "available",
+        "timing_path_count",
+        "is_on_critical_path",
+        "worst_slack_seen",
+        "min_arrival",
+        "max_arrival",
+        "max_slew",
+        "max_cap",
+        "driver_pin_keys",
+        "endpoint_pin_count",
+        "path_refs",
+        "source",
+    } <= set(n1["timing_context"])
     assert n1["route_analysis"]["route_only_oracle"] is True
+    assert {
+        "route_only_oracle",
+        "routed_wire_count",
+        "routed_wire_length",
+        "routed_bbox",
+        "covered_layers",
+        "via_count",
+        "detour_ratio",
+        "routed_patch_ids",
+        "routed_patch_count",
+        "overlapped_congested_patch_count",
+        "final_overflow_sum",
+        "final_overflow_max",
+        "patch_attribution_refs",
+        "source",
+    } <= set(n1["route_analysis"])
     assert n1["route_analysis"]["routed_wire_length"] > 0
+    assert n1["route_analysis"]["routed_wire_count"] > 0
+    assert n1["route_analysis"]["routed_patch_count"] == len(n1["route_analysis"]["routed_patch_ids"])
+    assert n1["route_analysis"]["detour_ratio"] == n1["route_analysis"]["routed_wire_length"] / n1["geometry_proxy"]["hpwl"]
+    assert n1["route_analysis"]["final_overflow_sum"] == 8.0
+    assert n1["route_analysis"]["final_overflow_max"] == 5.0
+    assert {
+        "patch_id",
+        "wire_length_in_patch",
+        "via_count_in_patch",
+        "final_overflow",
+        "wire_segment_count",
+        "covered_layers",
+        "contribution_score",
+    } <= set(n1["route_analysis"]["patch_attribution_refs"][0])
     assert n1["route_analysis"]["via_count"] >= 0
+    assert {
+        "available_from",
+        "created_stage",
+        "created_stage_source",
+        "exists_in_prev_stage",
+        "exists_in_place",
+        "introduced_by_cts",
+        "prev_net_key",
+        "renamed_from_prev_stage",
+        "terminal_count_changed_from_prev_stage",
+        "hpwl_delta_from_prev_stage",
+        "patch_span_delta_from_prev_stage",
+        "route_only_oracle",
+    } <= set(n1["progressive_metadata"])
+    assert n1["progressive_metadata"]["exists_in_prev_stage"] is True
+    assert n1["progressive_metadata"]["exists_in_place"] is True
     assert n1["source_refs"]["def"] == "route_ecc/output/gcd_route.def"
+    assert n1["source_refs"]["def_section"] == "NETS"
+    assert n1["source_refs"]["def_index"] == 0
+    assert n1["source_refs"]["sta"] == "route_ecc/data/sta/gcd.rpt.json"
+    assert n1["source_refs"]["route"] == "route_ecc/output/gcd_route.def"
+
+    place_nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "place.jsonl").read_text().splitlines()]
+    place_n1 = next(row for row in place_nets if row["net_key"] == "n1")
+    assert place_n1["route_analysis"] is None
+    assert place_n1["null_reason"]["route_analysis"] == "route_only_not_available_for_preroute_stage"
+    assert place_n1["progressive_metadata"]["route_only_oracle"] is False
+    assert "final_overflow" not in json.dumps(place_n1["patch_anchor"])
 
     wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "route.jsonl").read_text().splitlines()]
     wire = next(row for row in wires if row["identity"]["net_key"] == "n1" and row["identity"]["segment_kind"] == "wire_segment")

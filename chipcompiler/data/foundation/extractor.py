@@ -704,6 +704,7 @@ class FoundationExtractor:
             )
             counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches, sort_keys=False)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
+        _attach_net_progressive_metadata(stages, self.foundation_dir / "vectors" / "nets")
         _attach_pin_progressive_metadata(stages, self.foundation_dir / "vectors" / "pins")
         return counts
 
@@ -829,6 +830,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
+        route_label_overflow_by_patch = _route_label_overflow_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}
         pins_by_net: dict[str, list[dict[str, Any]]] = {}
         for pin in pins:
             net_name = str(pin.get("identity", {}).get("net") or "")
@@ -837,7 +839,7 @@ class FoundationExtractor:
         records = []
         for idx, net in enumerate(parsed_def.nets):
             net_pins = pins_by_net.get(net.name, [])
-            records.append(_ordered_net_record(_build_net_record(stage, parsed_def, net, idx, net_pins, canonical_grid, stage_maps, sta_report), idx))
+            records.append(_ordered_net_record(_build_net_record(stage, parsed_def, net, idx, net_pins, canonical_grid, stage_maps, sta_report, route_label_overflow_by_patch), idx))
         return records
 
     def _pin_records(
@@ -2105,6 +2107,50 @@ def _attach_pin_progressive_metadata(stages: list[StageInfo], pins_dir: Path) ->
         write_jsonl(pins_dir / f"{stage.name}.jsonl", [_ordered_pin_record(record, idx) for idx, record in enumerate(current)], sort_keys=False)
 
 
+def _attach_net_progressive_metadata(stages: list[StageInfo], nets_dir: Path) -> None:
+    records_by_stage: dict[str, list[dict[str, Any]]] = {}
+    for stage in stages:
+        path = nets_dir / f"{stage.name}.jsonl"
+        if not path.exists():
+            records_by_stage[stage.name] = []
+            continue
+        records_by_stage[stage.name] = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    first_seen: dict[str, str] = {}
+    for stage in stages:
+        for record in records_by_stage.get(stage.name, []):
+            first_seen.setdefault(str(record.get("net_key")), stage.name)
+    place_keys = {str(record.get("net_key")) for record in records_by_stage.get("place", [])}
+    previous_by_key: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        current = records_by_stage.get(stage.name, [])
+        current_by_key = {str(record.get("net_key")): record for record in current}
+        for key, record in current_by_key.items():
+            previous = previous_by_key.get(key)
+            first = first_seen.get(key, stage.name)
+            current_summary = record.get("connectivity_summary", {}) if isinstance(record.get("connectivity_summary"), dict) else {}
+            prev_summary = previous.get("connectivity_summary", {}) if isinstance(previous, dict) and isinstance(previous.get("connectivity_summary"), dict) else {}
+            current_geom = record.get("geometry_proxy", {}) if isinstance(record.get("geometry_proxy"), dict) else {}
+            prev_geom = previous.get("geometry_proxy", {}) if isinstance(previous, dict) and isinstance(previous.get("geometry_proxy"), dict) else {}
+            introduced_by_cts = first in {"CTS", "legalization", "route", "drc", "filler"} and bool(record.get("identity", {}).get("is_clock") or _is_clock_like(key))
+            record["progressive_metadata"] = {
+                "available_from": first,
+                "created_stage": "Synthesis" if first in {"Floorplan", "fixFanout", "place"} else first,
+                "created_stage_source": "def_net" if first in {"Floorplan", "fixFanout", "place"} else "first_observed",
+                "exists_in_prev_stage": previous is not None,
+                "exists_in_place": key in place_keys,
+                "introduced_by_cts": introduced_by_cts,
+                "prev_net_key": key if previous is not None else None,
+                "renamed_from_prev_stage": False,
+                "terminal_count_changed_from_prev_stage": _delta(current_summary.get("terminal_count"), prev_summary.get("terminal_count")) if previous else None,
+                "hpwl_delta_from_prev_stage": _delta(current_geom.get("hpwl"), prev_geom.get("hpwl")) if previous else None,
+                "patch_span_delta_from_prev_stage": _delta(current_geom.get("patch_span_count"), prev_geom.get("patch_span_count")) if previous else None,
+                "route_only_oracle": isinstance(record.get("route_analysis"), dict) and bool(record["route_analysis"].get("route_only_oracle")),
+            }
+        if current_by_key:
+            previous_by_key = current_by_key
+        write_jsonl(nets_dir / f"{stage.name}.jsonl", [_ordered_net_record(record, idx) for idx, record in enumerate(current)], sort_keys=False)
+
+
 def _ordered_pin_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
     return {
         "id": record_id,
@@ -3260,29 +3306,303 @@ def _net_identity(net: DefNet) -> dict[str, Any]:
 
 def _terminal_refs_for_net(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
-    for pin in pins[:64]:
+    for pin in sorted(pins, key=lambda item: str(item.get("pin_key") or ""))[:256]:
         identity = pin.get("identity", {}) if isinstance(pin.get("identity"), dict) else {}
         parent = pin.get("parent_instance") if isinstance(pin.get("parent_instance"), dict) else None
         connectivity = pin.get("connectivity_context", {}) if isinstance(pin.get("connectivity_context"), dict) else {}
         patch_anchor = pin.get("patch_anchor", {}) if isinstance(pin.get("patch_anchor"), dict) else {}
         geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
+        pin_role = connectivity.get("pin_role") or "unknown"
         refs.append(
             {
                 "pin_key": pin.get("pin_key"),
                 "pin_kind": identity.get("pin_kind"),
+                "instance": identity.get("instance"),
                 "pin_name": identity.get("pin_name"),
+                "full_name": identity.get("full_name"),
                 "parent_instance_key": identity.get("parent_instance_key"),
                 "parent_master": identity.get("parent_master"),
                 "parent_cell_class": parent.get("cell_class") if parent else None,
                 "parent_physical_class": parent.get("physical_class") if parent else None,
-                "pin_role": connectivity.get("pin_role"),
+                "pin_role": pin_role,
+                "is_driver": bool(connectivity.get("is_driver")),
+                "is_sink": bool(connectivity.get("is_sink")),
+                "is_io": bool(identity.get("is_io")),
+                "is_macro_pin": bool(identity.get("is_macro_pin")),
                 "patch_id": patch_anchor.get("primary_patch_id"),
                 "geometry_status": geometry.get("geometry_status"),
+                "anchor_source": geometry.get("anchor_source") or patch_anchor.get("anchor_source"),
+                "is_on_critical_path": bool(pin.get("timing_context", {}).get("is_on_critical_path")),
                 "center": geometry.get("center"),
                 "bbox": geometry.get("bbox"),
             }
         )
     return refs
+
+
+def _anchor_point(ref: dict[str, Any]) -> dict[str, Any] | None:
+    center = ref.get("center")
+    if isinstance(center, dict):
+        return center
+    bbox = ref.get("bbox")
+    if isinstance(bbox, dict):
+        return _bbox_center(bbox)
+    return None
+
+
+def _net_anchor_quality(terminal_refs: list[dict[str, Any]]) -> str:
+    statuses = [str(ref.get("geometry_status") or "missing") for ref in terminal_refs]
+    if not statuses or all(status == "missing" for status in statuses):
+        return "missing"
+    exact = sum(1 for status in statuses if status == "exact")
+    fallback = sum(1 for status in statuses if status.startswith("fallback"))
+    if exact == len(statuses):
+        return "all_exact"
+    if fallback == len(statuses):
+        return "all_fallback"
+    if exact or fallback:
+        return "mixed_exact_and_fallback"
+    return "missing"
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _map_values_for_patches(canonical_grid: dict, stage_maps: dict[str, dict[str, MapMatrix]], patch_ids: list[int], category: str, name: str) -> list[float]:
+    matrix = stage_maps.get(category, {}).get(name)
+    values: list[float] = []
+    for patch_id in patch_ids:
+        row_col = _patch_row_col(canonical_grid, patch_id)
+        if row_col is None:
+            continue
+        value = _matrix_value(matrix, row_col[0], row_col[1])
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _net_patch_anchor(
+    terminal_refs: list[dict[str, Any]],
+    geometry_proxy: dict[str, Any],
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+) -> dict[str, Any]:
+    patch_ids = list(geometry_proxy.get("patch_ids") or [])
+    terminal_count_by_patch = {
+        str(patch_id): sum(1 for ref in terminal_refs if ref.get("patch_id") == patch_id)
+        for patch_id in patch_ids
+    }
+    primary_patch_id = None
+    if patch_ids:
+        terminal_center = geometry_proxy.get("terminal_center")
+        primary_patch_id = sorted(
+            patch_ids,
+            key=lambda patch_id: (
+                -terminal_count_by_patch.get(str(patch_id), 0),
+                _patch_center_distance(canonical_grid, patch_id, terminal_center),
+                patch_id,
+            ),
+        )[0]
+    cell_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "density", "allcell_density")
+    pin_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "density", "allcell_pin_density")
+    rudy_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "rudy", "rudy_union")
+    egr_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "congestion", "union")
+    return {
+        "primary_patch_id": primary_patch_id,
+        "patch_ids": patch_ids,
+        "patch_span_count": len(patch_ids),
+        "anchor_source": "terminal_patch_ids" if patch_ids else "missing_terminal_geometry",
+        "local_cell_density_mean": _mean(cell_values),
+        "local_pin_density_mean": _mean(pin_values),
+        "local_rudy_mean": _mean(rudy_values),
+        "local_rudy_max": max(rudy_values) if rudy_values else None,
+        "local_egr_overflow_mean": _mean(egr_values),
+        "local_egr_overflow_max": max(egr_values) if egr_values else None,
+        "terminal_count_by_patch": terminal_count_by_patch,
+    }
+
+
+def _patch_center_distance(canonical_grid: dict, patch_id: int, point: Any) -> float:
+    if not isinstance(point, dict):
+        return 0.0
+    patch = next((item for item in canonical_grid.get("patches", []) if int(item.get("patch_id")) == int(patch_id)), None)
+    if not patch or not isinstance(patch.get("bbox"), dict):
+        return 0.0
+    center = _bbox_center(patch["bbox"])
+    return abs(float(center["x"]) - float(point["x"])) + abs(float(center["y"]) - float(point["y"]))
+
+
+def _net_timing_context(
+    net_name: str,
+    terminal_refs: list[dict[str, Any]],
+    sta_report: dict[str, Any] | None,
+    workspace_dir: Path,
+) -> dict[str, Any]:
+    records = sta_report.get("records", []) if isinstance(sta_report, dict) else []
+    terminal_keys = {str(ref.get("pin_key")) for ref in terminal_refs if ref.get("pin_key")}
+    terminal_names = {str(ref.get("full_name")) for ref in terminal_refs if ref.get("full_name")}
+    terminal_names.update(str(ref.get("pin_name")) for ref in terminal_refs if ref.get("pin_name"))
+    path_refs = []
+    slacks: list[float] = []
+    arrivals: list[float] = []
+    slews: list[float] = []
+    caps: list[float] = []
+    driver_pin_keys: set[str] = set()
+    endpoint_pin_keys: set[str] = set()
+    for idx, record in enumerate(records):
+        points = [
+            item
+            for item in [
+                *record.get("path_points", []),
+                *record.get("wire_path_nodes", []),
+            ]
+            if isinstance(item, dict)
+        ]
+        point_keys = {str(item.get("pin_key")) for item in points if item.get("pin_key")}
+        point_nets = {str(item.get("net_key")) for item in points if item.get("net_key")}
+        point_names = {str(item.get("raw_name") or item.get("raw_point") or item.get("pin_name")) for item in points if item.get("raw_name") or item.get("raw_point") or item.get("pin_name")}
+        edge_nets = {
+            str(edge.get("net_key") or edge.get("net_name"))
+            for edge in record.get("timing_edges", [])
+            if isinstance(edge, dict) and (edge.get("net_key") or edge.get("net_name"))
+        }
+        if net_name not in point_nets and net_name not in edge_nets and not terminal_keys.intersection(point_keys) and not terminal_names.intersection(point_names):
+            continue
+        timing = record.get("path_timing", {}) if isinstance(record.get("path_timing"), dict) else {}
+        slack = _to_float(timing.get("slack"))
+        if slack is not None:
+            slacks.append(slack)
+        path_delay = _to_float(timing.get("path_delay"))
+        if path_delay is not None:
+            arrivals.append(path_delay)
+        electrical = record.get("path_electrical", {}) if isinstance(record.get("path_electrical"), dict) else {}
+        caps.extend(float(value) for value in electrical.get("capacitance_list", []) if value is not None)
+        slews.extend(float(value) for value in electrical.get("slew_list", []) if value is not None)
+        endpoints = record.get("endpoints", {}) if isinstance(record.get("endpoints"), dict) else {}
+        start_key = endpoints.get("startpoint", {}).get("pin_key") if isinstance(endpoints.get("startpoint"), dict) else None
+        endpoint_key = endpoints.get("endpoint", {}).get("pin_key") if isinstance(endpoints.get("endpoint"), dict) else None
+        if start_key and str(start_key) in terminal_keys:
+            driver_pin_keys.add(str(start_key))
+        if endpoint_key and str(endpoint_key) in terminal_keys:
+            endpoint_pin_keys.add(str(endpoint_key))
+        path_id = record.get("id", idx)
+        path_refs.append({"path_id": path_id, "role": "internal", "slack": slack})
+    source = sta_report.get("source") if isinstance(sta_report, dict) else None
+    if source:
+        try:
+            source = str(Path(str(source)).relative_to(workspace_dir))
+        except ValueError:
+            source = str(source)
+    return {
+        "available": bool(sta_report and sta_report.get("available")),
+        "timing_path_count": len(path_refs),
+        "is_on_critical_path": bool(path_refs),
+        "worst_slack_seen": min(slacks) if slacks else None,
+        "min_arrival": min(arrivals) if arrivals else None,
+        "max_arrival": max(arrivals) if arrivals else None,
+        "max_slew": max(slews) if slews else None,
+        "max_cap": max(caps) if caps else None,
+        "driver_pin_keys": sorted(driver_pin_keys),
+        "endpoint_pin_count": len(endpoint_pin_keys),
+        "path_refs": sorted(path_refs, key=lambda item: (item["slack"] is None, item["slack"] if item["slack"] is not None else 0.0))[:8],
+        "source": source,
+    }
+
+
+def _route_analysis_for_net(
+    stage: StageInfo,
+    parsed_def: DefData,
+    net: DefNet,
+    route_wires: list[DefWire],
+    terminal_hpwl: float | None,
+    canonical_grid: dict,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+    route_label_overflow_by_patch: dict[int, float],
+) -> dict[str, Any] | None:
+    if stage.name != "route":
+        return None
+    wire_geometries = [_wire_geometry(wire) for wire in route_wires]
+    wire_bboxes = [geometry["bbox"] for geometry in wire_geometries if isinstance(geometry.get("bbox"), dict)]
+    routed_bbox = _bbox_union(wire_bboxes) if wire_bboxes else None
+    patch_stats: dict[int, dict[str, Any]] = {}
+    for wire, geometry in zip(route_wires, wire_geometries):
+        intersections = _wire_patch_intersections(geometry, canonical_grid)
+        for item in intersections:
+            patch_id = int(item["patch_id"])
+            stat = patch_stats.setdefault(
+                patch_id,
+                {
+                    "patch_id": patch_id,
+                    "wire_length_in_patch": 0.0,
+                    "via_count_in_patch": 0,
+                    "final_overflow": None,
+                    "wire_segment_count": 0,
+                    "covered_layers": set(),
+                },
+            )
+            stat["wire_length_in_patch"] += float(item.get("length") or 0.0)
+            stat["wire_segment_count"] += 1
+            stat["covered_layers"].add(wire.layer)
+            if wire.via:
+                stat["via_count_in_patch"] += 1
+    for patch_id, stat in patch_stats.items():
+        row_col = _patch_row_col(canonical_grid, patch_id)
+        final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1]) if row_col else None
+        if final_overflow is None:
+            final_overflow = route_label_overflow_by_patch.get(patch_id)
+        stat["final_overflow"] = final_overflow
+        stat["contribution_score"] = stat["wire_length_in_patch"] * max(final_overflow or 0.0, 0.0)
+    attribution_refs = [
+        {
+            "patch_id": stat["patch_id"],
+            "wire_length_in_patch": stat["wire_length_in_patch"],
+            "via_count_in_patch": stat["via_count_in_patch"],
+            "final_overflow": stat["final_overflow"],
+            "wire_segment_count": stat["wire_segment_count"],
+            "covered_layers": sorted(stat["covered_layers"]),
+            "contribution_score": stat["contribution_score"],
+        }
+        for stat in sorted(patch_stats.values(), key=lambda item: (-float(item["contribution_score"]), int(item["patch_id"])))
+    ]
+    final_overflows = [float(item["final_overflow"]) for item in attribution_refs if item["final_overflow"] is not None]
+    routed_wire_length = sum(wire.length for wire in route_wires)
+    return {
+        "route_only_oracle": True,
+        "routed_wire_count": len([wire for wire in route_wires if not wire.via]),
+        "routed_wire_length": routed_wire_length,
+        "routed_bbox": routed_bbox,
+        "covered_layers": sorted({wire.layer for wire in route_wires}),
+        "via_count": sum(1 for wire in route_wires if wire.via),
+        "detour_ratio": routed_wire_length / terminal_hpwl if terminal_hpwl and terminal_hpwl > 0 else None,
+        "routed_patch_ids": sorted(patch_stats),
+        "routed_patch_count": len(patch_stats),
+        "overlapped_congested_patch_count": sum(1 for value in final_overflows if value > 0),
+        "final_overflow_sum": sum(final_overflows) if final_overflows else None,
+        "final_overflow_max": max(final_overflows) if final_overflows else None,
+        "patch_attribution_refs": attribution_refs[:64],
+        "patch_attribution_ref_count_total": len(attribution_refs),
+        "patch_attribution_refs_truncated": len(attribution_refs) > 64,
+        "source": _workspace_relative_from_parsed_def(parsed_def),
+    }
+
+
+def _route_label_union_overflow(stage_dir: Path, canonical_grid: dict, patch_id: int) -> float | None:
+    labels = parse_route_native_demand_capacity_artifacts(stage_dir, canonical_grid).get("labels", [])
+    for label in labels:
+        if int(label.get("patch_id", -1)) == int(patch_id):
+            value = label.get("union_overflow")
+            return float(value) if value is not None else None
+    return None
+
+
+def _route_label_overflow_by_patch(stage_dir: Path, canonical_grid: dict) -> dict[int, float]:
+    labels = parse_route_native_demand_capacity_artifacts(stage_dir, canonical_grid).get("labels", [])
+    return {
+        int(label["patch_id"]): float(label["union_overflow"])
+        for label in labels
+        if label.get("patch_id") is not None and label.get("union_overflow") is not None
+    }
 
 
 def _build_net_record(
@@ -3294,44 +3614,73 @@ def _build_net_record(
     canonical_grid: dict,
     stage_maps: dict[str, dict[str, MapMatrix]],
     sta_report: dict[str, Any] | None,
+    route_label_overflow_by_patch: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     source_rel = _workspace_relative_from_parsed_def(parsed_def)
     terminal_refs = _terminal_refs_for_net(pins) or [
         {
             "pin_key": _pin_key({**pin, "pin_kind": "io_port" if pin.get("instance") == "PIN" else "instance_terminal"}),
             "pin_kind": "io_port" if pin.get("instance") == "PIN" else "instance_terminal",
+            "instance": pin.get("instance"),
             "pin_name": pin.get("pin_name"),
+            "full_name": f"PIN/{pin.get('pin_name')}" if pin.get("instance") == "PIN" else f"{pin.get('instance')}/{pin.get('pin_name')}",
             "parent_instance_key": None if pin.get("instance") == "PIN" else pin.get("instance"),
             "parent_master": None,
             "parent_cell_class": None,
             "parent_physical_class": None,
             "pin_role": "unknown",
+            "is_driver": False,
+            "is_sink": False,
+            "is_io": pin.get("instance") == "PIN",
+            "is_macro_pin": False,
             "patch_id": None,
             "geometry_status": "missing",
+            "anchor_source": "none",
+            "is_on_critical_path": False,
             "center": None,
             "bbox": None,
         }
         for pin in net.pins
     ]
-    centers = [ref["center"] for ref in terminal_refs if isinstance(ref.get("center"), dict)]
+    centers = [point for point in (_anchor_point(ref) for ref in terminal_refs) if isinstance(point, dict)]
     bboxes = [ref["bbox"] for ref in terminal_refs if isinstance(ref.get("bbox"), dict)]
     patch_ids = sorted({int(ref["patch_id"]) for ref in terminal_refs if ref.get("patch_id") is not None})
     role_counts = {role: sum(1 for ref in terminal_refs if ref.get("pin_role") == role) for role in ("driver", "sink", "bidirectional", "unknown")}
     hpwl = _hpwl_from_points(centers)
-    bbox = _bbox_union(bboxes) if bboxes else _bbox_from_points(centers)
+    bbox = _bbox_union([*bboxes, *([_bbox_from_points(centers)] if centers else [])]) if bboxes else _bbox_from_points(centers)
     route_wires = [wire for wire in net.wires if not wire.special]
-    wire_length = sum(wire.length for wire in route_wires)
-    via_count = sum(1 for wire in net.wires if wire.via)
     identity = _net_identity(net)
-    primary_patch_id = patch_ids[0] if patch_ids else None
-    row_col = _patch_row_col(canonical_grid, primary_patch_id)
     null_reason: dict[str, str] = {}
     if hpwl is None:
-        null_reason["geometry_proxy"] = "missing_terminal_geometry"
+        null_reason["geometry_proxy"] = "missing_terminal_anchors"
     if stage.name != "route":
-        null_reason["route_analysis"] = "not_route_stage"
-    timing_records = sta_report.get("records", []) if isinstance(sta_report, dict) else []
-    timing_hits = [record for record in timing_records if net.name in json.dumps(record)]
+        null_reason["route_analysis"] = "route_only_not_available_for_preroute_stage"
+    elif not route_wires:
+        null_reason["route_analysis"] = "no_routed_wires"
+    timing_context = _net_timing_context(net.name, terminal_refs, sta_report, parsed_def.path.parents[2])
+    if not timing_context["available"]:
+        null_reason["timing_context"] = "missing_sta_artifact"
+    elif timing_context["timing_path_count"] == 0:
+        null_reason["timing_context"] = "net_not_in_timing_paths"
+    geometry_proxy = {
+        "anchor_source": "terminal_anchor" if centers or bboxes else "none",
+        "anchor_quality": _net_anchor_quality(terminal_refs),
+        "terminal_bbox": bbox,
+        "terminal_center": _bbox_center(bbox) if isinstance(bbox, dict) else None,
+        "hpwl": hpwl,
+        "x_span": None if bbox is None else float(bbox["urx"]) - float(bbox["llx"]),
+        "y_span": None if bbox is None else float(bbox["ury"]) - float(bbox["lly"]),
+        "area": None if bbox is None else _bbox_area(bbox),
+        "aspect_ratio": None if bbox is None or float(bbox["ury"]) == float(bbox["lly"]) else (float(bbox["urx"]) - float(bbox["llx"])) / (float(bbox["ury"]) - float(bbox["lly"])),
+        "patch_ids": patch_ids,
+        "patch_span_count": len(patch_ids),
+        "cross_patch": len(patch_ids) > 1,
+        "exact_terminal_count": sum(1 for ref in terminal_refs if ref.get("geometry_status") == "exact"),
+        "fallback_terminal_count": sum(1 for ref in terminal_refs if str(ref.get("geometry_status") or "").startswith("fallback")),
+        "missing_anchor_terminal_count": sum(1 for ref in terminal_refs if not ref.get("center") and not ref.get("bbox")),
+    }
+    patch_anchor = _net_patch_anchor(terminal_refs, geometry_proxy, canonical_grid, stage_maps)
+    route_analysis = _route_analysis_for_net(stage, parsed_def, net, route_wires, hpwl, canonical_grid, stage_maps, route_label_overflow_by_patch or {})
     return {
         "stage": stage.name,
         "net_key": net.name,
@@ -3353,56 +3702,30 @@ def _build_net_record(
             "sequential_sink_count": sum(1 for ref in terminal_refs if ref.get("pin_role") == "sink" and ref.get("parent_cell_class") == "sequential"),
             "physical_only_terminal_count": sum(1 for ref in terminal_refs if ref.get("parent_physical_class") == "physical_only"),
             "max_terminals_per_patch": max([sum(1 for ref in terminal_refs if ref.get("patch_id") == patch_id) for patch_id in patch_ids], default=0),
-            "cross_patch": len(patch_ids) > 1 if patch_ids else None,
+            "cross_patch": len(patch_ids) > 1,
             "cross_patch_count": len(patch_ids),
             "classification_source": "pin_connectivity_context" if pins else "def_net_connections",
+            "terminal_refs_truncated": len(pins) > 256,
+            "terminal_ref_count_total": len(pins) if pins else len(net.pins),
+            "max_terminal_refs": 256,
         },
         "terminal_refs": terminal_refs,
-        "geometry_proxy": {
-            "bbox": bbox,
-            "hpwl": hpwl,
-            "x_span": None if bbox is None else float(bbox["urx"]) - float(bbox["llx"]),
-            "y_span": None if bbox is None else float(bbox["ury"]) - float(bbox["lly"]),
-            "patch_ids": patch_ids,
-            "patch_span_count": len(patch_ids),
-            "anchor_quality": "exact" if centers else "missing",
-            "exact_terminal_count": sum(1 for ref in terminal_refs if ref.get("geometry_status") == "exact"),
-            "missing_anchor_terminal_count": sum(1 for ref in terminal_refs if not ref.get("center") and not ref.get("bbox")),
-        },
-        "patch_anchor": {
-            "primary_patch_id": primary_patch_id,
-            "overlap_patch_ids": patch_ids,
-            "local_cell_density": _matrix_value(stage_maps.get("density", {}).get("allcell_density"), row_col[0], row_col[1]) if row_col else None,
-            "local_pin_density": _matrix_value(stage_maps.get("density", {}).get("allcell_pin_density"), row_col[0], row_col[1]) if row_col else None,
-            "local_rudy": _matrix_value(stage_maps.get("rudy", {}).get("rudy_union"), row_col[0], row_col[1]) if row_col else None,
-            "local_egr_overflow": _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1]) if row_col else None,
-            "anchor_source": "terminal_geometry" if primary_patch_id is not None else "missing_terminal_geometry",
-        },
-        "timing_context": {
-            "available": bool(timing_records),
-            "timing_path_count": len(timing_hits),
-            "is_on_critical_path": bool(timing_hits),
-            "worst_slack_seen": min([_to_float(record.get("path_timing", {}).get("slack")) for record in timing_hits if isinstance(record, dict) and _to_float(record.get("path_timing", {}).get("slack")) is not None], default=None),
-            "source": sta_report.get("source") if isinstance(sta_report, dict) else None,
-        },
-        "route_analysis": {
-            "route_only_oracle": True,
-            "routed_wire_length": wire_length,
-            "wire_count": len(route_wires),
-            "via_count": via_count,
-            "covered_layers": sorted({wire.layer for wire in net.wires}),
-            "routed_patch_ids": patch_ids,
-            "patch_attribution_refs": [{"patch_id": patch_id, "source": "vectors/wires/route.jsonl"} for patch_id in patch_ids[:16]],
-            "source": "routed_def",
-        } if stage.name == "route" else None,
-        "progressive_metadata": {"available_from": stage.name, "route_only_oracle": stage.name == "route"},
+        "geometry_proxy": geometry_proxy,
+        "patch_anchor": patch_anchor,
+        "timing_context": timing_context,
+        "route_analysis": route_analysis,
+        "progressive_metadata": {},
         "source_refs": {
             "def": _workspace_relative_from_parsed_def(parsed_def),
+            "def_section": "SPECIALNETS" if net.special else "NETS",
+            "def_index": idx,
             "pins": f"foundation_data/ecc/vectors/pins/{stage.name}.jsonl",
             "instances": f"foundation_data/ecc/vectors/instances/{stage.name}.jsonl",
-            "maps": "foundation_data/ecc/maps",
+            "maps": f"foundation_data/ecc/maps/{stage.name}",
+            "sta": timing_context.get("source"),
             "wires": "foundation_data/ecc/vectors/wires/route.jsonl" if stage.name == "route" else None,
             "routing_graph": "foundation_data/ecc/vectors/routing_graphs/route.jsonl" if stage.name == "route" else None,
+            "route": _workspace_relative_from_parsed_def(parsed_def) if stage.name == "route" else None,
         },
         "null_reason": null_reason,
     }
