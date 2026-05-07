@@ -17,11 +17,8 @@ def parse_sta_artifacts(stage_dir: Path) -> dict[str, Any]:
     details = rpt.get("detail", []) if isinstance(rpt.get("detail"), list) else []
     slack_rows = rpt.get("slack", []) if isinstance(rpt.get("slack"), list) else []
     wire_paths = sorted((stage_dir / "data" / "sta" / "wire_paths").glob("*.json"))
-    stage_wns, stage_tns = _stage_slack_summary(slack_rows)
-    slack_values = [_to_float(item.get("slack")) for item in summaries if isinstance(item, dict)]
-    slack_values = [value for value in slack_values if value is not None]
-    min_slack = min(slack_values) if slack_values else None
-    max_slack = max(slack_values) if slack_values else None
+    slack_summaries = _stage_slack_summaries(slack_rows)
+    slack_ranges = _slack_ranges_by_analysis_context(summaries, details)
     records: list[dict[str, Any]] = []
     for idx, item in enumerate(summaries):
         if not isinstance(item, dict):
@@ -36,6 +33,9 @@ def parse_sta_artifacts(stage_dir: Path) -> dict[str, Any]:
         wire_nodes = _match_wire_nodes(wire["nodes"], path_points)
         timing_edges = _timing_edges(path_points)
         slack = _to_float(item.get("slack") if item.get("slack") is not None else detail.get("slack"))
+        analysis_key = _analysis_context_key(item, detail)
+        min_slack, max_slack = slack_ranges.get(analysis_key, (None, None))
+        stage_wns, stage_tns = slack_summaries.get(analysis_key, (None, None))
         normalized, normalized_reason = _normalized_criticality(slack, min_slack, max_slack)
         is_worst = slack is not None and min_slack is not None and slack == min_slack
         is_near = is_worst if normalized is None else normalized >= CRITICALITY_THRESHOLD
@@ -379,17 +379,42 @@ def _normalized_criticality(slack: float | None, min_slack: float | None, max_sl
     return (max_slack - slack) / (max_slack - min_slack), None
 
 
-def _stage_slack_summary(rows: list[Any]) -> tuple[float | None, float | None]:
-    wns = None
-    tns = None
+def _stage_slack_summaries(rows: list[Any]) -> dict[tuple[str, str | None], tuple[float | None, float | None]]:
+    summaries: dict[tuple[str, str | None], tuple[float | None, float | None]] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
-        if wns is None:
-            wns = _to_float(row.get("WNS"))
-        if tns is None:
-            tns = _to_float(row.get("TNS"))
-    return wns, tns
+        key = _normalize_analysis_key(row.get("delay_type"), row.get("clock"))
+        if key not in summaries:
+            summaries[key] = (_to_float(row.get("WNS")), _to_float(row.get("TNS")))
+    return summaries
+
+
+def _slack_ranges_by_analysis_context(summaries: list[Any], details: list[Any]) -> dict[tuple[str, str | None], tuple[float | None, float | None]]:
+    values_by_key: dict[tuple[str, str | None], list[float]] = {}
+    for idx, item in enumerate(summaries):
+        if not isinstance(item, dict):
+            continue
+        detail = details[idx] if idx < len(details) and isinstance(details[idx], dict) else {}
+        slack = _to_float(item.get("slack") if item.get("slack") is not None else detail.get("slack"))
+        if slack is None:
+            continue
+        values_by_key.setdefault(_analysis_context_key(item, detail), []).append(slack)
+    return {
+        key: (min(values), max(values))
+        for key, values in values_by_key.items()
+        if values
+    }
+
+
+def _analysis_context_key(summary: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str | None]:
+    return _normalize_analysis_key(summary.get("delay_type") or detail.get("type"), summary.get("clock_group") or detail.get("clock_field"))
+
+
+def _normalize_analysis_key(delay_type: Any, clock_group: Any) -> tuple[str, str | None]:
+    normalized_delay = str(delay_type or "unknown").lower()
+    normalized_clock = str(clock_group) if clock_group is not None else None
+    return normalized_delay, normalized_clock
 
 
 def _slack_index(rows: list[Any], clock_group: Any, delay_type: Any) -> int | None:

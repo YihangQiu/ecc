@@ -3944,6 +3944,7 @@ def _enrich_timing_path_record(
             _enrich_timing_edge(edge, points_by_id, net_by_pin_pair)
     record["path_spatial"] = _timing_path_spatial(record.get("path_points", []), canonical_grid, stage_maps)
     record["coverage"] = _timing_path_coverage(record)
+    _update_timing_path_null_reasons(record, stage_maps)
     return record
 
 
@@ -3963,7 +3964,8 @@ def _enrich_timing_point(point: dict[str, Any], instance_by_key: dict[str, dict[
         geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
         point["center"] = geometry.get("center")
         point["patch_id"] = geometry.get("patch_id")
-        point["spatial_anchor_source"] = pin.get("patch_anchor", {}).get("anchor_source")
+        anchor_source = pin.get("patch_anchor", {}).get("anchor_source")
+        point["spatial_anchor_source"] = anchor_source if anchor_source in {"exact_pin_geometry", "parent_instance_anchor"} else "missing"
         return
     instance_key = point.get("instance_key")
     inst = instance_by_key.get(str(instance_key)) if instance_key else None
@@ -4092,6 +4094,23 @@ def _timing_path_coverage(record: dict[str, Any]) -> dict[str, Any]:
         "has_wire_path": bool(wire_nodes),
         "coverage_notes": [],
     }
+
+
+def _update_timing_path_null_reasons(record: dict[str, Any], stage_maps: dict[str, dict[str, MapMatrix]]) -> None:
+    null_reason = record.setdefault("null_reason", {})
+    path_spatial_reason = null_reason.setdefault("path_spatial", {})
+    spatial = record.get("path_spatial", {}) if isinstance(record.get("path_spatial"), dict) else {}
+    if spatial.get("has_missing_spatial_anchor"):
+        path_spatial_reason["spatial_anchor"] = "missing_spatial_anchor"
+    summaries = spatial.get("stage_map_summary", {}) if isinstance(spatial.get("stage_map_summary"), dict) else {}
+    if summaries and all(isinstance(summary, dict) and int(summary.get("count") or 0) == 0 for summary in summaries.values()):
+        has_stage_maps = any(stage_maps.get(category) for category in ("density", "rudy", "congestion"))
+        if not has_stage_maps:
+            path_spatial_reason["stage_map_summary"] = "missing_stage_maps"
+        elif spatial.get("patch_count", 0) == 0 and spatial.get("has_missing_spatial_anchor"):
+            path_spatial_reason["stage_map_summary"] = "missing_spatial_anchor"
+        elif spatial.get("patch_count", 0) > 0:
+            path_spatial_reason["stage_map_summary"] = "missing_stage_maps"
 
 
 def _attach_timing_progressive_metadata(stage_name: str, records: list[dict[str, Any]], timing_dir: Path) -> None:

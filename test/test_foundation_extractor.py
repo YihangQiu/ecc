@@ -727,6 +727,124 @@ def test_iccd_full_v1_orders_instance_record_fields_like_documented_schema(tmp_p
         "null_reason",
     ]
 
+
+def test_iccd_full_v1_timing_criticality_is_scoped_by_analysis_context(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_json(
+        ws / "route_ecc" / "data" / "sta" / "gcd.rpt.json",
+        {
+            "summary": [
+                {"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "max", "path_delay": "1.0", "path_required": "2.0", "slack": "1.0"},
+                {"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "max", "path_delay": "0.5", "path_required": "2.5", "slack": "2.0"},
+                {"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "min", "path_delay": "0.4", "path_required": "0.3", "slack": "-0.1"},
+                {"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "min", "path_delay": "0.2", "path_required": "0.3", "slack": "0.1"},
+            ],
+            "detail": [
+                {"start_point": "U1/A", "end_point": "U1/Y", "type": "max", "detail": [{"name": "U1/A", "incr_delay": "0.0", "path_delay": "0.0 r"}, {"name": "U1/Y", "incr_delay": "1.0", "path_delay": "1.0 r"}]},
+                {"start_point": "U1/A", "end_point": "U1/Y", "type": "max", "detail": [{"name": "U1/A", "incr_delay": "0.0", "path_delay": "0.0 r"}, {"name": "U1/Y", "incr_delay": "0.5", "path_delay": "0.5 r"}]},
+                {"start_point": "U1/A", "end_point": "U1/Y", "type": "min", "detail": [{"name": "U1/A", "incr_delay": "0.0", "path_delay": "0.0 r"}, {"name": "U1/Y", "incr_delay": "0.4", "path_delay": "0.4 r"}]},
+                {"start_point": "U1/A", "end_point": "U1/Y", "type": "min", "detail": [{"name": "U1/A", "incr_delay": "0.0", "path_delay": "0.0 r"}, {"name": "U1/Y", "incr_delay": "0.2", "path_delay": "0.2 r"}]},
+            ],
+            "slack": [
+                {"clock": "clk", "delay_type": "max", "TNS": "0.0", "WNS": "1.0"},
+                {"clock": "clk", "delay_type": "min", "TNS": "-0.1", "WNS": "-0.1"},
+            ],
+        },
+    )
+    for idx in range(1, 5):
+        _write_json(
+            ws / "route_ecc" / "data" / "sta" / "wire_paths" / f"wire_path_{idx}.json",
+            [
+                {"node_0": {"Point": "U1/A", "Capacitance": 0.1, "slew": 0.2, "trans_type": "rise"}},
+                {"net_arc_0": {"Incr": 0.3, "Resistance": 1.5}},
+                {"node_1": {"Point": "U1/Y", "Capacitance": 0.4, "slew": 0.6, "trans_type": "fall"}},
+            ],
+        )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+
+    records = [
+        json.loads(line)
+        for line in (ws / "foundation_data" / "ecc" / "vectors" / "timing_paths" / "route.jsonl").read_text().splitlines()
+    ]
+    assert [record["path_timing"]["is_worst_path"] for record in records] == [True, False, True, False]
+    assert [record["path_timing"]["normalized_criticality"] for record in records] == [1.0, 0.0, 1.0, 0.0]
+    assert [record["path_timing"]["is_near_critical"] for record in records] == [True, False, True, False]
+
+
+def test_iccd_full_v1_timing_paths_use_semantic_nulls_for_missing_spatial_maps(tmp_path: Path):
+    ws = _make_workspace(tmp_path, include_route_maps=False)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+
+    record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "timing_paths" / "route.jsonl").read_text().splitlines()[0])
+    assert record["path_spatial"]["patch_count"] > 0
+    assert all(summary["count"] == 0 for summary in record["path_spatial"]["stage_map_summary"].values())
+    assert record["null_reason"]["path_spatial"]["stage_map_summary"] == "missing_stage_maps"
+
+
+def test_iccd_full_v1_timing_paths_mark_missing_spatial_anchors_semantically(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 1 ;
+- U1 NAND2 ;
+END COMPONENTS
+NETS 1 ;
+- n1 ( U1 A ) ( U1 Y ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_json(
+        ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.json",
+        {
+            "design name": "gcd",
+            "diearea": {"path": [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]]},
+            "layerInfo": [{"id": 0, "layername": "cell"}],
+            "data": [
+                {
+                    "type": "group",
+                    "struct name": "Instance_U1",
+                    "children": [
+                        {"type": "box", "layer": 0, "path": [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]}
+                    ],
+                }
+            ],
+        },
+    )
+    _write_json(
+        ws / "Floorplan_ecc" / "data" / "sta" / "gcd.rpt.json",
+        {
+            "summary": [{"endpoint": "U1/Y", "clock_group": "clk", "delay_type": "max", "path_delay": "1.0", "path_required": "2.0", "slack": "1.0"}],
+            "detail": [{"start_point": "U1/A", "end_point": "U1/Y", "type": "max", "detail": [{"name": "U1/A", "incr_delay": "0.0", "path_delay": "0.0 r"}, {"name": "U1/Y", "incr_delay": "1.0", "path_delay": "1.0 r"}]}],
+            "slack": [{"clock": "clk", "delay_type": "max", "TNS": "0.0", "WNS": "1.0"}],
+        },
+    )
+    _write_json(
+        ws / "Floorplan_ecc" / "data" / "sta" / "wire_paths" / "wire_path_1.json",
+        [
+            {"node_0": {"Point": "U1/A", "Capacitance": 0.1, "slew": 0.2, "trans_type": "rise"}},
+            {"node_1": {"Point": "U1/Y", "Capacitance": 0.4, "slew": 0.6, "trans_type": "fall"}},
+        ],
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["Floorplan"])
+
+    record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "timing_paths" / "Floorplan.jsonl").read_text().splitlines()[0])
+    assert {point["spatial_anchor_source"] for point in record["path_points"]} == {"missing"}
+    assert record["path_spatial"]["has_missing_spatial_anchor"] is True
+    assert record["null_reason"]["path_spatial"]["spatial_anchor"] == "missing_spatial_anchor"
+
+
 def test_iccd_full_v1_enriches_instances_from_def_components(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     _write_text(
