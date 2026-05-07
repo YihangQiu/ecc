@@ -1898,6 +1898,51 @@ END DESIGN
     assert route_pin["route_context"]["net_routed_length"] == 40.0
 
 
+
+def test_iccd_full_v1_wire_primary_patch_is_in_intersections_on_grid_boundary(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "route_ecc" / "output" / "gcd_route.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+TRACKS X 50 DO 1 STEP 100 LAYER MET3 ;
+GCELLGRID X 0 DO 3 STEP 100 ;
+GCELLGRID Y 0 DO 3 STEP 100 ;
+COMPONENTS 1 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n_boundary + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
+END PINS
+NETS 1 ;
+- n_boundary ( U1 A ) ( PIN OUT )
+  + ROUTED MET3 ( 120 0 ) ( * 200 )
+  ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    wire = next(
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "wires" / "route.jsonl").read_text().splitlines()
+        if line.strip()
+    )
+    primary_patch_id = wire["patch_anchor"]["primary_patch_id"]
+    primary_intersections = [item for item in wire["patch_intersections"] if item["is_primary_patch"]]
+    assert any(item["patch_id"] == primary_patch_id for item in wire["patch_intersections"])
+    assert len(primary_intersections) == 1
+    assert primary_intersections[0]["patch_id"] == primary_patch_id
+
 def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
@@ -2098,6 +2143,9 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
         and patch["bbox"]["lly"] <= wire["geometry"]["center"]["y"] < patch["bbox"]["ury"]
     )
     assert wire["patch_anchor"]["primary_patch_id"] == primary_patch["patch_id"]
+    assert any(item["patch_id"] == primary_patch["patch_id"] for item in wire["patch_intersections"])
+    assert sum(1 for item in wire["patch_intersections"] if item["is_primary_patch"]) == 1
+    assert next(item for item in wire["patch_intersections"] if item["is_primary_patch"])["patch_id"] == primary_patch["patch_id"]
     assert wire["patch_anchor"]["anchor_source"] == "segment_midpoint"
     assert {"local_cell_density", "local_pin_density", "local_rudy", "local_egr_overflow"} <= set(wire["patch_anchor"])
     assert {

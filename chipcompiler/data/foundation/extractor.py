@@ -3045,7 +3045,21 @@ def _attach_patch_anchor(record: dict[str, Any], canonical_grid: dict, stage_map
 
 
 def _patch_for_point(patches: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any] | None:
+    half_open_match = next(
+        (patch for patch in patches if _point_in_patch_bbox_half_open(point.get("x"), point.get("y"), patch.get("bbox", {}))),
+        None,
+    )
+    if half_open_match is not None:
+        return half_open_match
     return next((patch for patch in patches if _point_in_bbox(point.get("x"), point.get("y"), patch.get("bbox", {}))), None)
+
+
+def _point_in_patch_bbox_half_open(x: Any, y: Any, bbox: dict[str, Any]) -> bool:
+    if x is None or y is None or not isinstance(bbox, dict):
+        return False
+    xf = float(x)
+    yf = float(y)
+    return float(bbox["llx"]) <= xf < float(bbox["urx"]) and float(bbox["lly"]) <= yf < float(bbox["ury"])
 
 
 def _overlap_patch_ids(patches: list[dict[str, Any]], bbox: dict[str, Any]) -> list[int]:
