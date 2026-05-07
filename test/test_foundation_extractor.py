@@ -598,7 +598,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert nets[0]["name"] == "n1"
     assert all("availability" not in item for item in [*nets, *pins, *wires, *timing_paths])
     assert any(pin["identity"]["pin_name"] == "OUT" for pin in pins)
-    assert any(wire["layer"] == "MET2" and wire["direction"] == "horizontal" for wire in wires)
+    assert any(wire["geometry"]["layer"] == "MET2" and wire["geometry"]["direction"] == "horizontal" for wire in wires)
     assert timing_paths
     timing_path = timing_paths[0]
     assert list(timing_path) == [
@@ -2082,25 +2082,89 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
         "progressive_metadata",
         "source_refs",
         "null_reason",
-        "net",
-        "layer",
-        "direction",
-        "x1",
-        "y1",
-        "x2",
-        "y2",
-        "length",
-        "width",
-        "via",
-        "special",
     ]
     assert wire["wire_key"].startswith("route:NETS:n1:")
+    assert wire["identity"]["wire_class"] == "signal"
     assert wire["geometry"]["segment_kind"] == "wire_segment"
     assert wire["geometry"]["bbox"] is not None
+    assert wire["geometry"]["length"] == 200.0
+    assert wire["geometry"]["width"] is None
     assert wire["patch_intersections"]
+    assert sum(item["length"] for item in wire["patch_intersections"]) == wire["geometry"]["length"]
+    primary_patch = next(
+        patch
+        for patch in json.loads((foundation_dir / "canonical_grid.json").read_text())["patches"]
+        if patch["bbox"]["llx"] <= wire["geometry"]["center"]["x"] < patch["bbox"]["urx"]
+        and patch["bbox"]["lly"] <= wire["geometry"]["center"]["y"] < patch["bbox"]["ury"]
+    )
+    assert wire["patch_anchor"]["primary_patch_id"] == primary_patch["patch_id"]
+    assert wire["patch_anchor"]["anchor_source"] == "segment_midpoint"
+    assert {"local_cell_density", "local_pin_density", "local_rudy", "local_egr_overflow"} <= set(wire["patch_anchor"])
+    assert {
+        "layer",
+        "layer_index",
+        "routing_direction_preference",
+        "pitch",
+        "width_default",
+        "is_preferred_direction",
+        "source",
+    } <= set(wire["layer_context"])
+    assert wire["layer_context"]["routing_direction_preference"] == "horizontal"
+    assert {"available", "track_axis", "is_on_track", "nearest_track_distance", "track_count", "track_step", "null_reason"} <= set(wire["track_context"])
+    assert wire["track_context"]["available"] is True
+    assert wire["track_context"]["is_on_track"] is True
+    assert {
+        "available",
+        "patch_layer_demand",
+        "patch_layer_capacity",
+        "patch_layer_utilization",
+        "layer_demand_capacity_ratio",
+        "source",
+    } <= set(wire["capacity_context"])
+    assert wire["capacity_context"]["available"] is True
     assert wire["net_context"]["terminal_count"] >= 2
+    assert wire["net_context"]["net_total_routed_length"] == 800.0
+    assert wire["net_context"]["net_via_count"] == 1
     assert wire["route_context"]["route_only_oracle"] is True
+    assert wire["route_context"]["local_final_overflow"] == 3.0
+    assert wire["route_context"]["nearby_wire_count"] >= 1
+    assert wire["route_context"]["nearby_via_count"] >= 0
+    assert wire["route_context"]["source"] == "routed_def_reconstruction"
+    assert wire["source_refs"]["def_section"] == "NETS"
+    assert wire["source_refs"]["route"] == "routed_def_reconstruction"
+    assert wire["null_reason"]["geometry_width"] == "def_route_missing_width"
+    assert {
+        "available_from_stage",
+        "is_new_routed_geometry",
+        "exists_same_geometry_in_prev_stage",
+        "net_exists_in_prev_stage",
+        "route_only_oracle",
+        "tracking_scope",
+    } <= set(wire["progressive_metadata"])
+    assert wire["progressive_metadata"]["route_only_oracle"] is True
+    assert wire["progressive_metadata"]["tracking_scope"] == "stage_local_wire_geometry"
+
+    via_wire = next(row for row in wires if row["identity"]["segment_kind"] == "via")
+    assert via_wire["via_context"]["via_name"] == "VIA23"
+    assert via_wire["via_context"]["cut_layer"] == "VIA2"
+    assert via_wire["via_context"]["lower_layer"] == "MET2"
+    assert via_wire["via_context"]["upper_layer"] == "MET3"
+    assert via_wire["via_context"]["layer_transition"] == "MET2->MET3"
+    assert via_wire["via_context"]["via_source"] in {"def_routed_wires", "vectors_tech_vias", "heuristic_via_name_rule"}
+
+    place_wires = [json.loads(line) for line in (foundation_dir / "vectors" / "wires" / "Floorplan.jsonl").read_text().splitlines()]
+    assert place_wires[0]["route_context"] is None
+    assert place_wires[0]["null_reason"]["route_context"] == "not_route_stage"
+    assert place_wires[0]["progressive_metadata"]["route_only_oracle"] is False
+    assert "route_context" not in json.dumps(place_wires[0]["patch_anchor"])
+    assert all(row["identity"]["wire_class"] in {"signal", "clock", "power_ground", "special"} for row in wires + place_wires)
     assert any(row["identity"]["segment_kind"] == "wire_segment" for row in wires)
+
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    assert quality["wires"]["route"]["record_count"] == len(wires)
+    assert quality["wires"]["route"]["route_context_coverage"] == 1.0
+    assert quality["wires"]["route"]["patch_intersection_coverage"] == 1.0
+    assert quality["wires"]["route"]["route_context_source"] == {"routed_def_reconstruction": len(wires)}
 
     pre_route_graphs = (foundation_dir / "vectors" / "routing_graphs" / "place.jsonl").read_text(encoding="utf-8")
     assert pre_route_graphs == ""
