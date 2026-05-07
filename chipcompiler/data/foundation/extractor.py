@@ -711,8 +711,9 @@ class FoundationExtractor:
             for entity, records in stage_vectors.items():
                 counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths", "nets", "wires", "routing_graphs", "patches"))
                 if entity == "routing_graphs" and stage.name != "route" and not records:
-                    self._quality.setdefault("availability", {}).setdefault(entity, {})[stage.name] = "not_available_before_route"
-                    self._quality.setdefault("null_reason", {}).setdefault(entity, {})[stage.name] = "not_available_before_route"
+                    status = "optional_post_route_snapshot" if stage.name in {"drc", "filler"} else "not_available_before_route"
+                    self._quality.setdefault("availability", {}).setdefault(entity, {})[stage.name] = status
+                    self._quality.setdefault("null_reason", {}).setdefault(entity, {})[stage.name] = status
                 else:
                     self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
@@ -935,10 +936,23 @@ class FoundationExtractor:
             if net_name:
                 pins_by_net.setdefault(net_name, []).append(pin)
         records = []
-        for net in parsed_def.nets:
+        for def_net_index, net in enumerate(parsed_def.nets):
             if not net.wires:
                 continue
-            records.append(_ordered_routing_graph_record(_build_routing_graph_record(stage, parsed_def, net, len(records), canonical_grid, pins_by_net.get(net.name, []), net_records.get(net.name))))
+            records.append(
+                _ordered_routing_graph_record(
+                    _build_routing_graph_record(
+                        stage,
+                        parsed_def,
+                        net,
+                        len(records),
+                        def_net_index,
+                        canonical_grid,
+                        pins_by_net.get(net.name, []),
+                        net_records.get(net.name),
+                    )
+                )
+            )
         return records
 
     def _timing_path_records(
@@ -4374,7 +4388,7 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
     intersections: list[dict[str, Any]] = []
     for patch in canonical_grid.get("patches", []):
         patch_bbox = patch.get("bbox", {})
-        if not isinstance(patch_bbox, dict) or not _bbox_intersects_bbox(bbox, patch_bbox):
+        if not isinstance(patch_bbox, dict) or not _wire_bbox_intersects_patch(bbox, patch_bbox):
             continue
         length = _clipped_segment_length(geometry, patch_bbox)
         if total_length > 0 and length <= 0:
@@ -4400,6 +4414,29 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
         for item in intersections:
             item["is_primary_patch"] = item["patch_id"] == primary_patch_id
     return intersections
+
+
+def _wire_bbox_intersects_patch(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    allx = float(a["llx"])
+    aurx = float(a["urx"])
+    blx = float(b["llx"])
+    burx = float(b["urx"])
+    ally = float(a["lly"])
+    aury = float(a["ury"])
+    bly = float(b["lly"])
+    bury = float(b["ury"])
+    a_zero_width = allx == aurx
+    a_zero_height = ally == aury
+    x_overlap = _range_overlaps_half_open(allx, aurx, blx, burx)
+    y_overlap = _range_overlaps_half_open(ally, aury, bly, bury)
+    return x_overlap and y_overlap
+
+
+def _range_overlaps_half_open(start: float, end: float, lower: float, upper: float) -> bool:
+    if start == end:
+        point = start
+        return lower <= point < upper
+    return max(min(start, end), lower) < min(max(start, end), upper)
 
 
 def _bbox_intersection(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float]:
@@ -4555,7 +4592,16 @@ def _ordered_wire_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefNet, idx: int, canonical_grid: dict, pins: list[dict[str, Any]], net_record: dict[str, Any] | None) -> dict[str, Any]:
+def _build_routing_graph_record(
+    stage: StageInfo,
+    parsed_def: DefData,
+    net: DefNet,
+    idx: int,
+    def_net_index: int,
+    canonical_grid: dict,
+    pins: list[dict[str, Any]],
+    net_record: dict[str, Any] | None,
+) -> dict[str, Any]:
     graph_key = f"{stage.name}:{net.name}"
     source = _workspace_relative_from_parsed_def(parsed_def)
     source_section = "SPECIALNETS" if net.special else "NETS"
@@ -4613,7 +4659,7 @@ def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefN
                 "patch_intersections": intersections,
                 "wire_ref": wire_ref,
                 "via_ref": via_ref,
-                "source_refs": {"def": source, "def_section": source_section, "def_net_index": idx, "wire_index": segment_index, "via_name": wire.via},
+                "source_refs": {"def": source, "def_section": source_section, "def_net_index": def_net_index, "wire_index": segment_index, "via_name": wire.via},
                 "null_reason": edge_null_reason,
             }
         )
@@ -4688,7 +4734,7 @@ def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefN
         "timing_context": timing_context,
         "route_context": {"route_only_oracle": True, "source": source, "total_routed_length": total_routed_length, "via_count": via_edge_count, "wire_segment_count": wire_edge_count, "detour_ratio": _routing_graph_detour_ratio(total_routed_length, net_record), "local_final_overflow_summary": None, "drc_count": None},
         "progressive_metadata": {"available_from": "route", "created_stage": "route", "exists_before_route": False, "not_available_before_route": True, "route_only_oracle": True, "pre_route_placeholder_policy": "empty_stage_file"},
-        "source_refs": {"def": source, "def_section": source_section, "def_net_index": idx, "net_vector_ref": f"vectors/nets/{stage.name}.jsonl:{net.name}", "wire_vector_refs": [edge["wire_ref"]["wire_key"] for edge in edges if edge.get("wire_ref")], "pin_vector_refs": [vertex["terminal_ref"]["pin_key"] for vertex in vertices if vertex.get("terminal_ref")], "timing_path_refs": [ref.get("path_key") or ref.get("path_id") for ref in timing_context.get("path_refs", [])]},
+        "source_refs": {"def": source, "def_section": source_section, "def_net_index": def_net_index, "net_vector_ref": f"vectors/nets/{stage.name}.jsonl:{net.name}", "wire_vector_refs": [edge["wire_ref"]["wire_key"] for edge in edges if edge.get("wire_ref")], "pin_vector_refs": [vertex["terminal_ref"]["pin_key"] for vertex in vertices if vertex.get("terminal_ref")], "timing_path_refs": [ref.get("path_key") or ref.get("path_id") for ref in timing_context.get("path_refs", [])]},
         "coverage": {"has_routed_geometry": bool(edges), "vertex_count": len(vertices), "edge_count": len(edges), "wire_ref_count": sum(1 for edge in edges if edge.get("wire_ref")), "via_ref_count": sum(1 for edge in edges if edge.get("via_ref")), "terminal_match_count": terminal_matching["matched_terminal_count"], "terminal_unmatched_count": terminal_matching["unmatched_count"], "terminal_match_rate": terminal_matching["terminal_match_rate"], "edge_patch_intersection_count": sum(len(edge.get("patch_intersections", [])) for edge in edges), "edge_patch_intersection_coverage": (sum(1 for edge in edges if edge.get("patch_intersections")) / len(edges)) if edges else None, "connected_component_count": comps},
         "null_reason": null_reason,
     }

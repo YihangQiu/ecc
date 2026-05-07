@@ -2202,3 +2202,63 @@ def test_routing_graph_records_follow_vec_routing_graph_schema(tmp_path: Path):
     assert via_edge["via_ref"]["from_layer"] == "MET2"
     assert via_edge["via_ref"]["to_layer"] == "MET3"
     assert all(len(vertex["incident_edge_ids"]) == len(set(vertex["incident_edge_ids"])) for vertex in graph["vertices"])
+
+
+def test_routing_graph_strict_blockers_are_enforced(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_text(
+        ws / "route_ecc" / "output" / "gcd_route.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+TRACKS Y 50 DO 1 STEP 100 LAYER MET2 ;
+TRACKS X 50 DO 1 STEP 100 LAYER MET3 ;
+GCELLGRID X 0 DO 3 STEP 100 ;
+GCELLGRID Y 0 DO 3 STEP 100 ;
+COMPONENTS 1 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n_boundary + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;
+END PINS
+NETS 3 ;
+- n_skip ( U1 B ) ( U1 Y ) ;
+- n_boundary ( U1 A ) ( PIN OUT )
+  + ROUTED MET2 ( 120 10 ) ( * 70 )
+  ;
+- n_after ( U1 Y ) ( PIN OUT )
+  + ROUTED MET3 ( 10 90 ) ( 70 * )
+  ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route", "drc"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    route_graphs = [
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "routing_graphs" / "route.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    boundary = next(row for row in route_graphs if row["net_key"] == "n_boundary")
+    assert boundary["id"] == 0
+    assert boundary["source_refs"]["def_net_index"] == 1
+    edge = boundary["edges"][0]
+    assert edge["geometry"]["length"] == 60.0
+    assert sum(item["length"] for item in edge["patch_intersections"]) == edge["geometry"]["length"]
+    assert sum(float(value) for value in boundary["patch_footprint"]["total_routed_length_by_patch"].values()) == boundary["graph_metrics"]["total_routed_length"]
+
+    after = next(row for row in route_graphs if row["net_key"] == "n_after")
+    assert after["id"] == 1
+    assert after["source_refs"]["def_net_index"] == 2
+
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    assert quality["availability"]["routing_graphs"]["drc"] == "optional_post_route_snapshot"
+    assert quality["null_reason"]["routing_graphs"]["drc"] == "optional_post_route_snapshot"
