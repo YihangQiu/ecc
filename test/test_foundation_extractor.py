@@ -1534,6 +1534,147 @@ END DESIGN
     assert inst_pin["connectivity_context"]["same_net_pin_count"] == 2
 
 
+def test_iccd_full_v1_pins_use_lef_geometry_electrical_context_and_route_attribution(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    _write_json(
+        ws / "home" / "parameters.json",
+        {
+            "PDK": "unit-test",
+            "PDK Root": str(ws / "pdk"),
+            "Design": "gcd",
+            "Core": {"Utilitization": 0.5},
+        },
+    )
+    _write_text(
+        ws / "pdk" / "unit.lef",
+        """
+VERSION 5.8 ;
+MACRO NAND2
+  CLASS CORE ;
+  SIZE 20 BY 20 ;
+  PIN A
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER MET2 ;
+        RECT 1 2 5 6 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER MET2 ;
+        RECT 10 10 14 14 ;
+    END
+  END Y
+END NAND2
+END LIBRARY
+""".strip()
+        + "\n",
+    )
+    _write_text(
+        ws / "place_dreamplace" / "output" / "gcd_place.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+- U2 NAND2 + PLACED ( 40 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + USE SIGNAL + LAYER MET2 ( -5 -5 ) ( 5 5 ) + PLACED ( 180 50 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( U1 A ) ( U2 A ) ( PIN OUT ) ;
+- n2 ( U1 Y ) ( U2 Y ) ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_text(
+        ws / "route_ecc" / "output" / "gcd_route.def",
+        """
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN gcd ;
+UNITS DISTANCE MICRONS 1 ;
+DIEAREA ( 0 0 ) ( 200 200 ) ;
+COMPONENTS 2 ;
+- U1 NAND2 + PLACED ( 10 20 ) N ;
+- U2 NAND2 + PLACED ( 40 20 ) N ;
+END COMPONENTS
+PINS 1 ;
+- OUT + NET n1 + DIRECTION OUTPUT + USE SIGNAL + LAYER MET2 ( -5 -5 ) ( 5 5 ) + PLACED ( 180 50 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( U1 A ) ( U2 A ) ( PIN OUT )
+  + ROUTED MET2 ( 11 22 ) ( 90 * )
+    NEW MET2 ( 42 22 ) ( 100 * )
+  ;
+- n2 ( U1 Y ) ( U2 Y )
+  + ROUTED MET3 ( 22 32 ) ( * 120 )
+  ;
+END NETS
+END DESIGN
+""".strip()
+        + "\n",
+    )
+    _write_sample_gcell_info(ws / "route_ecc")
+    _write_text(
+        ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.jsonl",
+        "\n".join(
+            [
+                json.dumps({"row": 0, "col": 0, "gcell": {"x": 0, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 6, "capacity": 3, "demand_capacity": 3, "utilization": 2, "overflow": 3, "source": "irt_space_router_native"}),
+                json.dumps({"row": 0, "col": 1, "gcell": {"x": 1, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 2, "capacity": 3, "demand_capacity": -1, "utilization": 0.67, "overflow": 0, "source": "irt_space_router_native"}),
+            ]
+        )
+        + "\n",
+    )
+    _write_json(
+        ws / "drc_ecc" / "data" / "drc" / "violation_map.json",
+        [{"type": "short", "layer": "MET2", "bbox": {"llx": 10, "lly": 20, "urx": 20, "ury": 30}, "count": 2}],
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "route", "drc"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    place_rows = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "place.jsonl").read_text().splitlines()]
+    route_rows = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "route.jsonl").read_text().splitlines()]
+    u1_a = next(row for row in place_rows if row["pin_key"] == "U1:A")
+    u1_y = next(row for row in place_rows if row["pin_key"] == "U1:Y")
+    route_u1_a = next(row for row in route_rows if row["pin_key"] == "U1:A")
+
+    assert u1_a["geometry"]["geometry_status"] == "exact"
+    assert u1_a["geometry"]["anchor_source"] == "lef_pin_shape"
+    assert u1_a["geometry"]["bbox"] == {"llx": 11.0, "lly": 22.0, "urx": 15.0, "ury": 26.0}
+    assert u1_a["geometry"]["layers"] == ["MET2"]
+    assert u1_a["electrical_context"]["direction"] == "INPUT"
+    assert u1_a["electrical_context"]["direction_source"] == "lef_pin_direction"
+    assert u1_a["connectivity_context"]["pin_role"] == "sink"
+    assert u1_y["electrical_context"]["direction"] == "OUTPUT"
+    assert u1_y["connectivity_context"]["pin_role"] == "driver"
+    assert u1_a["patch_anchor"]["nearby_pin_count"] >= 2
+    assert u1_a["patch_anchor"]["nearby_io_pin_count"] >= 0
+    assert u1_a["source_refs"]["lef"].endswith("unit.lef")
+    assert u1_a["source_refs"]["lef_macro"] == "NAND2"
+    assert u1_a["source_refs"]["lef_pin"] == "A"
+    assert "geometry_bbox" not in u1_a["null_reason"]
+
+    assert route_u1_a["route_context"]["route_only_oracle"] is True
+    assert route_u1_a["route_context"]["nearby_wire_count"] >= 1
+    assert route_u1_a["route_context"]["nearby_drc_count"] == 2
+    assert route_u1_a["route_context"]["local_final_overflow"] == 3.0
+    assert route_u1_a["route_context"]["net_detour_ratio"] is not None
+    assert route_u1_a["route_context"]["source"] == "route_ecc/output/gcd_route.def"
+
+
 def test_iccd_full_v1_pin_progressive_and_route_leakage_guard(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     _write_text(

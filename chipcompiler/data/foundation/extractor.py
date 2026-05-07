@@ -12,6 +12,7 @@ from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resiz
 from .parsers.def_parser import DefData, DefWire, parse_def
 from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.gcell import parse_gcell_info
+from .parsers.lef_parser import LefMacro, parse_lef_files
 from .parsers.map_csv import read_numeric_csv, shape
 from .parsers.route_native_demand_capacity import parse_route_native_demand_capacity_artifacts
 from .parsers.rt_log import parse_rt_log
@@ -68,6 +69,7 @@ class FoundationExtractor:
         self._quality: dict[str, Any] = {"availability": {}, "null_reason": {}, "warnings": []}
         self._raw_refs: list[dict[str, Any]] = []
         self._exact_gcell_map_keys: set[tuple[str, str, str]] = set()
+        self._lef_macros: dict[str, LefMacro] = {}
 
     def extract(self, *, force: bool = False, stages: Any = "all", include_raw_refs: bool = True) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
@@ -75,6 +77,7 @@ class FoundationExtractor:
             shutil.rmtree(self.foundation_dir)
         flow = self._read_json(self.workspace_dir / "home" / "flow.json")
         parameters = self._read_json(self.workspace_dir / "home" / "parameters.json")
+        self._lef_macros = self._load_lef_macros(parameters)
         selected_stages = self._filter_stages(self._stage_infos(flow), stages)
         options = {"stages": [stage.name for stage in selected_stages], "include_raw_refs": bool(include_raw_refs)}
         def_data = self._collect_def_data(selected_stages)
@@ -152,6 +155,23 @@ class FoundationExtractor:
         if unknown:
             raise ValueError(f"unknown foundation extraction stage: {', '.join(unknown)}")
         return [by_name[name] for name in requested_names]
+
+    def _load_lef_macros(self, parameters: dict[str, Any]) -> dict[str, LefMacro]:
+        pdk_root = parameters.get("PDK Root") or parameters.get("pdk_root")
+        if not pdk_root:
+            self._mark("tech", "lef", "missing", "missing_pdk_root")
+            return {}
+        root = Path(str(pdk_root)).expanduser()
+        if not root.is_absolute():
+            root = (self.workspace_dir / root).resolve()
+        if not root.exists():
+            self._mark("tech", "lef", "missing", "missing_pdk_root")
+            return {}
+        paths = sorted([*root.rglob("*.lef"), *root.rglob("*.tlef")])
+        macros = parse_lef_files(paths)
+        self._quality.setdefault("tech", {})["lef_macro_count"] = len(macros)
+        self._mark("tech", "lef", "available" if macros else "missing", "" if macros else "missing_lef_macros")
+        return macros
 
     def _collect_def_data(self, stages: list[StageInfo]) -> dict[str, DefData]:
         out: dict[str, DefData] = {}
@@ -581,6 +601,8 @@ class FoundationExtractor:
         for idx, item in enumerate(sorted(cells_by_name.values(), key=lambda value: str(value.get("name")))):
             name = str(item["name"])
             stage_counts = item.get("stage_instance_counts", {})
+            lef_macro = self._lef_macros.get(name)
+            lef_source = lef_macro.source if lef_macro is not None else None
             cell_records.append({
                 "id": idx,
                 "name": name,
@@ -589,11 +611,11 @@ class FoundationExtractor:
                 "identity": {"name": name, "cell_key": name, "cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "classification_source": "heuristic_name_rule"},
                 "classification": {"cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "is_clock_related": _is_clock_related(name, name), "is_physical_only": _is_physical_only_cell_name(name, name)},
                 "physical_properties": {"observed_bbox_stats": None, "source": "def_components_only"},
-                "pin_summary": {"pin_count": None, "source": "lef_not_parsed"},
+                "pin_summary": {"pin_count": len(lef_macro.pins) if lef_macro is not None else None, "source": "lef_macro_pins" if lef_macro is not None else "lef_missing_macro"},
                 "usage_summary": {"instance_count": item.get("instance_count", 0), "stage_instance_counts": stage_counts},
                 "stage_metadata": {"available_stages": sorted(stage_counts), "stage_count": len(stage_counts)},
-                "source_refs": {"def": "stage_def_components", "lef": None, "liberty": None},
-                "null_reason": {"lef": "lef_not_parsed", "liberty": "liberty_reserved_not_parsed"},
+                "source_refs": {"def": "stage_def_components", "lef": lef_source, "liberty": None},
+                "null_reason": {**({} if lef_macro is not None else {"lef": "missing_lef_macro"}), "liberty": "liberty_reserved_not_parsed"},
             })
         via_records = []
         for idx, item in enumerate(sorted(vias_by_name.values(), key=lambda value: str(value.get("name")))):
@@ -660,6 +682,7 @@ class FoundationExtractor:
                 canonical_grid,
                 canonical_maps.get(stage.name, {}),
                 sta_reports.get(stage.name),
+                drc_reports.get(stage.name) or (drc_reports.get("drc") if stage.name == "route" else None),
             )
             nets = self._net_records(stage, parsed_def, pins, canonical_grid, canonical_maps.get(stage.name, {}), sta_reports.get(stage.name))
             wires = self._wire_records(stage, parsed_def, canonical_grid, canonical_maps.get(stage.name, {}), nets)
@@ -855,6 +878,7 @@ class FoundationExtractor:
         canonical_grid: dict,
         stage_maps: dict[str, dict[str, list[list[float]]]],
         sta_report: dict[str, Any] | None,
+        drc_report: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
@@ -866,6 +890,8 @@ class FoundationExtractor:
             stage_maps,
             sta_report,
             self.workspace_dir,
+            self._lef_macros,
+            drc_report,
         )
 
     def _wire_records(
@@ -1710,6 +1736,8 @@ def _pin_records_for_stage(
     stage_maps: dict[str, dict[str, MapMatrix]],
     sta_report: dict[str, Any] | None,
     workspace_dir: Path,
+    lef_macros: dict[str, LefMacro] | None = None,
+    drc_report: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     source = str(parsed_def.path.relative_to(workspace_dir))
     instance_by_key = {str(record.get("identity", {}).get("instance_key")): record for record in instances}
@@ -1761,10 +1789,14 @@ def _pin_records_for_stage(
             sta_report,
             workspace_dir,
             parsed_def,
+            lef_macros or {},
+            drc_report,
         )
         for record_id, raw_pin in enumerate(raw_pins)
     ]
     _attach_pin_connectivity_context(interim, net_by_name)
+    _attach_pin_nearby_context(interim)
+    _attach_pin_route_detour_ratios(interim)
     return [_ordered_pin_record(record, idx) for idx, record in enumerate(interim)]
 
 
@@ -1781,6 +1813,8 @@ def _build_pin_record(
     sta_report: dict[str, Any] | None,
     workspace_dir: Path,
     parsed_def: DefData,
+    lef_macros: dict[str, LefMacro],
+    drc_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
     del record_id
     pin_kind = str(raw_pin.get("pin_kind") or "instance_terminal")
@@ -1794,15 +1828,18 @@ def _build_pin_record(
     null_reason: dict[str, str] = {}
     identity = _pin_identity(raw_pin, pin_key, parent, component)
     parent_instance = _pin_parent_instance(parent, component, parent_key)
-    electrical = _pin_electrical_context(raw_pin, net_use_by_name.get(net), null_reason)
-    geometry = _pin_geometry(raw_pin, pin_kind, parent_instance, canonical_grid, null_reason)
+    lef_pin = _lookup_lef_pin(identity.get("parent_master"), pin_name, lef_macros)
+    electrical = _pin_electrical_context(raw_pin, net_use_by_name.get(net), null_reason, lef_pin)
+    lef_macro = _lookup_lef_macro(identity.get("parent_master"), lef_macros)
+    component_origin = component.get("origin") if isinstance(component, dict) else None
+    geometry = _pin_geometry(raw_pin, pin_kind, parent_instance, canonical_grid, null_reason, lef_pin, parsed_def.units, lef_macro, component_origin)
     patch_anchor = _pin_patch_anchor(geometry, canonical_grid, stage_maps)
     timing_context = _pin_timing_context(pin_key, identity["full_name"], net, sta_report, workspace_dir)
     if timing_context["available"] and timing_context["timing_path_count"] == 0:
         null_reason["timing_context"] = "pin_not_found_in_timing_paths"
     elif not timing_context["available"]:
         null_reason["timing_context"] = "missing_sta_artifacts"
-    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps)
+    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps, canonical_grid, _route_label_overflow_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}, drc_report)
     if route_context is None:
         null_reason["route_context"] = "not_route_stage"
     return {
@@ -1822,7 +1859,7 @@ def _build_pin_record(
             "def": source,
             "def_section": raw_pin.get("def_section"),
             "def_index": raw_pin.get("def_index"),
-            "lef": None,
+            "lef": _workspace_relative_path(lef_pin.source, workspace_dir) if lef_pin and lef_pin.source else None,
             "lef_macro": identity.get("parent_master"),
             "lef_pin": pin_name,
             "liberty": None,
@@ -1832,6 +1869,64 @@ def _build_pin_record(
         "null_reason": null_reason,
     }
 
+
+def _lookup_lef_pin(master: Any, pin_name: str, lef_macros: dict[str, LefMacro]) -> Any:
+    macro = lef_macros.get(str(master or ""))
+    if not macro:
+        return None
+    return macro.pins.get(pin_name)
+
+
+def _lookup_lef_macro(master: Any, lef_macros: dict[str, LefMacro]) -> LefMacro | None:
+    return lef_macros.get(str(master or ""))
+
+
+def _workspace_relative_path(value: Any, workspace_dir: Path) -> str:
+    path = Path(str(value))
+    try:
+        return str(path.relative_to(workspace_dir))
+    except ValueError:
+        return str(path)
+
+
+def _lef_scale(units: int | None) -> float:
+    return float(units or 1000)
+
+
+def _scale_lef_rect(rect: dict[str, Any], units: int | None) -> dict[str, float]:
+    scale = _lef_scale(units)
+    return {key: float(rect[key]) * scale for key in ("llx", "lly", "urx", "ury")}
+
+
+def _transform_local_rect(rect: dict[str, float], origin: dict[str, Any], orientation: str | None, macro_size: dict[str, float] | None, units: int | None) -> dict[str, float] | None:
+    ox = float(origin["x"])
+    oy = float(origin["y"])
+    orient = (orientation or "N").upper()
+    width = float(macro_size.get("width", 0.0)) * _lef_scale(units) if isinstance(macro_size, dict) else None
+    height = float(macro_size.get("height", 0.0)) * _lef_scale(units) if isinstance(macro_size, dict) else None
+    points = [(rect["llx"], rect["lly"]), (rect["llx"], rect["ury"]), (rect["urx"], rect["lly"]), (rect["urx"], rect["ury"])]
+
+    def transform(x: float, y: float) -> tuple[float, float] | None:
+        if orient in {"N", "R0"}:
+            return ox + x, oy + y
+        if orient in {"S", "R180"} and width is not None and height is not None:
+            return ox + width - x, oy + height - y
+        if orient in {"FN", "MY"} and width is not None:
+            return ox + width - x, oy + y
+        if orient in {"FS", "MX"} and height is not None:
+            return ox + x, oy + height - y
+        if orient in {"E", "R270"} and width is not None:
+            return ox + y, oy + width - x
+        if orient in {"W", "R90"} and height is not None:
+            return ox + height - y, oy + x
+        return None
+
+    transformed = [transform(x, y) for x, y in points]
+    if any(point is None for point in transformed):
+        return None
+    xs = [point[0] for point in transformed if point is not None]
+    ys = [point[1] for point in transformed if point is not None]
+    return {"llx": min(xs), "lly": min(ys), "urx": max(xs), "ury": max(ys)}
 
 def _pin_identity(
     raw_pin: dict[str, Any],
@@ -1885,9 +1980,11 @@ def _pin_parent_instance(
     }
 
 
-def _pin_electrical_context(raw_pin: dict[str, Any], net_use: str | None, null_reason: dict[str, str]) -> dict[str, Any]:
-    direction = str(raw_pin.get("direction") or "UNKNOWN").upper()
-    use = str(raw_pin.get("use") or net_use or "UNKNOWN").upper()
+def _pin_electrical_context(raw_pin: dict[str, Any], net_use: str | None, null_reason: dict[str, str], lef_pin: Any = None) -> dict[str, Any]:
+    lef_direction = getattr(lef_pin, "direction", None) if lef_pin is not None else None
+    lef_use = getattr(lef_pin, "use", None) if lef_pin is not None else None
+    direction = str(raw_pin.get("direction") or lef_direction or "UNKNOWN").upper()
+    use = str(raw_pin.get("use") or net_use or lef_use or "UNKNOWN").upper()
     name_blob = f"{raw_pin.get('net') or ''} {raw_pin.get('pin_name') or ''}".lower()
     is_clock = use == "CLOCK" or _is_clock_like(name_blob)
     is_reset = "reset" in name_blob or "rst" in name_blob
@@ -1896,6 +1993,8 @@ def _pin_electrical_context(raw_pin: dict[str, Any], net_use: str | None, null_r
         null_reason["electrical_direction"] = "missing_pin_direction"
     if use == "UNKNOWN":
         null_reason["electrical_use"] = "missing_pin_use"
+    direction_source = "def_pin_direction" if raw_pin.get("direction") else "lef_pin_direction" if lef_direction else "unknown"
+    use_source = "def_pin_use" if raw_pin.get("use") else "def_net_use" if net_use else "lef_pin_use" if lef_use else "heuristic_name_rule" if is_clock or is_reset or is_power_ground else "unknown"
     return {
         "direction": direction,
         "use": "CLOCK" if is_clock and use == "UNKNOWN" else "RESET" if is_reset and use == "UNKNOWN" else use,
@@ -1903,8 +2002,8 @@ def _pin_electrical_context(raw_pin: dict[str, Any], net_use: str | None, null_r
         "is_reset": is_reset,
         "is_power_ground": is_power_ground,
         "is_signal": not is_clock and not is_reset and not is_power_ground and use in {"SIGNAL", "UNKNOWN"},
-        "direction_source": "def_pin_direction" if raw_pin.get("direction") else "unknown",
-        "use_source": "def_pin_use" if raw_pin.get("use") else "def_net_use" if net_use else "heuristic_name_rule" if is_clock or is_reset or is_power_ground else "unknown",
+        "direction_source": direction_source,
+        "use_source": use_source,
     }
 
 
@@ -1914,6 +2013,10 @@ def _pin_geometry(
     parent_instance: dict[str, Any] | None,
     canonical_grid: dict,
     null_reason: dict[str, str],
+    lef_pin: Any = None,
+    units: int | None = None,
+    lef_macro: LefMacro | None = None,
+    component_origin: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if pin_kind == "io_port":
         origin = raw_pin.get("origin")
@@ -1979,8 +2082,45 @@ def _pin_geometry(
 
     center = parent_instance.get("center") if isinstance(parent_instance, dict) else None
     patch_id = parent_instance.get("patch_id") if isinstance(parent_instance, dict) else None
+    origin = component_origin
+    if not isinstance(origin, dict) and isinstance(parent_instance, dict) and isinstance(parent_instance.get("bbox"), dict):
+        bbox = parent_instance["bbox"]
+        origin = {"x": float(bbox["llx"]), "y": float(bbox["lly"])}
+    shapes = getattr(lef_pin, "shapes", None) if lef_pin is not None else None
+    if isinstance(origin, dict) and shapes:
+        absolute_shapes = []
+        boxes = []
+        macro_size = lef_macro.size if lef_macro is not None else None
+        for shape in shapes:
+            rect = shape.get("rect") if isinstance(shape, dict) else None
+            if not isinstance(rect, dict):
+                continue
+            local_rect = _scale_lef_rect(rect, units)
+            abs_rect = _transform_local_rect(local_rect, origin, parent_instance.get("orientation") if isinstance(parent_instance, dict) else None, macro_size, units)
+            if abs_rect is None:
+                null_reason["geometry_bbox"] = "orientation_transform_unsupported"
+                continue
+            boxes.append(abs_rect)
+            absolute_shapes.append({**{k: v for k, v in shape.items() if k != "source"}, "rect": abs_rect})
+        if boxes:
+            bbox = _bbox_union(boxes)
+            pin_center = _bbox_center(bbox)
+            patch = _patch_for_point(canonical_grid.get("patches", []), pin_center)
+            return {
+                "geometry_status": "exact",
+                "anchor_source": "lef_pin_shape",
+                "bbox": bbox,
+                "center": pin_center,
+                "layers": sorted({str(shape["layer"]) for shape in absolute_shapes if shape.get("layer")}),
+                "shape_count": len(absolute_shapes),
+                "area": sum(_bbox_area(box) for box in boxes),
+                "local_shapes": [{**{k: v for k, v in shape.items() if k != "source"}, "rect": _scale_lef_rect(shape["rect"], units)} for shape in shapes if isinstance(shape.get("rect"), dict)],
+                "absolute_shapes": absolute_shapes,
+                "patch_id": int(patch["patch_id"]) if patch else None,
+                "overlap_patch_ids": _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
+            }
     if isinstance(center, dict):
-        null_reason["geometry_bbox"] = "missing_lef_pin_shape"
+        null_reason["geometry_bbox"] = "missing_lef_pin_shape" if not shapes else null_reason.get("geometry_bbox", "missing_instance_origin")
         return _empty_pin_geometry("fallback_to_instance_anchor", "parent_instance_center", center, patch_id)
     null_reason["geometry_bbox"] = "missing_instance_origin"
     return _empty_pin_geometry("missing", "none", None, None)
@@ -2089,27 +2229,40 @@ def _pin_timing_context(pin_key: str, full_name: str, net: str, sta_report: dict
     }
 
 
-def _pin_route_context(stage_name: str, net: str, geometry: dict[str, Any], parsed_def: DefData, stage_maps: dict[str, dict[str, MapMatrix]]) -> dict[str, Any] | None:
+def _pin_route_context(
+    stage_name: str,
+    net: str,
+    geometry: dict[str, Any],
+    parsed_def: DefData,
+    stage_maps: dict[str, dict[str, MapMatrix]],
+    canonical_grid: dict,
+    route_label_overflow_by_patch: dict[int, float],
+    drc_report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if stage_name != "route":
         return None
     net_wires = [wire for def_net in parsed_def.nets if def_net.name == net for wire in def_net.wires]
     patch_id = geometry.get("patch_id")
     local_final_overflow = None
     if patch_id is not None:
-        patch = next((item for item in _grid_patches_from_stage_maps(stage_maps) if int(item.get("patch_id")) == int(patch_id)), None)
-        if patch:
-            local_final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), int(patch["row"]), int(patch["col"]))
+        row_col = _patch_row_col(canonical_grid, int(patch_id))
+        if row_col:
+            local_final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1])
+        if local_final_overflow is None:
+            local_final_overflow = route_label_overflow_by_patch.get(int(patch_id))
+    nearby_wires = [wire for wire in net_wires if not wire.via and _wire_near_geometry(wire, geometry)]
+    nearby_vias = [wire for wire in net_wires if wire.via and _wire_near_geometry(wire, geometry)]
     return {
         "route_only_oracle": True,
-        "nearby_wire_count": len(net_wires) if geometry.get("center") else None,
-        "nearby_via_count": sum(1 for wire in net_wires if wire.via),
-        "nearby_drc_count": None,
+        "nearby_wire_count": len(nearby_wires) if geometry.get("center") else None,
+        "nearby_via_count": len(nearby_vias),
+        "nearby_drc_count": _drc_count_near_geometry(drc_report, geometry),
         "local_final_overflow": local_final_overflow,
-        "pin_access_congestion": None,
-        "net_routed_length": sum(wire.length for wire in net_wires) if net_wires else 0.0,
+        "pin_access_congestion": local_final_overflow,
+        "net_routed_length": sum(wire.length for wire in net_wires if not wire.via) if net_wires else 0.0,
         "net_via_count": sum(1 for wire in net_wires if wire.via),
         "net_detour_ratio": None,
-        "source": str(parsed_def.path.name),
+        "source": _workspace_relative_from_parsed_def(parsed_def),
     }
 
 
@@ -2183,6 +2336,70 @@ def _attach_pin_connectivity_context(records: list[dict[str, Any]], net_by_name:
         if driver_by_net.get(net) is None and len(pins) > 1:
             record.setdefault("null_reason", {})["connectivity_role"] = "ambiguous_driver_sink"
 
+
+def _attach_pin_nearby_context(records: list[dict[str, Any]]) -> None:
+    by_patch: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        patch_id = record.get("patch_anchor", {}).get("primary_patch_id")
+        if patch_id is None:
+            continue
+        by_patch.setdefault(int(patch_id), []).append(record)
+    for record in records:
+        patch_id = record.get("patch_anchor", {}).get("primary_patch_id")
+        patch_anchor = record.setdefault("patch_anchor", {})
+        if patch_id is None:
+            patch_anchor["nearby_pin_count"] = None
+            patch_anchor["nearby_io_pin_count"] = None
+            patch_anchor["nearby_macro_pin_count"] = None
+            continue
+        nearby = by_patch.get(int(patch_id), [])
+        patch_anchor["nearby_pin_count"] = len(nearby)
+        patch_anchor["nearby_io_pin_count"] = sum(1 for pin in nearby if pin.get("identity", {}).get("is_io"))
+        patch_anchor["nearby_macro_pin_count"] = sum(1 for pin in nearby if pin.get("identity", {}).get("is_macro_pin"))
+
+
+def _attach_pin_route_detour_ratios(records: list[dict[str, Any]]) -> None:
+    by_net: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        net = str(record.get("identity", {}).get("net") or "")
+        if net:
+            by_net.setdefault(net, []).append(record)
+    for pins in by_net.values():
+        hpwl = _hpwl_from_points([pin.get("geometry", {}).get("center") for pin in pins if isinstance(pin.get("geometry", {}).get("center"), dict)])
+        for pin in pins:
+            route_context = pin.get("route_context")
+            if not isinstance(route_context, dict):
+                continue
+            routed_length = route_context.get("net_routed_length")
+            route_context["net_detour_ratio"] = (float(routed_length) / hpwl) if hpwl and routed_length is not None else None
+
+
+def _drc_count_near_geometry(drc_report: dict[str, Any] | None, geometry: dict[str, Any]) -> int | None:
+    if not drc_report or not drc_report.get("available"):
+        return None
+    bbox = geometry.get("bbox")
+    if not isinstance(bbox, dict):
+        center = geometry.get("center")
+        if not isinstance(center, dict):
+            return None
+        bbox = {"llx": float(center["x"]), "lly": float(center["y"]), "urx": float(center["x"]), "ury": float(center["y"])}
+    count = 0
+    for violation in drc_report.get("violations", []):
+        violation_bbox = violation.get("bbox")
+        if isinstance(violation_bbox, dict) and _bbox_intersects_bbox(violation_bbox, bbox):
+            count += int(violation.get("count") or 1)
+    return count
+
+
+def _wire_near_geometry(wire: DefWire, geometry: dict[str, Any]) -> bool:
+    bbox = geometry.get("bbox")
+    if not isinstance(bbox, dict):
+        center = geometry.get("center")
+        if not isinstance(center, dict):
+            return False
+        bbox = {"llx": float(center["x"]), "lly": float(center["y"]), "urx": float(center["x"]), "ury": float(center["y"])}
+    wire_bbox = _wire_geometry(wire)["bbox"]
+    return _bbox_intersects_bbox(wire_bbox, bbox)
 
 def _attach_pin_progressive_metadata(stages: list[StageInfo], pins_dir: Path) -> None:
     records_by_stage: dict[str, list[dict[str, Any]]] = {}
