@@ -2010,10 +2010,77 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
         "null_reason",
     ]
     assert graph["identity"]["has_routed_geometry"] is True
+    assert graph["graph_semantics"]["topology_direction"] == "undirected"
     assert graph["graph_metrics"]["wire_edge_count"] > 0
-    assert graph["graph_metrics"]["via_edge_count"] >= 0
-    assert graph["patch_footprint"]["patch_count"] >= 1
-    assert graph["coverage"]["patch_intersection_count"] >= 1
+    assert graph["graph_metrics"]["via_edge_count"] == 1
+    assert graph["graph_metrics"]["total_routed_length"] == 800.0
+    assert graph["graph_metrics"]["used_layers"] == ["MET2", "MET3"]
+    assert graph["graph_metrics"]["layer_count"] == 2
+    assert graph["graph_metrics"]["max_vertex_degree"] >= 1
+    assert graph["graph_metrics"]["terminal_vertex_count"] >= 1
+    assert graph["patch_footprint"]["touched_patch_count"] >= 1
+    assert graph["patch_footprint"]["touched_patch_ids"]
+    assert graph["patch_footprint"]["dominant_patch_id"] in graph["patch_footprint"]["touched_patch_ids"]
+    assert graph["patch_footprint"]["total_routed_length_by_patch"]
+    assert graph["patch_footprint"]["layer_usage_by_patch"]
+    assert graph["patch_footprint"]["touched_layer_ids"] == ["MET2", "MET3"]
+    assert isinstance(graph["patch_footprint"]["cross_patch"], bool)
+    assert graph["terminal_matching"]["strategy"] == "exact_shape_then_nearest_same_net"
+    assert graph["terminal_matching"]["expected_terminal_count"] >= 2
+    assert graph["terminal_matching"]["matched_terminal_count"] >= 1
+    assert graph["terminal_matching"]["terminal_match_rate"] is not None
+    assert graph["route_context"]["route_only_oracle"] is True
+    assert graph["route_context"]["source"] == "route_ecc/output/gcd_route.def"
+    assert graph["route_context"]["total_routed_length"] == 800.0
+    assert graph["route_context"]["via_count"] == 1
+    assert graph["route_context"]["wire_segment_count"] == 4
+    assert graph["progressive_metadata"] == {
+        "available_from": "route",
+        "created_stage": "route",
+        "exists_before_route": False,
+        "not_available_before_route": True,
+        "route_only_oracle": True,
+        "pre_route_placeholder_policy": "empty_stage_file",
+    }
+    assert graph["coverage"]["has_routed_geometry"] is True
+    assert graph["coverage"]["wire_ref_count"] == graph["graph_metrics"]["wire_edge_count"]
+    assert graph["coverage"]["via_ref_count"] == graph["graph_metrics"]["via_edge_count"]
+    assert graph["coverage"]["terminal_match_rate"] == graph["terminal_matching"]["terminal_match_rate"]
+    assert graph["coverage"]["edge_patch_intersection_coverage"] == 1.0
+    assert graph["coverage"]["connected_component_count"] == graph["graph_metrics"]["connected_component_count"]
+    assert "patch_intersection_count" not in graph["coverage"]
+    assert "patch_count" not in graph["patch_footprint"]
+
+    via_edge = next(edge for edge in graph["edges"] if edge["edge_kind"] == "via_transition")
+    assert via_edge["edge_key"] == f"{graph['graph_key']}:e{via_edge['edge_id']}"
+    assert via_edge["source_vertex_id"] != via_edge["target_vertex_id"]
+    assert via_edge["geometry"]["start"]["layer"] == "MET2"
+    assert via_edge["geometry"]["end"]["layer"] == "MET3"
+    assert via_edge["geometry"]["direction"] == "point"
+    assert via_edge["via_ref"] == {
+        "via_name": "VIA23",
+        "coordinate": {"x": 60.0, "y": 60.0},
+        "from_layer": "MET2",
+        "to_layer": "MET3",
+    }
+    assert via_edge["patch_intersections"][0]["layer"] == "MET2/MET3"
+    assert via_edge["patch_intersections"][0]["intersection_kind"] == "via_point"
+    assert via_edge["source_refs"]["def"] == "route_ecc/output/gcd_route.def"
+    assert via_edge["null_reason"].get("wire_ref") == "via_transition_has_no_wire_segment_ref"
+
+    wire_edge = next(edge for edge in graph["edges"] if edge["edge_kind"] == "wire_segment")
+    assert wire_edge["source_vertex_id"] != wire_edge["target_vertex_id"]
+    assert wire_edge["wire_ref"]["wire_key"].startswith("route:NETS:n1:")
+    assert wire_edge["via_ref"] is None
+    assert wire_edge["patch_intersections"][0]["layer"] == wire_edge["geometry"]["layer"]
+    assert wire_edge["patch_intersections"][0]["intersection_kind"] == "segment_overlap"
+
+    assert all("terminal_match" in vertex for vertex in graph["vertices"])
+    assert all("source_refs" in vertex for vertex in graph["vertices"])
+    assert all("null_reason" in vertex for vertex in graph["vertices"])
+    assert all(len(vertex["incident_edge_ids"]) == len(set(vertex["incident_edge_ids"])) for vertex in graph["vertices"])
+    assert any(vertex["vertex_kind"] == "terminal_anchor" for vertex in graph["vertices"])
+    assert any(vertex["vertex_kind"] == "via_point" for vertex in graph["vertices"])
 
     patches = [json.loads(line) for line in (foundation_dir / "vectors" / "patches" / "route.jsonl").read_text().splitlines()]
     patch = patches[0]
@@ -2065,3 +2132,73 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
         "via_count": len(vias),
         "stage_count": 5,
     }
+
+
+def test_routing_graph_records_follow_vec_routing_graph_schema(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "route"])
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    assert (foundation_dir / "vectors" / "routing_graphs" / "place.jsonl").read_text(encoding="utf-8") == ""
+    route_graphs = [
+        json.loads(line)
+        for line in (foundation_dir / "vectors" / "routing_graphs" / "route.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    graph = next(row for row in route_graphs if row["net_key"] == "n1")
+
+    required_patch_fields = {
+        "primary_patch_id",
+        "dominant_patch_id",
+        "touched_patch_ids",
+        "touched_patch_count",
+        "total_routed_length_by_patch",
+        "layer_usage_by_patch",
+        "touched_layer_ids",
+        "cross_patch",
+    }
+    assert required_patch_fields.issubset(graph["patch_footprint"])
+    assert "patch_count" not in graph["patch_footprint"]
+    assert "length_by_patch" not in graph["patch_footprint"]
+
+    required_metric_fields = {
+        "vertex_count",
+        "edge_count",
+        "wire_edge_count",
+        "via_edge_count",
+        "branch_vertex_count",
+        "terminal_vertex_count",
+        "connected_component_count",
+        "total_routed_length",
+        "layer_count",
+        "used_layers",
+        "max_vertex_degree",
+        "has_cycle",
+    }
+    assert required_metric_fields.issubset(graph["graph_metrics"])
+    assert graph["graph_metrics"]["total_routed_length"] == 800.0
+    assert graph["graph_metrics"]["via_edge_count"] == 1
+
+    assert graph["terminal_matching"]["strategy"] == "exact_shape_then_nearest_same_net"
+    assert graph["terminal_matching"]["expected_terminal_count"] >= 2
+    assert graph["terminal_matching"]["terminal_match_rate"] is not None
+    assert graph["progressive_metadata"]["available_from"] == "route"
+    assert graph["progressive_metadata"]["not_available_before_route"] is True
+    assert graph["route_context"]["source"] == "route_ecc/output/gcd_route.def"
+    assert graph["coverage"]["edge_patch_intersection_coverage"] == 1.0
+
+    assert all({"terminal_match", "source_refs", "null_reason"}.issubset(vertex) for vertex in graph["vertices"])
+    assert all({"edge_key", "source_vertex_id", "target_vertex_id", "wire_ref", "via_ref", "source_refs", "null_reason"}.issubset(edge) for edge in graph["edges"])
+    assert all(
+        {"layer", "intersection_kind"}.issubset(item)
+        for edge in graph["edges"]
+        for item in edge["patch_intersections"]
+    )
+
+    via_edge = next(edge for edge in graph["edges"] if edge["edge_kind"] == "via_transition")
+    assert via_edge["source_vertex_id"] != via_edge["target_vertex_id"]
+    assert via_edge["geometry"]["start"]["layer"] == "MET2"
+    assert via_edge["geometry"]["end"]["layer"] == "MET3"
+    assert via_edge["via_ref"]["from_layer"] == "MET2"
+    assert via_edge["via_ref"]["to_layer"] == "MET3"
+    assert all(len(vertex["incident_edge_ids"]) == len(set(vertex["incident_edge_ids"])) for vertex in graph["vertices"])

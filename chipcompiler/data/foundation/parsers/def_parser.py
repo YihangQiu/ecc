@@ -367,12 +367,22 @@ def _parse_routed_wires(net_name: str, text: str, *, special: bool) -> list[DefW
             if (x, y) != previous:
                 wires.append(DefWire(net=net_name, layer=layer, x1=previous[0], y1=previous[1], x2=x, y2=y, width=width, special=special))
             previous = (x, y)
-        if via and previous:
-            wires.append(DefWire(net=net_name, layer=layer, x1=previous[0], y1=previous[1], x2=previous[0], y2=previous[1], width=width, via=via, special=special))
+        if via:
+            via_point = previous
+            if via_point is None and points:
+                raw_x, raw_y = points[-1]
+                if raw_x != "*" and raw_y != "*":
+                    via_point = (float(raw_x), float(raw_y))
+            if via_point is not None:
+                wires.append(DefWire(net=net_name, layer=layer, x1=via_point[0], y1=via_point[1], x2=via_point[0], y2=via_point[1], width=width, via=via, special=special))
     return wires
 
 
 def _extract_via(chunk: str, last_point: tuple[str, str]) -> str | None:
-    tail = chunk.rsplit(f"( {last_point[0]} {last_point[1]} )", 1)[-1]
-    match = re.search(r"\b([A-Za-z_][A-Za-z0-9_.$-]*(?:VIA|via)[A-Za-z0-9_.$-]*)\b", tail)
-    return match.group(1) if match else None
+    point_pattern = r"\(\s*" + re.escape(last_point[0]) + r"\s+" + re.escape(last_point[1]) + r"\s*\)"
+    parts = re.split(point_pattern, chunk, maxsplit=1)
+    tail = parts[-1] if len(parts) > 1 else chunk
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_.$-]*\b", tail):
+        if "VIA" in token.upper():
+            return token
+    return None

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resize_nearest
-from .parsers.def_parser import DefData, DefWire, parse_def
+from .parsers.def_parser import DefData, DefNet, DefWire, parse_def
 from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.gcell import parse_gcell_info
 from .parsers.lef_parser import LefMacro, parse_lef_files
@@ -4557,34 +4557,120 @@ def _ordered_wire_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefNet, idx: int, canonical_grid: dict, pins: list[dict[str, Any]], net_record: dict[str, Any] | None) -> dict[str, Any]:
     graph_key = f"{stage.name}:{net.name}"
+    source = _workspace_relative_from_parsed_def(parsed_def)
+    source_section = "SPECIALNETS" if net.special else "NETS"
+    via_layers = _via_layers_by_name(parsed_def)
     vertex_ids: dict[tuple[float, float, str], int] = {}
-    edges: list[dict[str, Any]] = []
-    def vertex_id(point: tuple[float, float, str]) -> int:
+    vertex_source_refs: dict[int, dict[str, Any]] = {}
+
+    def vertex_id(point: tuple[float, float, str], source_ref: dict[str, Any]) -> int:
         if point not in vertex_ids:
             vertex_ids[point] = len(vertex_ids)
-        return vertex_ids[point]
-    for edge_id, wire in enumerate(net.wires):
-        a = (wire.x1, wire.y1, wire.layer)
-        b = (wire.x2, wire.y2, wire.layer)
-        source_id = vertex_id(a)
-        target_id = vertex_id(b)
+        vid = vertex_ids[point]
+        current = vertex_source_refs.setdefault(vid, {"def": source, "wire_segment_ids": [], "via_names": [], "pin_refs": []})
+        if source_ref.get("wire_segment_id") is not None and source_ref["wire_segment_id"] not in current["wire_segment_ids"]:
+            current["wire_segment_ids"].append(source_ref["wire_segment_id"])
+        if source_ref.get("via_name") and source_ref["via_name"] not in current["via_names"]:
+            current["via_names"].append(source_ref["via_name"])
+        return vid
+
+    edges: list[dict[str, Any]] = []
+    for segment_index, wire in enumerate(net.wires):
         geometry = _wire_geometry(wire)
-        intersections = _wire_patch_intersections(geometry, canonical_grid)
-        edge_kind = "via_transition" if wire.via else "wire_segment"
-        edges.append({"edge_id": edge_id, "source_id": source_id, "target_id": target_id, "edge_kind": edge_kind, "geometry": geometry, "patch_intersections": intersections})
-    incident: dict[int, list[int]] = {vid: [] for vid in vertex_ids.values()}
+        intersections = _routing_graph_patch_intersections(geometry, canonical_grid, wire.layer, "via_point" if wire.via else "segment_overlap")
+        edge_id = len(edges)
+        if wire.via:
+            from_layer, to_layer = _resolve_via_transition_layers(wire, net.wires, segment_index, via_layers)
+            source_id = vertex_id((wire.x1, wire.y1, from_layer), {"wire_segment_id": segment_index, "via_name": wire.via})
+            target_id = vertex_id((wire.x1, wire.y1, to_layer), {"wire_segment_id": segment_index, "via_name": wire.via})
+            via_geometry = {
+                "layer": None,
+                "start": {"x": wire.x1, "y": wire.y1, "layer": from_layer},
+                "end": {"x": wire.x2, "y": wire.y2, "layer": to_layer},
+                "direction": "point",
+                "length": 0.0,
+                "bbox": geometry["bbox"],
+            }
+            intersections = _routing_graph_patch_intersections(via_geometry, canonical_grid, f"{from_layer}/{to_layer}", "via_point")
+            edge_null_reason = {"wire_ref": "via_transition_has_no_wire_segment_ref"}
+            wire_ref = None
+            via_ref = {"via_name": wire.via, "coordinate": {"x": wire.x1, "y": wire.y1}, "from_layer": from_layer, "to_layer": to_layer}
+        else:
+            source_id = vertex_id((wire.x1, wire.y1, wire.layer), {"wire_segment_id": segment_index})
+            target_id = vertex_id((wire.x2, wire.y2, wire.layer), {"wire_segment_id": segment_index})
+            via_geometry = {"layer": geometry["layer"], "start": geometry["start"], "end": geometry["end"], "direction": geometry["direction"], "length": geometry["length"], "bbox": geometry["bbox"]}
+            edge_null_reason = {"via_ref": "not_a_via_transition"}
+            wire_ref = {"wire_key": f"{stage.name}:{source_section}:{net.name}:{segment_index}", "source_section": source_section, "segment_index": segment_index}
+            via_ref = None
+        edges.append(
+            {
+                "edge_id": edge_id,
+                "edge_key": f"{graph_key}:e{edge_id}",
+                "edge_kind": "via_transition" if wire.via else "wire_segment",
+                "source_vertex_id": source_id,
+                "target_vertex_id": target_id,
+                "geometry": via_geometry,
+                "patch_intersections": intersections,
+                "wire_ref": wire_ref,
+                "via_ref": via_ref,
+                "source_refs": {"def": source, "def_section": source_section, "def_net_index": idx, "wire_index": segment_index, "via_name": wire.via},
+                "null_reason": edge_null_reason,
+            }
+        )
+
+    incident: dict[int, set[int]] = {vid: set() for vid in vertex_ids.values()}
     for edge in edges:
-        incident.setdefault(edge["source_id"], []).append(edge["edge_id"])
-        incident.setdefault(edge["target_id"], []).append(edge["edge_id"])
+        incident.setdefault(edge["source_vertex_id"], set()).add(edge["edge_id"])
+        incident.setdefault(edge["target_vertex_id"], set()).add(edge["edge_id"])
+
+    terminal_matches = _match_routing_vertices_to_terminals(vertex_ids, pins, threshold=1000.0)
     vertices = []
     for (x, y, layer), vid in sorted(vertex_ids.items(), key=lambda item: item[1]):
         patch = _patch_for_point(canonical_grid.get("patches", []), {"x": x, "y": y})
-        degree = len(incident.get(vid, []))
-        vertices.append({"vertex_id": vid, "vertex_key": f"{graph_key}:v{vid}", "coordinate": {"x": x, "y": y, "layer": layer}, "vertex_kind": "branch" if degree > 2 else "endpoint" if degree <= 1 else "junction", "degree": degree, "incident_edge_ids": incident.get(vid, []), "patch_id": int(patch["patch_id"]) if patch else None, "terminal_ref": None})
-    patch_ids = sorted({item["patch_id"] for edge in edges for item in edge.get("patch_intersections", [])})
-    comps = _connected_components(len(vertices), [(edge["source_id"], edge["target_id"]) for edge in edges])
+        degree = len(incident.get(vid, set()))
+        terminal_match = terminal_matches.get(vid, _unmatched_terminal_match())
+        terminal_ref = terminal_match.get("terminal_ref")
+        null_reason: dict[str, str] = {}
+        if patch is None:
+            null_reason["patch_id"] = "point_outside_canonical_grid"
+        if terminal_ref is None:
+            null_reason["terminal_ref"] = "unmatched_pin_anchor"
+        source_refs = vertex_source_refs.get(vid, {"def": source, "wire_segment_ids": [], "via_names": [], "pin_refs": []})
+        if terminal_ref:
+            source_refs = {**source_refs, "pin_refs": [terminal_ref.get("pin_key")]}
+        vertices.append(
+            {
+                "vertex_id": vid,
+                "vertex_key": f"{graph_key}:v{vid}",
+                "coordinate": {"x": x, "y": y, "layer": layer},
+                "vertex_kind": _routing_vertex_kind(terminal_ref, source_refs.get("via_names", []), degree),
+                "degree": degree,
+                "incident_edge_ids": sorted(incident.get(vid, set())),
+                "patch_id": int(patch["patch_id"]) if patch else None,
+                "terminal_ref": terminal_ref,
+                "terminal_match": {k: v for k, v in terminal_match.items() if k != "terminal_ref"},
+                "source_refs": source_refs,
+                "null_reason": null_reason,
+            }
+        )
+
+    patch_footprint = _routing_graph_patch_footprint(edges, vertices)
+    comps = _connected_components(len(vertices), [(edge["source_vertex_id"], edge["target_vertex_id"]) for edge in edges])
     identity = _net_identity(net)
-    source = _workspace_relative_from_parsed_def(parsed_def)
+    wire_edge_count = sum(1 for edge in edges if edge["edge_kind"] == "wire_segment")
+    via_edge_count = sum(1 for edge in edges if edge["edge_kind"] == "via_transition")
+    total_routed_length = sum(float(edge["geometry"].get("length") or 0.0) for edge in edges if edge["edge_kind"] == "wire_segment")
+    used_layers = sorted({str(layer) for edge in edges for layer in _edge_layers(edge) if layer})
+    terminal_matching = _routing_graph_terminal_matching_summary(pins, vertices, threshold=1000.0)
+    timing_context, timing_null = _routing_graph_timing_context(net.name, net_record)
+    route_null_reason = {
+        "route_context.detour_ratio": "missing_hpwl_proxy" if _routing_graph_detour_ratio(total_routed_length, net_record) is None else None,
+        "route_context.local_final_overflow_summary": "missing_route_overflow_map",
+        "route_context.drc_count": "missing_drc_join",
+    }
+    null_reason = {k: v for k, v in route_null_reason.items() if v}
+    if timing_null:
+        null_reason["timing_context"] = timing_null
     return {
         "id": idx,
         "stage": stage.name,
@@ -4592,19 +4678,19 @@ def _build_routing_graph_record(stage: StageInfo, parsed_def: DefData, net: DefN
         "net_key": net.name,
         "name": net.name,
         "source": source,
-        "identity": {"graph_key": graph_key, "net_key": net.name, "name": net.name, "use": identity["use"], "source_section": "SPECIALNETS" if net.special else "NETS", "net_class": identity["net_class"], "is_signal": identity["is_signal"], "is_clock": identity["is_clock"], "is_reset": identity["is_reset"], "is_power_ground": identity["is_power_ground"], "is_special": identity["is_special"], "has_routed_geometry": bool(net.wires), "classification_source": identity["classification_source"]},
-        "graph_semantics": {"topology_direction": "undirected", "root_vertex_id": None, "root_source": "unknown", "driver_terminal_refs": [], "sink_terminal_refs": [], "direction_annotation_source": "pins_connectivity_context" if pins else "missing_pin_context"},
+        "identity": {"graph_key": graph_key, "net_key": net.name, "name": net.name, "use": identity["use"], "source_section": source_section, "net_class": identity["net_class"], "is_signal": identity["is_signal"], "is_clock": identity["is_clock"], "is_reset": identity["is_reset"], "is_power_ground": identity["is_power_ground"], "is_special": identity["is_special"], "has_routed_geometry": bool(edges), "classification_source": identity["classification_source"]},
+        "graph_semantics": _routing_graph_semantics(vertices, pins),
         "vertices": vertices,
         "edges": edges,
-        "patch_footprint": {"patch_ids": patch_ids, "patch_count": len(patch_ids), "total_routed_length": sum(wire.length for wire in net.wires), "length_by_patch": {str(pid): sum(float(item["length"]) for edge in edges for item in edge.get("patch_intersections", []) if item["patch_id"] == pid) for pid in patch_ids}},
-        "graph_metrics": {"vertex_count": len(vertices), "edge_count": len(edges), "wire_edge_count": sum(1 for edge in edges if edge["edge_kind"] == "wire_segment"), "via_edge_count": sum(1 for edge in edges if edge["edge_kind"] == "via_transition"), "branch_vertex_count": sum(1 for vertex in vertices if vertex["vertex_kind"] == "branch"), "connected_component_count": comps, "has_cycle": len(edges) >= len(vertices) if vertices else False},
-        "terminal_matching": {"nearest_terminal_distance_threshold": 1000, "unmatched_count": len(pins), "matched_terminal_count": 0, "exact_match_count": 0, "nearest_match_count": 0},
-        "timing_context": {"available": False, "source": None},
-        "route_context": {"route_only_oracle": True, "source": "routed_def"},
-        "progressive_metadata": {"route_only_oracle": True, "pre_route_placeholder_policy": "empty_stage_file"},
-        "source_refs": {"def": source, "net_index": idx, "wires": "foundation_data/ecc/vectors/wires/route.jsonl", "pins": "foundation_data/ecc/vectors/pins/route.jsonl"},
-        "coverage": {"vertex_count": len(vertices), "edge_count": len(edges), "patch_intersection_count": sum(len(edge.get("patch_intersections", [])) for edge in edges), "matched_terminal_count": 0, "unmatched_terminal_count": len(pins)},
-        "null_reason": {},
+        "patch_footprint": patch_footprint,
+        "graph_metrics": {"vertex_count": len(vertices), "edge_count": len(edges), "wire_edge_count": wire_edge_count, "via_edge_count": via_edge_count, "branch_vertex_count": sum(1 for vertex in vertices if vertex["vertex_kind"] == "branch_point" or int(vertex.get("degree") or 0) >= 3), "terminal_vertex_count": sum(1 for vertex in vertices if vertex.get("terminal_ref")), "connected_component_count": comps, "total_routed_length": total_routed_length, "layer_count": len(used_layers), "used_layers": used_layers, "max_vertex_degree": max((int(vertex.get("degree") or 0) for vertex in vertices), default=0), "has_cycle": _routing_graph_has_cycle(len(vertices), [(edge["source_vertex_id"], edge["target_vertex_id"]) for edge in edges])},
+        "terminal_matching": terminal_matching,
+        "timing_context": timing_context,
+        "route_context": {"route_only_oracle": True, "source": source, "total_routed_length": total_routed_length, "via_count": via_edge_count, "wire_segment_count": wire_edge_count, "detour_ratio": _routing_graph_detour_ratio(total_routed_length, net_record), "local_final_overflow_summary": None, "drc_count": None},
+        "progressive_metadata": {"available_from": "route", "created_stage": "route", "exists_before_route": False, "not_available_before_route": True, "route_only_oracle": True, "pre_route_placeholder_policy": "empty_stage_file"},
+        "source_refs": {"def": source, "def_section": source_section, "def_net_index": idx, "net_vector_ref": f"vectors/nets/{stage.name}.jsonl:{net.name}", "wire_vector_refs": [edge["wire_ref"]["wire_key"] for edge in edges if edge.get("wire_ref")], "pin_vector_refs": [vertex["terminal_ref"]["pin_key"] for vertex in vertices if vertex.get("terminal_ref")], "timing_path_refs": [ref.get("path_key") or ref.get("path_id") for ref in timing_context.get("path_refs", [])]},
+        "coverage": {"has_routed_geometry": bool(edges), "vertex_count": len(vertices), "edge_count": len(edges), "wire_ref_count": sum(1 for edge in edges if edge.get("wire_ref")), "via_ref_count": sum(1 for edge in edges if edge.get("via_ref")), "terminal_match_count": terminal_matching["matched_terminal_count"], "terminal_unmatched_count": terminal_matching["unmatched_count"], "terminal_match_rate": terminal_matching["terminal_match_rate"], "edge_patch_intersection_count": sum(len(edge.get("patch_intersections", [])) for edge in edges), "edge_patch_intersection_coverage": (sum(1 for edge in edges if edge.get("patch_intersections")) / len(edges)) if edges else None, "connected_component_count": comps},
+        "null_reason": null_reason,
     }
 
 
@@ -4680,3 +4766,243 @@ def _edge_position(row: int, col: int, rows: int, cols: int) -> str:
     if horizontal:
         return f"{horizontal}_edge"
     return "interior"
+
+
+def _via_layers_by_name(parsed_def: DefData) -> dict[str, tuple[str, str]]:
+    out: dict[str, tuple[str, str]] = {}
+    for via in parsed_def.vias:
+        layers = [str(layer) for layer in via.get("layers", []) if str(layer).upper().startswith("MET")]
+        if len(layers) >= 2:
+            out[str(via.get("name"))] = (layers[0], layers[-1])
+    return out
+
+
+def _resolve_via_transition_layers(wire: DefWire, wires: list[DefWire], index: int, via_layers: dict[str, tuple[str, str]]) -> tuple[str, str]:
+    fallback = via_layers.get(str(wire.via or "")) or _infer_via_layers_from_name(str(wire.via or ""))
+    previous_layer = next((wires[pos].layer for pos in range(index - 1, -1, -1) if not wires[pos].via), None)
+    next_layer = next((wires[pos].layer for pos in range(index + 1, len(wires)) if not wires[pos].via), None)
+    if fallback:
+        return fallback
+    if previous_layer and next_layer and previous_layer != next_layer:
+        return previous_layer, next_layer
+    if previous_layer and next_layer and previous_layer == next_layer:
+        return previous_layer, f"{previous_layer}_via_unknown_target"
+    if previous_layer:
+        return previous_layer, f"{previous_layer}_via_unknown_target"
+    return wire.layer, f"{wire.layer}_via_unknown_target"
+
+
+def _infer_via_layers_from_name(via_name: str) -> tuple[str, str] | None:
+    metals = re.findall(r"MET\d+", via_name.upper())
+    if len(metals) >= 2:
+        unique = sorted(set(metals), key=lambda item: int(re.search(r"\d+", item).group(0)))
+        if len(unique) >= 2:
+            return unique[0], unique[-1]
+    match = re.search(r"VIA(\d+)", via_name.upper())
+    if match:
+        lower = int(match.group(1))
+        return f"MET{lower}", f"MET{lower + 1}"
+    return None
+
+
+def _routing_graph_patch_intersections(geometry: dict[str, Any], canonical_grid: dict, layer: str, kind: str) -> list[dict[str, Any]]:
+    raw = _wire_patch_intersections(geometry, canonical_grid)
+    layer_value = layer
+    if kind == "via_point":
+        start_layer = geometry.get("start", {}).get("layer")
+        end_layer = geometry.get("end", {}).get("layer")
+        if start_layer and end_layer and start_layer != end_layer:
+            layer_value = f"{start_layer}/{end_layer}"
+    return [
+        {
+            "patch_id": int(item["patch_id"]),
+            "layer": layer_value,
+            "length": float(item.get("length") or 0.0),
+            "area_proxy": item.get("area_proxy"),
+            "intersection_kind": kind,
+            **({"row": item.get("row"), "col": item.get("col")} if item.get("row") is not None and item.get("col") is not None else {}),
+            **({"length_fraction": item.get("length_fraction")} if "length_fraction" in item else {}),
+        }
+        for item in raw
+    ]
+
+
+def _pin_bbox_contains_point(pin: dict[str, Any], x: float, y: float, layer: str) -> bool:
+    geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
+    for shape in geometry.get("absolute_shapes", []) if isinstance(geometry.get("absolute_shapes"), list) else []:
+        rect = shape.get("rect") if isinstance(shape, dict) else None
+        shape_layer = shape.get("layer") if isinstance(shape, dict) else None
+        if isinstance(rect, dict) and (not shape_layer or str(shape_layer) == str(layer)) and _point_in_bbox(x, y, rect):
+            return True
+    bbox = geometry.get("bbox")
+    layers = {str(item) for item in geometry.get("layers", [])} if isinstance(geometry.get("layers"), list) else set()
+    return isinstance(bbox, dict) and (not layers or str(layer) in layers) and _point_in_bbox(x, y, bbox)
+
+
+def _pin_anchor_point(pin: dict[str, Any]) -> dict[str, float] | None:
+    geometry = pin.get("geometry", {}) if isinstance(pin.get("geometry"), dict) else {}
+    center = geometry.get("center")
+    if isinstance(center, dict) and center.get("x") is not None and center.get("y") is not None:
+        return {"x": float(center["x"]), "y": float(center["y"])}
+    bbox = geometry.get("bbox")
+    return _bbox_center(bbox) if isinstance(bbox, dict) else None
+
+
+def _terminal_ref_from_pin(pin: dict[str, Any]) -> dict[str, Any]:
+    connectivity = pin.get("connectivity_context", {}) if isinstance(pin.get("connectivity_context"), dict) else {}
+    identity = pin.get("identity", {}) if isinstance(pin.get("identity"), dict) else {}
+    return {"pin_key": pin.get("pin_key"), "terminal_role": connectivity.get("pin_role") or "unknown", "pin_name": identity.get("pin_name"), "instance": identity.get("instance")}
+
+
+def _unmatched_terminal_match() -> dict[str, Any]:
+    return {"match_status": "unmatched", "distance": None, "match_source": None, "terminal_ref": None}
+
+
+def _match_routing_vertices_to_terminals(vertex_ids: dict[tuple[float, float, str], int], pins: list[dict[str, Any]], threshold: float) -> dict[int, dict[str, Any]]:
+    matches = {vid: _unmatched_terminal_match() for vid in vertex_ids.values()}
+    used_pins: set[str] = set()
+    for (x, y, layer), vid in sorted(vertex_ids.items(), key=lambda item: item[1]):
+        exact = next((pin for pin in pins if str(pin.get("pin_key")) not in used_pins and _pin_bbox_contains_point(pin, x, y, layer)), None)
+        if exact:
+            used_pins.add(str(exact.get("pin_key")))
+            matches[vid] = {"match_status": "exact_shape", "distance": 0.0, "match_source": "pin_absolute_shape", "terminal_ref": _terminal_ref_from_pin(exact)}
+            continue
+        candidates = []
+        for pin in pins:
+            if str(pin.get("pin_key")) in used_pins:
+                continue
+            point = _pin_anchor_point(pin)
+            if not isinstance(point, dict):
+                continue
+            distance = abs(float(point["x"]) - x) + abs(float(point["y"]) - y)
+            candidates.append((distance, str(pin.get("pin_key") or ""), pin))
+        if candidates:
+            distance, _, nearest = min(candidates, key=lambda item: (item[0], item[1]))
+            if distance <= threshold:
+                used_pins.add(str(nearest.get("pin_key")))
+                matches[vid] = {"match_status": "nearest_same_net", "distance": distance, "match_source": "nearest_same_net_pin", "terminal_ref": _terminal_ref_from_pin(nearest)}
+    return matches
+
+
+def _routing_vertex_kind(terminal_ref: dict[str, Any] | None, via_names: list[str], degree: int) -> str:
+    if terminal_ref:
+        return "terminal_anchor"
+    if via_names:
+        return "via_point"
+    if degree >= 3:
+        return "branch_point"
+    if degree == 2:
+        return "wire_junction"
+    return "wire_endpoint"
+
+
+def _routing_graph_patch_footprint(edges: list[dict[str, Any]], vertices: list[dict[str, Any]]) -> dict[str, Any]:
+    length_by_patch: dict[int, float] = {}
+    layer_usage: dict[tuple[int, str], dict[str, Any]] = {}
+    touched_patch_ids = {int(vertex["patch_id"]) for vertex in vertices if vertex.get("patch_id") is not None}
+    layers: set[str] = set()
+    for edge in edges:
+        edge_kind = edge.get("edge_kind")
+        edge_layers = _edge_layers(edge)
+        layers.update(edge_layers)
+        for item in edge.get("patch_intersections", []):
+            patch_id = int(item["patch_id"])
+            layer = str(item.get("layer") or edge.get("geometry", {}).get("layer") or "unknown")
+            length = float(item.get("length") or 0.0)
+            touched_patch_ids.add(patch_id)
+            length_by_patch[patch_id] = length_by_patch.get(patch_id, 0.0) + length
+            stat = layer_usage.setdefault((patch_id, layer), {"patch_id": patch_id, "layer": layer, "routed_length": 0.0, "wire_edge_count": 0, "via_edge_count": 0})
+            stat["routed_length"] += length
+            if edge_kind == "via_transition":
+                stat["via_edge_count"] += 1
+            else:
+                stat["wire_edge_count"] += 1
+    dominant_patch_id = max(length_by_patch.items(), key=lambda item: (item[1], -item[0]))[0] if length_by_patch else (min(touched_patch_ids) if touched_patch_ids else None)
+    return {
+        "primary_patch_id": dominant_patch_id,
+        "dominant_patch_id": dominant_patch_id,
+        "touched_patch_ids": sorted(touched_patch_ids),
+        "touched_patch_count": len(touched_patch_ids),
+        "total_routed_length_by_patch": {str(pid): length_by_patch.get(pid, 0.0) for pid in sorted(touched_patch_ids)},
+        "layer_usage_by_patch": sorted(layer_usage.values(), key=lambda item: (item["patch_id"], item["layer"])),
+        "touched_layer_ids": sorted(layers),
+        "cross_patch": len(touched_patch_ids) > 1,
+    }
+
+
+def _edge_layers(edge: dict[str, Any]) -> list[str]:
+    geometry = edge.get("geometry", {}) if isinstance(edge.get("geometry"), dict) else {}
+    if edge.get("edge_kind") == "via_transition":
+        layers = [geometry.get("start", {}).get("layer"), geometry.get("end", {}).get("layer")]
+        return [str(layer) for layer in layers if layer]
+    layer = geometry.get("layer")
+    return [str(layer)] if layer else []
+
+
+def _routing_graph_terminal_matching_summary(pins: list[dict[str, Any]], vertices: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    exact = sum(1 for vertex in vertices if vertex.get("terminal_match", {}).get("match_status") == "exact_shape")
+    nearest = sum(1 for vertex in vertices if vertex.get("terminal_match", {}).get("match_status") == "nearest_same_net")
+    matched = exact + nearest
+    expected = len(pins)
+    unmatched = max(0, expected - matched)
+    return {"strategy": "exact_shape_then_nearest_same_net", "nearest_terminal_distance_threshold": threshold, "exact_match_count": exact, "nearest_match_count": nearest, "unmatched_count": unmatched, "matched_terminal_count": matched, "expected_terminal_count": expected, "terminal_match_rate": (matched / expected) if expected else None}
+
+
+def _routing_graph_semantics(vertices: list[dict[str, Any]], pins: list[dict[str, Any]]) -> dict[str, Any]:
+    role_by_pin = {str(pin.get("pin_key")): pin.get("connectivity_context", {}).get("pin_role") for pin in pins if isinstance(pin.get("connectivity_context"), dict)}
+    driver_refs = []
+    sink_refs = []
+    for vertex in vertices:
+        ref = vertex.get("terminal_ref")
+        if not isinstance(ref, dict):
+            continue
+        item = {"pin_key": ref.get("pin_key"), "vertex_id": vertex.get("vertex_id")}
+        role = role_by_pin.get(str(ref.get("pin_key"))) or ref.get("terminal_role")
+        if role == "driver":
+            driver_refs.append(item)
+        elif role == "sink":
+            sink_refs.append(item)
+    root_vertex_id = driver_refs[0]["vertex_id"] if len(driver_refs) == 1 else None
+    return {"topology_direction": "undirected", "root_vertex_id": root_vertex_id, "root_source": "driver_terminal_match" if root_vertex_id is not None else "unknown", "driver_terminal_refs": driver_refs, "sink_terminal_refs": sink_refs, "direction_annotation_source": "pins_connectivity_context" if pins else "missing_pin_context"}
+
+
+def _routing_graph_timing_context(net_name: str, net_record: dict[str, Any] | None) -> tuple[dict[str, Any], str | None]:
+    source_ctx = net_record.get("timing_context", {}) if isinstance(net_record, dict) and isinstance(net_record.get("timing_context"), dict) else {}
+    available = bool(source_ctx.get("available"))
+    path_refs = source_ctx.get("path_refs") if isinstance(source_ctx.get("path_refs"), list) else []
+    timing_path_count = int(source_ctx.get("timing_path_count") or len(path_refs) or 0)
+    context = {"available": available, "is_timing_critical_net": bool(source_ctx.get("is_on_critical_path") or path_refs), "timing_path_count": timing_path_count, "worst_slack_seen": source_ctx.get("worst_slack_seen"), "min_slack_seen": source_ctx.get("worst_slack_seen"), "max_criticality_seen": None, "path_refs": path_refs, "source": source_ctx.get("source")}
+    if not available:
+        return context, "missing_sta_artifact"
+    if timing_path_count == 0:
+        return context, "net_not_found_in_timing_paths"
+    return context, None
+
+
+def _routing_graph_detour_ratio(total_routed_length: float, net_record: dict[str, Any] | None) -> float | None:
+    hpwl = None
+    if isinstance(net_record, dict):
+        hpwl = net_record.get("geometry_proxy", {}).get("hpwl") if isinstance(net_record.get("geometry_proxy"), dict) else None
+    value = _to_float(hpwl)
+    if value and value > 0:
+        return total_routed_length / value
+    return None
+
+
+def _routing_graph_has_cycle(vertex_count: int, edges: list[tuple[int, int]]) -> bool:
+    parent = list(range(vertex_count))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        if a == b:
+            return True
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return True
+        parent[rb] = ra
+    return False
