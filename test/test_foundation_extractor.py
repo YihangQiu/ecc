@@ -2126,12 +2126,75 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
     assert cells[0]["usage_summary"]["instance_count"] >= 1
     assert vias[0]["identity"]["name"] == vias[0]["name"]
     assert "layer_stack" in vias[0]
+    assert tech_summary["schema_version"] == "iccd_full_v1.tech.v1"
+    assert tech_summary["profile"] == "iccd_full_v1"
+    assert tech_summary["source_coverage"] == {
+        "def_tracks": True,
+        "rt_log_layers": True,
+        "def_components": True,
+        "def_vias": True,
+        "lef": False,
+        "liberty": False,
+    }
     assert tech_summary["counts"] == {
         "layer_count": len(layers),
+        "routing_layer_count": 2,
+        "cut_layer_count": 1,
         "cell_count": len(cells),
         "via_count": len(vias),
         "stage_count": 5,
     }
+    assert tech_summary["milestones"] == {"m1": "available", "m2": "planned", "liberty": "reserved_not_parsed"}
+
+    met2 = next(layer for layer in layers if layer["name"] == "MET2")
+    assert met2["identity"]["is_routing_layer"] is True
+    assert met2["identity"]["is_cut_layer"] is False
+    assert met2["routing_properties"]["pitch"] == 100.0
+    assert met2["routing_properties"]["source"] == "def_tracks+rt_log"
+    assert met2["capacity_summary"]["estimated_track_count"] == 1
+    assert met2["capacity_summary"]["estimated_capacity"] == 0.01
+    assert met2["capacity_summary"]["capacity_formula"] == "estimated_track_count / pitch"
+    assert met2["capacity_summary"]["stage_track_variants"]
+    assert met2["capacity_summary"]["patch_capacity_ref"] == "foundation_data/ecc/vectors/patches/route.jsonl:native_demand_capacity_by_layer"
+    assert met2["stage_metadata"]["missing_stages"] == ["place", "CTS", "drc"]
+    assert met2["stage_metadata"]["stage_sources"]["route"] == ["def_routed_wires", "def_tracks", "def_vias", "rt_log"]
+    assert met2["source_refs"]["def"][0]["section"] == "TRACKS"
+    assert met2["source_refs"]["rt_log"][0]["parser"] == "rt_log"
+
+    via2 = next(layer for layer in layers if layer["name"] == "VIA2")
+    assert via2["identity"]["layer_type"] == "cut"
+    assert via2["identity"]["is_cut_layer"] is True
+
+    nand2 = next(cell for cell in cells if cell["name"] == "NAND2")
+    assert nand2["identity"]["is_macro"] is False
+    assert nand2["identity"]["is_physical_only"] is False
+    assert nand2["classification"]["is_buffer_like"] is False
+    assert nand2["classification"]["source"] == "heuristic_name_rule"
+    assert nand2["physical_properties"]["size_source"] in {"missing", "lef_macro_size"}
+    assert nand2["pin_summary"]["summary_source"] in {"def_net_terminals", "lef_macro_pins"}
+    assert nand2["usage_summary"]["first_seen_stage"] == "Floorplan"
+    assert nand2["usage_summary"]["route_only_usage"] is False
+    assert nand2["stage_metadata"]["missing_stages"] == ["CTS", "drc"]
+
+    via23 = next(via for via in vias if via["name"] == "VIA23")
+    assert via23["identity"]["via_type"] == "fixed"
+    assert via23["layer_stack"] == {
+        "layers": ["MET2", "VIA2", "MET3"],
+        "bottom_layer": "MET2",
+        "cut_layer": "VIA2",
+        "top_layer": "MET3",
+        "stack_source": "def_via_layers",
+    }
+    assert via23["geometry"]["geometry_status"] == "name_only"
+    assert via23["routing_properties"]["bottom_direction"] == "horizontal"
+    assert via23["routing_properties"]["top_direction"] == "vertical"
+    assert via23["routing_properties"]["is_direction_change"] is True
+    assert via23["usage_summary"]["total_usage_count"] == 1
+    assert via23["usage_summary"]["usage_source"] == "def_routed_wires"
+    assert via23["usage_summary"]["route_only_usage"] is True
+    assert via23["stage_metadata"]["stage_sources"]["route"] == ["def_routed_wires", "def_vias"]
+    assert via23["source_refs"]["liberty"] is None
+    assert via23["null_reason"]["geometry_bottom_rect"] == "via_geometry_not_available_from_def"
 
 
 def test_routing_graph_records_follow_vec_routing_graph_schema(tmp_path: Path):

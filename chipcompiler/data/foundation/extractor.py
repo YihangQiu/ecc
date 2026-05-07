@@ -12,7 +12,7 @@ from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resiz
 from .parsers.def_parser import DefData, DefNet, DefWire, parse_def
 from .parsers.drc_parser import parse_drc_artifacts
 from .parsers.gcell import parse_gcell_info
-from .parsers.lef_parser import LefMacro, parse_lef_files
+from .parsers.lef_parser import LefLayer, LefMacro, LefVia, parse_lef_libraries
 from .parsers.map_csv import read_numeric_csv, shape
 from .parsers.route_native_demand_capacity import parse_route_native_demand_capacity_artifacts
 from .parsers.rt_log import parse_rt_log
@@ -70,6 +70,8 @@ class FoundationExtractor:
         self._raw_refs: list[dict[str, Any]] = []
         self._exact_gcell_map_keys: set[tuple[str, str, str]] = set()
         self._lef_macros: dict[str, LefMacro] = {}
+        self._lef_layers: dict[str, LefLayer] = {}
+        self._lef_vias: dict[str, LefVia] = {}
 
     def extract(self, *, force: bool = False, stages: Any = "all", include_raw_refs: bool = True) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
@@ -168,10 +170,15 @@ class FoundationExtractor:
             self._mark("tech", "lef", "missing", "missing_pdk_root")
             return {}
         paths = sorted([*root.rglob("*.lef"), *root.rglob("*.tlef")])
-        macros = parse_lef_files(paths)
-        self._quality.setdefault("tech", {})["lef_macro_count"] = len(macros)
-        self._mark("tech", "lef", "available" if macros else "missing", "" if macros else "missing_lef_macros")
-        return macros
+        library = parse_lef_libraries(paths)
+        self._lef_layers = library.layers
+        self._lef_vias = library.vias
+        self._quality.setdefault("tech", {})["lef_macro_count"] = len(library.macros)
+        self._quality.setdefault("tech", {})["lef_layer_count"] = len(library.layers)
+        self._quality.setdefault("tech", {})["lef_via_count"] = len(library.vias)
+        has_lef_data = bool(library.macros or library.layers or library.vias)
+        self._mark("tech", "lef", "available" if has_lef_data else "missing", "" if has_lef_data else "missing_lef_records")
+        return library.macros
 
     def _collect_def_data(self, stages: list[StageInfo]) -> dict[str, DefData]:
         out: dict[str, DefData] = {}
@@ -535,118 +542,390 @@ class FoundationExtractor:
                 write_json(self.foundation_dir / "maps" / stage / f"{category}.json", payload)
 
     def _write_tech(self, def_data: dict[str, DefData], rt_logs: dict[str, dict[str, Any]], stages: list[StageInfo]) -> None:
-        layers_by_name: dict[str, dict[str, Any]] = {}
-        cells_by_name: dict[str, dict[str, Any]] = {}
-        vias_by_name: dict[str, dict[str, Any]] = {}
+        stage_names = [stage.name for stage in stages]
+        stage_order = {stage.name: idx for idx, stage in enumerate(stages)}
+        layer_items: dict[str, dict[str, Any]] = {}
+        cell_items: dict[str, dict[str, Any]] = {}
+        via_items: dict[str, dict[str, Any]] = {}
+        pin_names_by_master: dict[str, set[str]] = {}
+        pin_layers_by_master: dict[str, set[str]] = {}
+        pin_clock_by_master: dict[str, set[str]] = {}
+        pin_pg_by_master: dict[str, set[str]] = {}
+
         for stage_name, parsed in def_data.items():
             for track in parsed.tracks:
-                item = layers_by_name.setdefault(
-                    track.layer,
-                    {
-                        "name": track.layer,
-                        "track_axes": [],
-                        "preferred_direction": None,
-                        "source": "def_tracks",
-                        "stage_set": set(),
-                    },
-                )
+                item = layer_items.setdefault(track.layer, _empty_layer_item(track.layer))
                 item["track_axes"].append({"axis": track.axis, "start": track.start, "count": track.count, "step": track.step, "stage": stage_name})
-                item["stage_set"].add(stage_name)
+                item["stage_sources"].setdefault(stage_name, set()).add("def_tracks")
+                item["source_refs_def"].append({"path": _workspace_relative_path(parsed.path, self.workspace_dir), "stage": stage_name, "section": "TRACKS", "layer": track.layer})
             for component in parsed.components:
-                cell = cells_by_name.setdefault(
-                    component["master"],
-                    {"name": component["master"], "instance_count": 0, "stage_instance_counts": {}, "source": "def_components"},
-                )
-                cell["instance_count"] += 1
+                master = str(component["master"])
+                cell = cell_items.setdefault(master, {"name": master, "stage_instance_counts": {}, "source_refs_def": [], "bbox_sizes": []})
                 cell["stage_instance_counts"][stage_name] = cell["stage_instance_counts"].get(stage_name, 0) + 1
-            for via in parsed.vias:
-                vias_by_name.setdefault(via["name"], {**via, "usage_count": 0, "stage_usage_counts": {}})
+                cell["source_refs_def"].append({"path": _workspace_relative_path(parsed.path, self.workspace_dir), "stage": stage_name, "section": "COMPONENTS", "master": master})
+            component_master_by_name = {str(component.get("name")): str(component.get("master")) for component in parsed.components}
+            for pin in parsed.pins:
+                for shape in pin.get("shapes", []) or []:
+                    layer = shape.get("layer")
+                    if layer:
+                        layer_items.setdefault(str(layer), _empty_layer_item(str(layer)))["stage_sources"].setdefault(stage_name, set()).add("def_pin_layers")
             for net in parsed.nets:
+                for pin in net.pins:
+                    master = component_master_by_name.get(str(pin.get("instance")))
+                    if not master:
+                        continue
+                    pin_name = str(pin.get("pin_name"))
+                    pin_names_by_master.setdefault(master, set()).add(pin_name)
+                    if _is_clock_pin_name(pin_name):
+                        pin_clock_by_master.setdefault(master, set()).add(pin_name)
+                    if _is_power_ground_pin_name(pin_name):
+                        pin_pg_by_master.setdefault(master, set()).add(pin_name)
                 for wire in net.wires:
+                    if wire.layer:
+                        layer_items.setdefault(wire.layer, _empty_layer_item(wire.layer))["stage_sources"].setdefault(stage_name, set()).add("def_routed_wires")
                     if wire.via:
-                        via = vias_by_name.setdefault(wire.via, {"name": wire.via, "layers": [], "source": "def_routed_wires", "usage_count": 0, "stage_usage_counts": {}})
+                        via = via_items.setdefault(wire.via, _empty_via_item(wire.via, source="def_routed_wires"))
                         via["usage_count"] = int(via.get("usage_count", 0)) + 1
                         via["stage_usage_counts"][stage_name] = via["stage_usage_counts"].get(stage_name, 0) + 1
-        for parsed in rt_logs.values():
+                        via["stage_sources"].setdefault(stage_name, set()).add("def_routed_wires")
+                        via["source_refs_def"].append({"path": _workspace_relative_path(parsed.path, self.workspace_dir), "stage": stage_name, "section": "NETS" if not net.special else "SPECIALNETS", "via": wire.via})
+                        inferred_layers = _infer_via_stack_layers_from_name(wire.via, layer_items)
+                        if inferred_layers and not via.get("layers"):
+                            via["layers"] = inferred_layers
+                            via["stack_source"] = "heuristic_from_name"
+            for via in parsed.vias:
+                name = str(via.get("name"))
+                item = via_items.setdefault(name, _empty_via_item(name, source="def_vias"))
+                item["source"] = "def_vias" if item.get("source") != "def_routed_wires" else item.get("source")
+                if via.get("layers"):
+                    item["layers"] = list(via.get("layers") or [])
+                    item["stack_source"] = "def_via_layers"
+                if via.get("rects_by_layer"):
+                    item["rects_by_layer"] = via.get("rects_by_layer") or {}
+                item["stage_definition_counts"][stage_name] = item["stage_definition_counts"].get(stage_name, 0) + 1
+                item["stage_sources"].setdefault(stage_name, set()).add("def_vias")
+                item["source_refs_def"].append({"path": _workspace_relative_path(parsed.path, self.workspace_dir), "stage": stage_name, "section": "VIAS", "via": name})
+                for layer in item.get("layers") or []:
+                    layer_items.setdefault(str(layer), _empty_layer_item(str(layer)))["stage_sources"].setdefault(stage_name, set()).add("def_vias")
+
+        for stage_name, parsed in rt_logs.items():
             for layer in parsed.get("layers", []):
-                item = layers_by_name.setdefault(
-                    layer["name"],
-                    {"name": layer["name"], "track_axes": [], "source": "rt_log", "stage_set": set()},
-                )
-                item["preferred_direction"] = layer.get("preferred_direction")
+                name = str(layer.get("name"))
+                item = layer_items.setdefault(name, _empty_layer_item(name))
+                item["preferred_direction"] = _normalize_direction(layer.get("preferred_direction"))
                 item["order"] = layer.get("order")
-        layer_records = []
-        for idx, item in enumerate(sorted(layers_by_name.values(), key=lambda value: str(value.get("name")))):
-            stage_set = sorted(item.pop("stage_set", set()))
-            axes = item.get("track_axes", [])
-            track_count_by_axis: dict[str, int] = {}
-            for axis in axes:
-                axis_name = str(axis.get("axis"))
-                track_count_by_axis[axis_name] = max(track_count_by_axis.get(axis_name, 0), int(axis.get("count") or 0))
-            layer_records.append({
-                "id": idx,
-                "name": item["name"],
-                "track_axes": axes,
-                "preferred_direction": item.get("preferred_direction"),
-                "order": item.get("order"),
-                "source": item.get("source"),
-                "identity": {"name": item["name"], "layer_key": item["name"], "order": item.get("order"), "layer_type": "routing", "classification_source": "rt_log_or_def_tracks"},
-                "routing_properties": {"preferred_direction": item.get("preferred_direction"), "track_axes": axes, "track_count_by_axis": track_count_by_axis},
-                "capacity_summary": {"estimated_track_count": sum(track_count_by_axis.values()) if track_count_by_axis else None, "source": "def_tracks" if axes else None},
-                "stage_metadata": {"available_stages": stage_set, "stage_count": len(stage_set)},
-                "source_refs": {"def": "stage_def_tracks" if axes else None, "rt_log": "stage_rt_log" if item.get("source") == "rt_log" else None, "lef": None, "liberty": None},
-                "null_reason": {"source_refs_lef": "lef_not_parsed", "source_refs_liberty": "liberty_reserved_not_parsed"},
-            })
-        cell_records = []
-        for idx, item in enumerate(sorted(cells_by_name.values(), key=lambda value: str(value.get("name")))):
-            name = str(item["name"])
-            stage_counts = item.get("stage_instance_counts", {})
-            lef_macro = self._lef_macros.get(name)
-            lef_source = lef_macro.source if lef_macro is not None else None
-            cell_records.append({
-                "id": idx,
-                "name": name,
-                "instance_count": item.get("instance_count", 0),
-                "source": item.get("source"),
-                "identity": {"name": name, "cell_key": name, "cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "classification_source": "heuristic_name_rule"},
-                "classification": {"cell_class": _cell_class(name, name), "physical_class": _physical_class(name, name), "is_clock_related": _is_clock_related(name, name), "is_physical_only": _is_physical_only_cell_name(name, name)},
-                "physical_properties": {"observed_bbox_stats": None, "source": "def_components_only"},
-                "pin_summary": {"pin_count": len(lef_macro.pins) if lef_macro is not None else None, "source": "lef_macro_pins" if lef_macro is not None else "lef_missing_macro"},
-                "usage_summary": {"instance_count": item.get("instance_count", 0), "stage_instance_counts": stage_counts},
-                "stage_metadata": {"available_stages": sorted(stage_counts), "stage_count": len(stage_counts)},
-                "source_refs": {"def": "stage_def_components", "lef": lef_source, "liberty": None},
-                "null_reason": {**({} if lef_macro is not None else {"lef": "missing_lef_macro"}), "liberty": "liberty_reserved_not_parsed"},
-            })
-        via_records = []
-        for idx, item in enumerate(sorted(vias_by_name.values(), key=lambda value: str(value.get("name")))):
-            layers = item.get("layers", [])
-            usage_counts = item.get("stage_usage_counts", {})
-            via_records.append({
-                "id": idx,
-                "name": item["name"],
-                "layers": layers,
-                "source": item.get("source"),
-                "identity": {"name": item["name"], "via_key": item["name"], "classification_source": item.get("source")},
-                "layer_stack": {"layers": layers, "bottom_layer": layers[0] if layers else None, "cut_layer": layers[1] if len(layers) > 2 else None, "top_layer": layers[-1] if layers else None},
-                "geometry": {"available": False, "source": None},
-                "routing_properties": {"is_direction_change": None},
-                "usage_summary": {"usage_count": item.get("usage_count", 0), "stage_usage_counts": usage_counts, "route_only_usage": True},
-                "stage_metadata": {"available_stages": sorted(usage_counts), "stage_count": len(usage_counts)},
-                "source_refs": {"def": "stage_def_vias_or_wires", "lef": None},
-                "null_reason": {"geometry": "via_rect_not_parsed", "lef": "lef_not_parsed"},
-            })
+                item["stage_sources"].setdefault(stage_name, set()).add("rt_log")
+                item["source_refs_rt_log"].append({"path": _workspace_relative_path(parsed.get("source"), self.workspace_dir), "parser": "rt_log", "stage": stage_name})
+
+        for name, lef_layer in self._lef_layers.items():
+            item = layer_items.setdefault(name, _empty_layer_item(name))
+            item["lef_layer"] = lef_layer
+            item["stage_sources"].setdefault("library", set()).add("lef_layer")
+        for name, lef_via in self._lef_vias.items():
+            item = via_items.setdefault(name, _empty_via_item(name, source="lef_via"))
+            if lef_via.layers:
+                item["layers"] = list(lef_via.layers)
+                item["stack_source"] = "lef_via_layers"
+            if lef_via.rects_by_layer:
+                item["rects_by_layer"] = lef_via.rects_by_layer
+            item["lef_via"] = lef_via
+            item["stage_sources"].setdefault("library", set()).add("lef_via")
+
+        layer_records = self._tech_layer_records(layer_items, stage_names)
+        layer_direction_by_name = {record["name"]: record["routing_properties"].get("preferred_direction") for record in layer_records}
+        layer_order_by_name = {record["name"]: record["identity"].get("order") for record in layer_records}
+        cell_records = self._tech_cell_records(cell_items, pin_names_by_master, pin_layers_by_master, pin_clock_by_master, pin_pg_by_master, stage_names, stage_order)
+        via_records = self._tech_via_records(via_items, layer_direction_by_name, layer_order_by_name, stage_names)
+        routing_layer_count = sum(1 for record in layer_records if record["identity"].get("is_routing_layer"))
+        cut_layer_count = sum(1 for record in layer_records if record["identity"].get("is_cut_layer"))
+        source_coverage = {
+            "def_tracks": any(parsed.tracks for parsed in def_data.values()),
+            "rt_log_layers": any(parsed.get("layers") for parsed in rt_logs.values()),
+            "def_components": any(parsed.components for parsed in def_data.values()),
+            "def_vias": any(parsed.vias or any(wire.via for net in parsed.nets for wire in net.wires) for parsed in def_data.values()),
+            "lef": bool(self._lef_macros or self._lef_layers or self._lef_vias),
+            "liberty": False,
+        }
         write_json(self.foundation_dir / "vectors" / "tech" / "layers.json", layer_records)
         write_json(self.foundation_dir / "vectors" / "tech" / "cells.json", cell_records)
         write_json(self.foundation_dir / "vectors" / "tech" / "vias.json", via_records)
-        write_json(self.foundation_dir / "vectors" / "tech" / "tech_summary.json", {
-            "counts": {"layer_count": len(layer_records), "cell_count": len(cell_records), "via_count": len(via_records), "stage_count": len(stages)},
-            "canonical_grid_ref": "foundation_data/ecc/canonical_grid.json",
-            "quality_flags": [],
-            "source_refs": {"lef": None, "liberty": None},
-        })
+        write_json(
+            self.foundation_dir / "vectors" / "tech" / "tech_summary.json",
+            {
+                "schema_version": "iccd_full_v1.tech.v1",
+                "profile": self.profile,
+                "source_coverage": source_coverage,
+                "counts": {
+                    "layer_count": len(layer_records),
+                    "routing_layer_count": routing_layer_count,
+                    "cut_layer_count": cut_layer_count,
+                    "cell_count": len(cell_records),
+                    "via_count": len(via_records),
+                    "stage_count": len(stages),
+                },
+                "canonical_grid_ref": "foundation_data/ecc/canonical_grid.json",
+                "milestones": {
+                    "m1": "available" if any(source_coverage[key] for key in ("def_tracks", "rt_log_layers", "def_components", "def_vias")) else "missing",
+                    "m2": "available" if source_coverage["lef"] else "planned",
+                    "liberty": "reserved_not_parsed",
+                },
+                "quality_flags": [],
+                "source_refs": {"lef": None, "liberty": None},
+            },
+        )
         self._mark("tech", "layers", "available" if layer_records else "missing", "" if layer_records else "missing_def_or_rt_layers")
         self._mark("tech", "cells", "available" if cell_records else "missing", "" if cell_records else "missing_def_components")
         self._mark("tech", "vias", "available" if via_records else "missing", "" if via_records else "missing_def_vias")
+
+    def _tech_layer_records(self, layer_items: dict[str, dict[str, Any]], stage_names: list[str]) -> list[dict[str, Any]]:
+        records = []
+        for idx, item in enumerate(sorted(layer_items.values(), key=lambda value: (_layer_order_sort_key(value), str(value.get("name"))))):
+            name = str(item["name"])
+            lef_layer = item.get("lef_layer")
+            layer_type = _layer_type(name, lef_layer)
+            is_routing = layer_type == "routing"
+            is_cut = layer_type == "cut"
+            axes = _unique_dicts(item.get("track_axes", []), keys=("axis", "start", "count", "step", "stage"))
+            track_count_by_axis: dict[str, int] = {}
+            steps_by_axis: dict[str, list[float]] = {}
+            for axis in axes:
+                axis_name = str(axis.get("axis"))
+                track_count_by_axis[axis_name] = max(track_count_by_axis.get(axis_name, 0), int(axis.get("count") or 0))
+                if axis.get("step") is not None:
+                    steps_by_axis.setdefault(axis_name, []).append(float(axis["step"]))
+            preferred_direction = _normalize_direction(item.get("preferred_direction")) or _normalize_direction(getattr(lef_layer, "direction", None)) or ("unknown" if is_routing else None)
+            pitch = _layer_pitch_from_tracks(preferred_direction, steps_by_axis) or getattr(lef_layer, "pitch", None)
+            order = item.get("order") if item.get("order") is not None else _layer_order_from_name(name)
+            estimated_track_count = _estimated_track_count(preferred_direction, track_count_by_axis)
+            estimated_capacity = (estimated_track_count / pitch) if estimated_track_count is not None and pitch not in (None, 0) else estimated_track_count
+            stage_sources = _stage_sources(item.get("stage_sources", {}), stage_names)
+            available_stages = sorted([stage for stage in stage_names if stage_sources.get(stage)])
+            null_reason = {
+                "source_refs_liberty": "liberty_reserved_not_parsed",
+                "patch_capacity_ref": "stored_in_patch_vectors_or_not_available",
+            }
+            if getattr(lef_layer, "width", None) is None:
+                null_reason["routing_properties_width"] = "lef_not_parsed_in_m1" if lef_layer is None else "missing_lef_layer_width"
+            if getattr(lef_layer, "spacing", None) is None:
+                null_reason["routing_properties_spacing"] = "lef_not_parsed_in_m1" if lef_layer is None else "missing_lef_layer_spacing"
+            if pitch is None:
+                null_reason["routing_properties_pitch"] = "missing_def_track_step"
+            record = {
+                "id": idx,
+                "name": name,
+                "identity": {
+                    "layer_key": name,
+                    "name": name,
+                    "layer_type": layer_type,
+                    "order": order,
+                    "is_routing_layer": is_routing,
+                    "is_cut_layer": is_cut,
+                    "classification_source": "lef_layer_type" if lef_layer and getattr(lef_layer, "layer_type", None) else "rt_log" if item.get("source_refs_rt_log") else "heuristic_name_rule",
+                },
+                "routing_properties": {
+                    "preferred_direction": preferred_direction,
+                    "pitch": pitch,
+                    "track_axes": axes,
+                    "track_count_by_axis": track_count_by_axis,
+                    "width": getattr(lef_layer, "width", None),
+                    "spacing": getattr(lef_layer, "spacing", None),
+                    "source": _join_sources(["def_tracks" if axes else None, "rt_log" if item.get("source_refs_rt_log") else None, "lef_layer" if lef_layer else None]),
+                },
+                "capacity_summary": {
+                    "estimated_track_count": estimated_track_count,
+                    "estimated_capacity": estimated_capacity,
+                    "capacity_formula": "estimated_track_count / pitch" if estimated_track_count is not None and pitch not in (None, 0) else "track_count_proxy_from_def_tracks" if estimated_track_count is not None else None,
+                    "stage_track_variants": _stage_track_variants(axes),
+                    "patch_capacity_ref": "foundation_data/ecc/vectors/patches/route.jsonl:native_demand_capacity_by_layer" if is_routing else None,
+                },
+                "stage_metadata": {
+                    "available_stages": available_stages,
+                    "missing_stages": [stage for stage in stage_names if stage not in available_stages],
+                    "stage_sources": stage_sources,
+                    "stage_track_variants": _stage_track_variants(axes),
+                },
+                "source_refs": {
+                    "def": _unique_dicts(item.get("source_refs_def", []), keys=("path", "section", "stage", "layer")),
+                    "rt_log": _unique_dicts(item.get("source_refs_rt_log", []), keys=("path", "parser", "stage")),
+                    "lef": _workspace_relative_path(getattr(lef_layer, "source", None), self.workspace_dir) if lef_layer and getattr(lef_layer, "source", None) else None,
+                    "liberty": None,
+                    "derived_from_vectors": None,
+                },
+                "null_reason": null_reason,
+            }
+            records.append(record)
+        return records
+
+    def _tech_cell_records(
+        self,
+        cell_items: dict[str, dict[str, Any]],
+        pin_names_by_master: dict[str, set[str]],
+        pin_layers_by_master: dict[str, set[str]],
+        pin_clock_by_master: dict[str, set[str]],
+        pin_pg_by_master: dict[str, set[str]],
+        stage_names: list[str],
+        stage_order: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        records = []
+        for idx, item in enumerate(sorted(cell_items.values(), key=lambda value: str(value.get("name")))):
+            name = str(item["name"])
+            lef_macro = self._lef_macros.get(name)
+            stage_counts = dict(sorted(item.get("stage_instance_counts", {}).items(), key=lambda pair: stage_order.get(pair[0], 999)))
+            available_stages = list(stage_counts)
+            physical_class = _physical_class_from_lef_or_name(name, lef_macro)
+            cell_class = _cell_class(name, name)
+            is_physical_only = physical_class == "physical_only"
+            is_macro = physical_class == "macro"
+            size = getattr(lef_macro, "size", None) if lef_macro else None
+            pin_names = set(pin_names_by_master.get(name, set()))
+            pin_layers = set(pin_layers_by_master.get(name, set()))
+            pin_shape_count = None
+            signal_pin_count = None
+            pg_pin_count = None
+            clock_pin_count = None
+            pin_summary_source = "def_net_terminals" if pin_names else "missing"
+            if lef_macro is not None:
+                pin_names = set(lef_macro.pins)
+                pin_layers = {str(shape.get("layer")) for pin in lef_macro.pins.values() for shape in pin.shapes if shape.get("layer")}
+                pin_shape_count = sum(len(pin.shapes) for pin in lef_macro.pins.values())
+                pg_pin_count = sum(1 for pin in lef_macro.pins.values() if _is_power_ground_pin_name(pin.name) or str(pin.use or "").upper() in {"POWER", "GROUND"})
+                clock_pin_count = sum(1 for pin in lef_macro.pins.values() if _is_clock_pin_name(pin.name))
+                signal_pin_count = max(len(lef_macro.pins) - pg_pin_count, 0)
+                pin_summary_source = "lef_macro_pins"
+            else:
+                pg_pin_count = len(pin_pg_by_master.get(name, set())) if pin_names else None
+                clock_pin_count = len(pin_clock_by_master.get(name, set())) if pin_names else None
+                signal_pin_count = max(len(pin_names) - (pg_pin_count or 0), 0) if pin_names else None
+            null_reason = {"source_refs_liberty": "liberty_reserved_not_parsed"}
+            if size is None:
+                null_reason["physical_properties_width"] = "lef_not_parsed_and_no_bbox_estimate"
+                null_reason["physical_properties_height"] = "lef_not_parsed_and_no_bbox_estimate"
+            if not pin_layers:
+                null_reason["pin_summary_pin_layers"] = "lef_not_parsed_in_m1" if lef_macro is None else "missing_lef_pin_layers"
+            record = {
+                "id": idx,
+                "name": name,
+                "identity": {
+                    "cell_key": name,
+                    "name": name,
+                    "library": _library_from_lef_source(getattr(lef_macro, "source", None)) if lef_macro else None,
+                    "site": getattr(lef_macro, "site", None) if lef_macro else None,
+                    "is_macro": is_macro,
+                    "is_physical_only": is_physical_only,
+                    "classification_source": "lef_macro_class" if lef_macro and getattr(lef_macro, "macro_class", None) else "heuristic_name_rule",
+                },
+                "classification": {
+                    "cell_class": cell_class,
+                    "physical_class": physical_class,
+                    "is_clock_related": _is_clock_related(name, name),
+                    "is_buffer_like": _is_buffer_like_cell_name(name, name),
+                    "source": "lef_macro_class" if lef_macro and getattr(lef_macro, "macro_class", None) else "heuristic_name_rule",
+                },
+                "physical_properties": {
+                    "width": size.get("width") if isinstance(size, dict) else None,
+                    "height": size.get("height") if isinstance(size, dict) else None,
+                    "area": (size.get("width") * size.get("height")) if isinstance(size, dict) and size.get("width") is not None and size.get("height") is not None else None,
+                    "size_source": "lef_macro_size" if isinstance(size, dict) else "missing",
+                    "observed_bbox_stats": None,
+                },
+                "pin_summary": {
+                    "pin_count": len(pin_names) if pin_names else None,
+                    "signal_pin_count": signal_pin_count,
+                    "clock_pin_count": clock_pin_count,
+                    "power_ground_pin_count": pg_pin_count,
+                    "pin_layers": sorted(pin_layers),
+                    "pin_shape_count": pin_shape_count,
+                    "summary_source": pin_summary_source,
+                },
+                "usage_summary": {
+                    "instance_count": sum(stage_counts.values()),
+                    "stage_instance_counts": stage_counts,
+                    "first_seen_stage": min(stage_counts, key=lambda stage: stage_order.get(stage, 999)) if stage_counts else None,
+                    "route_only_usage": False,
+                },
+                "stage_metadata": {
+                    "available_stages": available_stages,
+                    "missing_stages": [stage for stage in stage_names if stage not in available_stages],
+                    "stage_instance_counts": stage_counts,
+                },
+                "source_refs": {
+                    "def": _unique_dicts(item.get("source_refs_def", []), keys=("path", "section", "stage", "master")),
+                    "lef": _workspace_relative_path(getattr(lef_macro, "source", None), self.workspace_dir) if lef_macro and getattr(lef_macro, "source", None) else None,
+                    "liberty": None,
+                    "derived_from_vectors": None,
+                },
+                "null_reason": null_reason,
+            }
+            records.append(record)
+        return records
+
+    def _tech_via_records(
+        self,
+        via_items: dict[str, dict[str, Any]],
+        layer_direction_by_name: dict[str, str | None],
+        layer_order_by_name: dict[str, Any],
+        stage_names: list[str],
+    ) -> list[dict[str, Any]]:
+        records = []
+        for idx, item in enumerate(sorted(via_items.values(), key=lambda value: str(value.get("name")))):
+            name = str(item["name"])
+            layers = list(item.get("layers") or [])
+            if not layers:
+                layers = _infer_via_stack_layers_from_name(name, {layer: {} for layer in layer_direction_by_name})
+            layer_stack = _via_layer_stack(layers, layer_order_by_name, item.get("stack_source") or ("heuristic_from_name" if layers else "missing"))
+            rects_by_layer = item.get("rects_by_layer") or {}
+            geometry = _via_geometry(layer_stack, rects_by_layer)
+            usage_counts = dict(sorted(item.get("stage_usage_counts", {}).items(), key=lambda pair: stage_names.index(pair[0]) if pair[0] in stage_names else 999))
+            stage_sources = _stage_sources(item.get("stage_sources", {}), stage_names)
+            available_stages = sorted([stage for stage in stage_names if stage_sources.get(stage) or usage_counts.get(stage)])
+            bottom_direction = layer_direction_by_name.get(layer_stack.get("bottom_layer"))
+            top_direction = layer_direction_by_name.get(layer_stack.get("top_layer"))
+            route_only_usage = bool(usage_counts)
+            null_reason = {"source_refs_liberty": "liberty_reserved_not_parsed"}
+            if geometry["geometry_status"] in {"name_only", "missing"}:
+                null_reason["geometry_bottom_rect"] = "via_geometry_not_available_from_def"
+                null_reason["geometry_cut_rect"] = "via_geometry_not_available_from_def"
+                null_reason["geometry_top_rect"] = "via_geometry_not_available_from_def"
+            if not usage_counts:
+                null_reason["usage_summary_stage_usage_counts"] = "route_usage_not_computed"
+            record = {
+                "id": idx,
+                "name": name,
+                "identity": {
+                    "via_key": name,
+                    "name": name,
+                    "via_type": "fixed" if item.get("source") == "def_vias" or item.get("stack_source") in {"def_via_layers", "lef_via_layers"} else "routed_wire_reference" if item.get("source") == "def_routed_wires" else "unknown",
+                    "classification_source": item.get("source") or "heuristic_name_rule",
+                },
+                "layer_stack": layer_stack,
+                "geometry": geometry,
+                "routing_properties": {
+                    "bottom_direction": bottom_direction,
+                    "top_direction": top_direction,
+                    "is_direction_change": (bottom_direction != top_direction) if bottom_direction and top_direction else None,
+                },
+                "usage_summary": {
+                    "stage_usage_counts": usage_counts,
+                    "total_usage_count": sum(usage_counts.values()),
+                    "route_only_usage": route_only_usage,
+                    "usage_source": "def_routed_wires" if usage_counts else "not_computed",
+                },
+                "stage_metadata": {
+                    "available_stages": available_stages,
+                    "missing_stages": [stage for stage in stage_names if stage not in available_stages],
+                    "stage_sources": stage_sources,
+                    "stage_usage_counts": usage_counts,
+                },
+                "source_refs": {
+                    "def": _unique_dicts(item.get("source_refs_def", []), keys=("path", "section", "stage", "via")),
+                    "lef": _workspace_relative_path(getattr(item.get("lef_via"), "source", None), self.workspace_dir) if item.get("lef_via") else None,
+                    "liberty": None,
+                    "derived_from_vectors": None,
+                },
+                "null_reason": null_reason,
+            }
+            records.append(record)
+        return records
 
     def _write_vectors(
         self,
@@ -4824,7 +5103,9 @@ def _via_layers_by_name(parsed_def: DefData) -> dict[str, tuple[str, str]]:
 
 
 def _resolve_via_transition_layers(wire: DefWire, wires: list[DefWire], index: int, via_layers: dict[str, tuple[str, str]]) -> tuple[str, str]:
-    fallback = via_layers.get(str(wire.via or "")) or _infer_via_layers_from_name(str(wire.via or ""))
+    fallback = via_layers.get(str(wire.via or ""))
+    if not fallback:
+        fallback = _infer_routing_transition_layers_from_via_name(str(wire.via or ""))
     previous_layer = next((wires[pos].layer for pos in range(index - 1, -1, -1) if not wires[pos].via), None)
     next_layer = next((wires[pos].layer for pos in range(index + 1, len(wires)) if not wires[pos].via), None)
     if fallback:
@@ -4838,7 +5119,7 @@ def _resolve_via_transition_layers(wire: DefWire, wires: list[DefWire], index: i
     return wire.layer, f"{wire.layer}_via_unknown_target"
 
 
-def _infer_via_layers_from_name(via_name: str) -> tuple[str, str] | None:
+def _infer_routing_transition_layers_from_via_name(via_name: str) -> tuple[str, str] | None:
     metals = re.findall(r"MET\d+", via_name.upper())
     if len(metals) >= 2:
         unique = sorted(set(metals), key=lambda item: int(re.search(r"\d+", item).group(0)))
@@ -5052,3 +5333,222 @@ def _routing_graph_has_cycle(vertex_count: int, edges: list[tuple[int, int]]) ->
             return True
         parent[rb] = ra
     return False
+
+
+def _empty_layer_item(name: str) -> dict[str, Any]:
+    return {"name": name, "track_axes": [], "stage_sources": {}, "source_refs_def": [], "source_refs_rt_log": []}
+
+
+def _empty_via_item(name: str, *, source: str) -> dict[str, Any]:
+    return {"name": name, "layers": [], "source": source, "usage_count": 0, "stage_usage_counts": {}, "stage_definition_counts": {}, "stage_sources": {}, "source_refs_def": []}
+
+
+def _normalize_direction(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"h", "horizontal"}:
+        return "horizontal"
+    if text in {"v", "vertical"}:
+        return "vertical"
+    if text:
+        return "unknown"
+    return None
+
+
+def _layer_type(name: str, lef_layer: Any = None) -> str:
+    lef_type = getattr(lef_layer, "layer_type", None)
+    if lef_type:
+        normalized = str(lef_type).lower()
+        if normalized == "routing":
+            return "routing"
+        if normalized == "cut":
+            return "cut"
+        if normalized == "masterslice":
+            return "masterslice"
+        if normalized == "implant":
+            return "implant"
+        return normalized
+    upper = name.upper()
+    if upper.startswith(("MET", "M")) or upper in {"RDL", "T4M2"}:
+        return "routing"
+    if "VIA" in upper or upper in {"CT", "RV", "T4V2"}:
+        return "cut"
+    return "unknown"
+
+
+def _layer_order_from_name(name: str) -> int | None:
+    upper = name.upper()
+    if upper == "CT":
+        return 5
+    if upper.startswith("VIA"):
+        digits = re.findall(r"\d+", upper)
+        return int(digits[0]) * 2 + 6 if digits else None
+    if upper.startswith("MET"):
+        digits = re.findall(r"\d+", upper)
+        return int(digits[0]) * 2 + 5 if digits else None
+    if upper == "T4V2":
+        return 16
+    if upper == "T4M2":
+        return 17
+    if upper == "RV":
+        return 18
+    if upper == "RDL":
+        return 19
+    return None
+
+
+def _layer_order_sort_key(item: dict[str, Any]) -> int:
+    value = item.get("order")
+    if value is None:
+        value = _layer_order_from_name(str(item.get("name", "")))
+    return int(value) if value is not None else 10_000
+
+
+def _layer_pitch_from_tracks(preferred_direction: str | None, steps_by_axis: dict[str, list[float]]) -> float | None:
+    axis = "Y" if preferred_direction == "horizontal" else "X" if preferred_direction == "vertical" else None
+    candidates = steps_by_axis.get(axis or "", []) if axis else [step for values in steps_by_axis.values() for step in values]
+    if not candidates:
+        return None
+    return sorted(candidates)[len(candidates) // 2]
+
+
+def _estimated_track_count(preferred_direction: str | None, track_count_by_axis: dict[str, int]) -> int | None:
+    if not track_count_by_axis:
+        return None
+    axis = "Y" if preferred_direction == "horizontal" else "X" if preferred_direction == "vertical" else None
+    if axis and axis in track_count_by_axis:
+        return track_count_by_axis[axis]
+    return max(track_count_by_axis.values())
+
+
+def _stage_track_variants(axes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    variants: dict[tuple[Any, Any, Any, Any], set[str]] = {}
+    for axis in axes:
+        key = (axis.get("axis"), axis.get("start"), axis.get("count"), axis.get("step"))
+        variants.setdefault(key, set()).add(str(axis.get("stage")))
+    return [
+        {"axis": key[0], "start": key[1], "count": key[2], "step": key[3], "stages": sorted(stages)}
+        for key, stages in sorted(variants.items(), key=lambda item: tuple(str(part) for part in item[0]))
+    ]
+
+
+def _stage_sources(raw: dict[str, Any], stage_names: list[str]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for stage in [*stage_names, "library"]:
+        values = raw.get(stage)
+        if values:
+            result[stage] = sorted(str(value) for value in values)
+    return result
+
+
+def _join_sources(values: list[str | None]) -> str | None:
+    present = [value for value in values if value]
+    return "+".join(present) if present else None
+
+
+def _unique_dicts(items: list[dict[str, Any]], *, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    out = []
+    for item in items:
+        key = tuple(item.get(k) for k in keys)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({k: item.get(k) for k in keys if k in item and item.get(k) is not None})
+    return out
+
+
+def _physical_class_from_lef_or_name(name: str, lef_macro: Any = None) -> str:
+    macro_class = str(getattr(lef_macro, "macro_class", "") or "").upper()
+    if macro_class in {"BLOCK", "RING", "COVER"}:
+        return "macro"
+    if macro_class in {"PAD", "ENDCAP"}:
+        return "io" if macro_class == "PAD" else "physical_only"
+    return _physical_class(name, name)
+
+
+def _is_buffer_like_cell_name(name: str, master: str) -> bool:
+    lower = f"{name} {master}".lower()
+    return any(token in lower for token in ("buf", "inv", "clkbuf", "fanout"))
+
+
+def _is_clock_pin_name(name: str) -> bool:
+    lower = name.lower()
+    return lower in {"clk", "clock", "ck"} or "clk" in lower or "clock" in lower
+
+
+def _is_power_ground_pin_name(name: str) -> bool:
+    lower = name.lower()
+    return lower.startswith(("vdd", "vss", "vcc", "gnd", "power", "ground")) or lower in {"vpwr", "vgnd"}
+
+
+def _library_from_lef_source(source: Any) -> str | None:
+    if not source:
+        return None
+    return Path(str(source)).stem
+
+
+def _infer_via_stack_layers_from_name(name: str, layer_items: dict[str, Any] | None = None) -> list[str]:
+    layer_items = layer_items or {}
+    upper = name.upper()
+    metals = re.findall(r"MET\d+", upper)
+    if len(metals) >= 2:
+        ordered = sorted(set(metals), key=lambda item: _layer_order_from_name(item) or 0)
+        via_digits = re.findall(r"VIA(\d+)", upper)
+        cut = f"VIA{via_digits[-1]}" if via_digits else _cut_between_routing_layers(ordered[0], ordered[-1])
+        return [ordered[0], cut, ordered[-1]] if cut else ordered
+    via_digits = re.findall(r"VIA(\d+)", upper)
+    if via_digits:
+        bottom = f"MET{via_digits[-1]}"
+        top = f"MET{int(via_digits[-1]) + 1}"
+        if bottom in layer_items or top in layer_items:
+            return [bottom, f"VIA{via_digits[-1]}", top]
+    return []
+
+
+def _cut_between_routing_layers(bottom: str, top: str) -> str | None:
+    bottom_digits = re.findall(r"\d+", bottom)
+    top_digits = re.findall(r"\d+", top)
+    if bottom_digits and top_digits and int(top_digits[0]) == int(bottom_digits[0]) + 1:
+        return f"VIA{bottom_digits[0]}"
+    return None
+
+
+def _via_layer_stack(layers: list[str], layer_order_by_name: dict[str, Any], stack_source: str) -> dict[str, Any]:
+    routing_layers = [layer for layer in layers if _layer_type(layer) == "routing"]
+    cut_layers = [layer for layer in layers if _layer_type(layer) == "cut"]
+    routing_layers = sorted(routing_layers, key=lambda layer: layer_order_by_name.get(layer) if layer_order_by_name.get(layer) is not None else _layer_order_from_name(layer) or 10_000)
+    return {
+        "layers": layers,
+        "bottom_layer": routing_layers[0] if routing_layers else None,
+        "cut_layer": cut_layers[0] if cut_layers else None,
+        "top_layer": routing_layers[-1] if routing_layers else None,
+        "stack_source": stack_source,
+    }
+
+
+def _via_geometry(layer_stack: dict[str, Any], rects_by_layer: dict[str, list[dict[str, float]]]) -> dict[str, Any]:
+    bottom_rect = _first_rect(rects_by_layer, layer_stack.get("bottom_layer"))
+    cut_rect = _first_rect(rects_by_layer, layer_stack.get("cut_layer"))
+    top_rect = _first_rect(rects_by_layer, layer_stack.get("top_layer"))
+    cut_count = len(rects_by_layer.get(str(layer_stack.get("cut_layer")), [])) if layer_stack.get("cut_layer") else None
+    if cut_count == 0:
+        cut_count = None
+    status = "exact" if bottom_rect and cut_rect and top_rect else "partial" if any([bottom_rect, cut_rect, top_rect]) else "name_only" if layer_stack.get("layers") else "missing"
+    return {
+        "bottom_rect": bottom_rect,
+        "cut_rect": cut_rect,
+        "top_rect": top_rect,
+        "row": None,
+        "col": None,
+        "cut_count": cut_count,
+        "geometry_status": status,
+    }
+
+
+def _first_rect(rects_by_layer: dict[str, list[dict[str, float]]], layer: Any) -> dict[str, float] | None:
+    if not layer:
+        return None
+    rects = rects_by_layer.get(str(layer)) or []
+    return rects[0] if rects else None

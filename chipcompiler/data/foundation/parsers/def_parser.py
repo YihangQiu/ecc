@@ -189,19 +189,41 @@ def _parse_rows(lines: list[str]) -> list[DefRow]:
 def _parse_vias(lines: list[str]) -> list[dict[str, Any]]:
     vias: list[dict[str, Any]] = []
     in_vias = False
+    current: dict[str, Any] | None = None
+    current_layer: str | None = None
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("VIAS "):
             in_vias = True
             continue
         if in_vias and stripped.startswith("END VIAS"):
+            if current:
+                vias.append(current)
             break
-        if in_vias and stripped.startswith("- "):
+        if not in_vias:
+            continue
+        if stripped.startswith("- "):
+            if current:
+                vias.append(current)
             tokens = stripped.split()
             layers = []
             if "+ LAYERS" in stripped:
                 layers = stripped.split("+ LAYERS", 1)[1].replace(";", "").split()[:3]
-            vias.append({"name": tokens[1], "layers": layers, "source": "def_vias"})
+            current = {"name": tokens[1], "layers": layers, "rects_by_layer": {}, "source": "def_vias"}
+            current_layer = None
+            continue
+        if current is None:
+            continue
+        layer_match = re.search(r"\+\s+LAYER\s+(\S+)", stripped) or re.match(r"LAYER\s+(\S+)", stripped)
+        if layer_match:
+            current_layer = layer_match.group(1)
+            current.setdefault("rects_by_layer", {}).setdefault(current_layer, [])
+            if current_layer not in current.setdefault("layers", []):
+                current["layers"].append(current_layer)
+        rect_match = re.search(r"RECT\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", stripped)
+        if rect_match and current_layer:
+            llx, lly, urx, ury = (float(rect_match.group(i)) for i in range(1, 5))
+            current.setdefault("rects_by_layer", {}).setdefault(current_layer, []).append({"llx": llx, "lly": lly, "urx": urx, "ury": ury})
     return vias
 
 
