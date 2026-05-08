@@ -27,3 +27,10 @@ def build_harden_flow() -> list:
     steps.append((StepEnum.HARDEN, "ecc", StateEnum.Unstart))
     
     return steps
+
+def build_rcx_flow() -> list:
+    steps = build_rtl2gds_flow()
+
+    steps.append((StepEnum.RCX, "ecc", StateEnum.Unstart))
+    
+    return steps

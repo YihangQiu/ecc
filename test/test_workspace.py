@@ -7,7 +7,7 @@ from chipcompiler.data import create_workspace, load_workspace
 
 
 def _create_minimal_ics55_pdk(root: Path) -> Path:
-    tech_path = root / "prtech" / "techLEF" / "N551P6M.lef"
+    tech_path = root / "prtech" / "techLEF" / "N551P6M_ecos.lef"
     tech_path.parent.mkdir(parents=True, exist_ok=True)
     tech_path.write_text("VERSION 5.8 ;\n")
 
@@ -54,7 +54,7 @@ def test_create_workspace_persists_pdk_root_in_parameters(tmp_path):
     assert workspace.pdk.root == resolved_root
     assert workspace.parameters.data.get("PDK Root") == resolved_root
 
-    parameters_data = json.loads((workspace_dir / "parameters.json").read_text())
+    parameters_data = json.loads((workspace_dir / "home" / "parameters.json").read_text())
     assert parameters_data.get("PDK Root") == resolved_root
 
 

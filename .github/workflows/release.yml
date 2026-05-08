@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag to release (e.g., v0.1.0)'
-        required: true
+        description: 'Tag to release (e.g., v0.1.0-alpha.2)'
+        required: false
+        default: 'v0.1.0-alpha.2'
 
 permissions:
   contents: write
@@ -64,7 +65,6 @@ jobs:
           name: ecc-wheel
           path: |
             dist/wheel/repaired/*.whl
-            dist/wheel/SHA256SUMS
 
   release:
     name: Create Release
@@ -81,7 +81,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ecc-wheel
-          path: dist/wheel
+          path: dist/wheel/repaired
 
       - name: Determine tag version
         id: version
@@ -96,21 +96,28 @@ jobs:
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           echo "full_tag=$FULL_TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Generate changelog with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: .github/cliff.toml
+          args: --latest --output release-changelog.md
+          github_token: ${{ github.token }}
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Generate release notes
         id: notes
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
           {
-            if [[ -n "$PREV_TAG" ]]; then
-              echo "## Changes"
-              echo ""
-              git log --oneline --no-merges "${PREV_TAG}..HEAD" | sed 's/^/- /'
-              echo ""
-            fi
+            cat release-changelog.md
+            echo ""
             echo "## Checksums"
             echo ""
             echo '```'
-            cat dist/wheel/SHA256SUMS
+            (
+              cd dist/wheel/repaired
+              sha256sum *.whl
+            )
             echo '```'
           } > release-notes.md
           cat release-notes.md
@@ -122,5 +129,4 @@ jobs:
           gh release create "${{ steps.version.outputs.full_tag }}" \
             --title "ecc ${{ steps.version.outputs.full_tag }}" \
             --notes-file release-notes.md \
-            dist/wheel/repaired/*.whl \
-            dist/wheel/SHA256SUMS
+            dist/wheel/repaired/*.whl

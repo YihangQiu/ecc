@@ -70,9 +70,13 @@ class DreamplaceModule:
         log_file = self.step.log.get("file") or self._log_path(legalize_only)
         os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
 
+        formatter = logging.Formatter("[%(levelname)-7s] %(message)s")
         file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter("[%(levelname)-7s] %(message)s"))
+        file_handler.setFormatter(formatter)
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
+        root_logger.addHandler(stdout_handler)
         if original_level > logging.INFO:
             root_logger.setLevel(logging.INFO)
 
@@ -80,7 +84,9 @@ class DreamplaceModule:
             yield
         finally:
             root_logger.removeHandler(file_handler)
+            root_logger.removeHandler(stdout_handler)
             file_handler.close()
+            stdout_handler.close()
             root_logger.setLevel(original_level)
             for handler in original_handlers:
                 if handler not in root_logger.handlers:

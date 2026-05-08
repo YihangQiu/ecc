@@ -139,6 +139,7 @@ def build_step(workspace: Workspace,
                step_name: str,
                input_def: str,
                input_verilog: str,
+               input_db : str | None = None,
                output_def: str = None,
                output_verilog: str = None,
                output_gds: str = None) -> WorkspaceStep:

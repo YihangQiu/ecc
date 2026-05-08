@@ -76,7 +76,11 @@ Artifacts:
 - Raw wheels: `dist/wheel/raw/`
 - Repaired wheels: `dist/wheel/repaired/`
 - auditwheel report: `dist/wheel/reports/show.txt`
-- Checksums: `dist/wheel/SHA256SUMS`
+
+Release notes for tagged ECC releases are generated with `git-cliff` using
+[`ecc/.github/cliff.toml`](../.github/cliff.toml). The release workflow appends
+the generated changelog before the checksum block that is published to GitHub
+Releases.
 
 Requirements:
 - Linux x86_64

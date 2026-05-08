@@ -12,34 +12,61 @@ from chipcompiler.tools.ecc.subflow import EccSubFlow, EccSubFlowEnum
 from chipcompiler.tools.ecc.checklist import EccChecklist
 from chipcompiler.utility import json_read
 
+
 def create_db_engine(workspace: Workspace,
                      step: WorkspaceStep) -> ECCToolsModule:
     """"""
-    if not is_eda_exist():
-        return False
-    eda_inst = ECCToolsModule()
+    def load_data():
+        eda_inst = ECCToolsModule()
+        
+        eda_inst.init_config(flow_config=step.config["flow"],
+                             db_config=step.config["db"],
+                             output_dir=step.data["dir"],
+                             feature_dir=step.feature["dir"])
     
-    eda_inst.init_config(flow_config=step.config["flow"],
-                         db_config=step.config["db"],
-                         output_dir=step.data["dir"],
-                         feature_dir=step.feature["dir"])
-    
-    eda_inst.init_techlef(workspace.pdk.tech)
-    eda_inst.init_lefs(workspace.pdk.lefs)
-    
-    # if db def exist, read db def
-    if os.path.exists(step.input["def"]):
-        eda_inst.read_def(step.input["def"])      
-    else:
-        #else, read step output verilog
-        if os.path.exists(step.input["verilog"]):
-            eda_inst.read_verilog(verilog=step.input["verilog"],
-                                  top_module=workspace.design.top_module)
+        db_path = step.input.get("db", "")
+        if eda_inst.is_db_data_exists(db_path):
+            eda_inst.load_data(path=db_path)
+            workspace.logger.info(f"Successfully loaded data from {db_path}")
+            return eda_inst
         else:
             return None
+        
+    def load_design():
+        eda_inst = ECCToolsModule()
     
-    return eda_inst
+        eda_inst.init_config(flow_config=step.config["flow"],
+                             db_config=step.config["db"],
+                             output_dir=step.data["dir"],
+                             feature_dir=step.feature["dir"])
 
+        eda_inst.init_techlef(workspace.pdk.tech)
+        eda_inst.init_lefs(workspace.pdk.lefs)
+        
+        # if db def exist, read db def
+        if os.path.exists(step.input["def"]):
+            eda_inst.read_def(step.input["def"])      
+        else:
+            #else, read step output verilog
+            if os.path.exists(step.input["verilog"]):
+                eda_inst.read_verilog(verilog=step.input["verilog"],
+                                      top_module=workspace.design.top_module)
+            else:
+                return None
+    
+        return eda_inst
+    
+    if not is_eda_exist():
+        return None
+    try:
+        eda_inst = load_data()
+        if eda_inst is None:
+            eda_inst = load_design()
+    except Exception as e:
+        eda_inst = load_design()
+        
+    return eda_inst
+        
 def get_eda_instance(workspace: Workspace,
                      step: WorkspaceStep,
                      ecc_module: ECCToolsModule=None) -> ECCToolsModule:
@@ -73,8 +100,9 @@ def save_data(workspace: Workspace,
     ecc_module.def_save(def_path=step.output.get("def", ""))
     ecc_module.verilog_save(output_verilog=step.output.get("verilog", ""))
     ecc_module.gds_save(output_path=step.output.get("gds", ""))
+    # ecc_module.save_data(path=step.output.get("db", ""))
     ecc_module.json_save(path=step.output.get("json", ""))
-    ecc_module.feature_sammry(json_path=step.feature.get("summary", ""))
+    ecc_module.feature_sammry(json_path=step.feature.get("db", ""))
     if feature_step:
         ecc_module.feature_step(step=step.name,
                             json_path=step.feature.get("step", ""))
@@ -178,6 +206,11 @@ def run_step(workspace: Workspace,
             state = run_harden(workspace=workspace,
                                step=step, 
                                ecc_module=ecc_module)
+            
+        case StepEnum.RCX.value:
+            state = run_rcx(workspace=workspace,
+                            step=step, 
+                            ecc_module=ecc_module)
                 
     return state
 
@@ -280,7 +313,8 @@ def run_cts(workspace: Workspace,
         
         eda_inst.report_cts(output=step.data[f"{StepEnum.CTS.value}"])
         
-        eda_inst.run_legalize(config=step.config[f"{StepEnum.LEGALIZATION.value}"])
+        # Post-CTS legalization is handled by the following DreamPlace legalization step.
+        # eda_inst.run_legalize(config=step.config[f"{StepEnum.LEGALIZATION.value}"])
         
         eda_inst.feature_cts_map(json_path=step.feature["map"])
         
@@ -430,6 +464,9 @@ def run_drc(workspace: Workspace,
                              state=StateEnum.Success) 
         
         run_analysis(workspace = workspace, step = step, subflow = sub_flow)
+        
+        sub_flow.update_step(step_name=EccSubFlowEnum.save_data.value,
+                             state=StateEnum.Success) 
     
     return reslut
 
@@ -501,7 +538,7 @@ def run_floorplan(workspace: Workspace,
     """
     run floorplan
     """
-    
+    reslut = False
     sub_flow = EccSubFlow(workspace=workspace,
                           workspace_step=step)
     
@@ -646,10 +683,8 @@ def run_floorplan(workspace: Workspace,
                              state=StateEnum.Success) 
         
         run_analysis(workspace = workspace, step = step, subflow = sub_flow)
-        
-        return reslut
     
-    return False 
+    return reslut 
 
 def run_harden(workspace: Workspace,
                step: WorkspaceStep,
@@ -668,9 +703,10 @@ def run_harden(workspace: Workspace,
     
     if eda_inst is not None:
         eda_inst.init_sta(output_dir=step.data["sta"],
-                              top_module=workspace.design.top_module,
-                              lib_paths=workspace.pdk.libs,
-                              sdc_path=workspace.pdk.sdc)
+                          top_module=workspace.design.top_module,
+                          lib_paths=workspace.pdk.libs,
+                          sdc_path=workspace.pdk.sdc)
+        eda_inst.update_timing()
         sub_flow.update_step(step_name=EccSubFlowEnum.load_data.value, state=StateEnum.Success)
         
         eda_inst.write_abstract_lef(output_lef_path=step.output.get("lef", ""))
@@ -682,3 +718,50 @@ def run_harden(workspace: Workspace,
         reslut = True
     
     return reslut
+
+def run_rcx(workspace: Workspace,
+            step: WorkspaceStep,
+            ecc_module : ECCToolsModule = None) -> bool:
+    """
+    run rcx
+    """
+    def run_jsons_to_itf(eda_inst : ECCToolsModule) -> bool:
+        config=json_read(step.config.get(StepEnum.RCX.value, ""))
+        corners_dict = config.get("corners", [])
+        for item in corners_dict:
+            json_file = item.get("ecc_tf", "")
+            itf_file = item.get("itf_file", "")
+
+            if not os.path.exists(json_file):
+                return False
+            
+            eda_inst.rcx_json_to_itf(json_path=json_file, itf_path=itf_file)
+        return True
+    
+    result = False
+    
+    sub_flow = EccSubFlow(workspace=workspace,
+                          workspace_step=step)
+    
+    eda_inst = get_eda_instance(workspace=workspace,
+                                step=step,
+                                ecc_module = ecc_module)
+    
+    if eda_inst is not None:
+        sub_flow.update_step(step_name=EccSubFlowEnum.load_data.value, state=StateEnum.Success)
+        if not run_jsons_to_itf(eda_inst):
+            sub_flow.update_step(step_name=EccSubFlowEnum.run_rcx.value, state=StateEnum.Imcomplete)
+            result = False
+        else:
+            eda_inst.run_rcx(config=step.config.get(StepEnum.RCX.value, ""))
+            eda_inst.report_rcx(step.output.get("dir", ""))
+            sub_flow.update_step(step_name=EccSubFlowEnum.run_rcx.value, state=StateEnum.Success)
+            
+            save_data(workspace=workspace, step=step, ecc_module=eda_inst, feature_step=False)
+            
+            sub_flow.update_step(step_name=EccSubFlowEnum.save_data.value,
+                                 state=StateEnum.Success) 
+        
+            result = True
+        
+    return result

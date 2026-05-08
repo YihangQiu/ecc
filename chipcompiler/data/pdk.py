@@ -18,6 +18,8 @@ class PDK:
     tech : str = "" # pdk tech lef file
     lefs : list = field(default_factory=list) # pdk lef files
     libs : list = field(default_factory=list) # pdk liberty files
+    mapping_file : str = "" # pdk mapping file
+    corners : list = field(default_factory=list) 
     sdc : str = "" # pdk sdc file
     spef : str = "" # pdk spef file
     site_core : str = "" # core site
@@ -84,6 +86,44 @@ def PDK_ICS55(pdk_root: str = "") -> PDK:
         "{}/ics55_LLSC_H7CR/liberty/ics55_LLSC_H7CR_ss_rcworst_1p08_125_nldm.lib".format(stdcell_dir),
         "{}/ics55_LLSC_H7CL/liberty/ics55_LLSC_H7CL_ss_rcworst_1p08_125_nldm.lib".format(stdcell_dir)
     ]
+    mapping_file = "{}/resource/ICsprout_55LLULP_1P6M_5lc_V1p1_cell.map".format(resolved_root)
+    corners = [
+        {
+            "name" : "TYPICAL",
+            "ecc_tf" : "{}/resource/TYP.json".format(resolved_root),
+            "itf_file" : "{}/resource/TYP.itf".format(resolved_root),
+            "captab_file" : "{}/resource/TYP.captab".format(resolved_root),
+            "spef_file" : "{}/resource/TYP.spef".format(resolved_root)
+        },
+        {
+            "name" : "RCbest",
+            "ecc_tf" : "{}/resource/RCbest.json".format(resolved_root),
+            "itf_file" : "{}/resource/RCbest.itf".format(resolved_root),
+            "captab_file" : "{}/resource/RCbest.captab".format(resolved_root),
+            "spef_file" : "{}/resource/RCbest.spef".format(resolved_root)
+        },
+        {
+            "name" : "RCworst",
+            "ecc_tf" : "{}/resource/RCworst.json".format(resolved_root),
+            "itf_file" : "{}/resource/RCworst.itf".format(resolved_root),
+            "captab_file" : "{}/resource/RCworst.captab".format(resolved_root),
+            "spef_file" : "{}/resource/RCworst.spef".format(resolved_root)
+        },
+        {
+            "name" : "Cbest",
+            "ecc_tf" : "{}/resource/Cbest.json".format(resolved_root),
+            "itf_file" : "{}/resource/Cbest.itf".format(resolved_root),
+            "captab_file" : "{}/resource/Cbest.captab".format(resolved_root),
+            "spef_file" : "{}/resource/Cbest.spef".format(resolved_root)
+        },
+        {
+            "name" : "Cworst",
+            "ecc_tf" : "{}/resource/Cworst.json".format(resolved_root),
+            "itf_file" : "{}/resource/Cworst.itf".format(resolved_root),
+            "captab_file" : "{}/resource/Cworst.captab".format(resolved_root),
+            "spef_file" : "{}/resource/Cworst.spef".format(resolved_root)
+        }
+    ]
 
     pdk = PDK(
         name="ics55",
@@ -92,6 +132,8 @@ def PDK_ICS55(pdk_root: str = "") -> PDK:
         tech=tech_path if os.path.isfile(tech_path) else "",
         lefs=[path for path in lef_paths if os.path.isfile(path)],
         libs=[path for path in lib_paths if os.path.isfile(path)],
+        mapping_file = mapping_file,
+        corners=corners,
         site_core = "core7",
         site_io = "core7",
         site_corner = "core7",

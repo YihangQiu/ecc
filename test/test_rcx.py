@@ -25,7 +25,7 @@ from chipcompiler.engine import (
 )
 
 def test_ics55_gcd():
-    workspace_dir="{}/test/examples/ics55_gcd_tool".format(root)
+    workspace_dir="{}/test/examples/ics55_gcd_rcx".format(root)
 
     input_def = ""
     input_verilog = "{}/test/fixtures/gcd/gcd.v".format(root) # RTL file
@@ -44,8 +44,8 @@ def test_ics55_gcd():
     
     engine_flow = EngineFlow(workspace=workspace)
     if not engine_flow.has_init():
-        from chipcompiler.rtl2gds import build_rtl2gds_flow
-        steps = build_rtl2gds_flow()
+        from chipcompiler.rtl2gds import build_rcx_flow
+        steps = build_rcx_flow()
         for step, tool, state in steps:
             engine_flow.add_step(step=step, tool=tool, state=state)
             
