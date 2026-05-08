@@ -73,7 +73,7 @@ def save_data(workspace: Workspace,
     ecc_module.def_save(def_path=step.output.get("def", ""))
     ecc_module.verilog_save(output_verilog=step.output.get("verilog", ""))
     ecc_module.gds_save(output_path=step.output.get("gds", ""))
-    ecc_module.json_save(path=step.out.get("json", ""))
+    ecc_module.json_save(path=step.output.get("json", ""))
     ecc_module.feature_sammry(json_path=step.feature.get("summary", ""))
     if feature_step:
         ecc_module.feature_step(step=step.name,
@@ -86,6 +86,7 @@ def save_data(workspace: Workspace,
                     top_module=workspace.design.top_module,
                     lib_paths=workspace.pdk.libs,
                     sdc_path=workspace.pdk.sdc)
+    ecc_module.build_timing_rc_tree(routing_type="ROUTED")
     ecc_module.report_timing()
     
     # update parameters

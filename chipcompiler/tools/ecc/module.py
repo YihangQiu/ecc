@@ -9,18 +9,20 @@ class ECCToolsModule:
     """
     def __init__(self):
         try:
-            from chipcompiler.tools.ecc.utility import is_eda_exist
-            if is_eda_exist():
+            from ecc_tools_bin import ecc_py as ecc
+        except ImportError:
+            try:
                 from chipcompiler.tools.ecc.bin import ecc_py as ecc
-        except ImportError as exc:
-            ecc_bin_dir = Path(__file__).resolve().parent / "bin"
-            candidates = sorted(p.name for p in ecc_bin_dir.glob("ecc_py*.so"))
-            raise ImportError(
-                "ecc tool is not installed or not found. "
-                f"Import error: {exc}. "
-                f"Available ecc_py binaries in {ecc_bin_dir}: {candidates}"
-            ) from exc
-    
+            except ImportError as exc:
+                ecc_bin_dir = Path(__file__).resolve().parent / "bin"
+                candidates = sorted(p.name for p in ecc_bin_dir.glob("ecc_py*.so"))
+                raise ImportError(
+                    "ecc-tools is not installed. Install the ecc-tools wheel or "
+                    "build from source with: bazel run //:prepare_dev. "
+                    f"Import error: {exc}. "
+                    f"Available ecc_py binaries in {ecc_bin_dir}: {candidates}"
+                ) from exc
+
         self.ecc = ecc
 
     def get_ecc(self):
@@ -269,6 +271,12 @@ class ECCToolsModule:
         generate cts map feature
         """
         self.ecc.feature_cts_eval(json_path, map_grid_size)
+
+    def feature_gcell_patch_map(self, json_path: str, stage: str):
+        """
+        generate gcell-aligned patch map features using ecc-tools/iDB data
+        """
+        self.ecc.feature_gcell_patch_eval(json_path, stage)
     
     ########################################################################    
     # DRC api
@@ -711,6 +719,9 @@ class ECCToolsModule:
 
     def update_timing(self):
         return self.ecc.update_timing()
+
+    def build_timing_rc_tree(self, routing_type: str = "HPWL"):
+        return self.ecc.build_timing_rc_tree(routing_type)
 
     def write_abstract_lef(self, output_lef_path: str):
         return self.ecc.write_abstract_lef(output_lef_path)
