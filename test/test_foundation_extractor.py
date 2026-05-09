@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from chipcompiler.data.foundation import FoundationExtractor
+from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -442,10 +443,133 @@ def test_read_numeric_csv_ignores_trailing_empty_columns(tmp_path: Path):
     assert shape(matrix) == (2, 3)
 
 
-def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
+def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
     result = FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    foundation_dir = result.foundation_dir
+    schema = json.loads((foundation_dir / "schema.json").read_text(encoding="utf-8"))
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    migration_report = json.loads((foundation_dir / "migration_report.json").read_text(encoding="utf-8"))
+
+    assert schema["contract_name"] == "foundation_data/ecc"
+    assert schema["storage_format"] == "parquet+json_views"
+    assert schema["schema_version"]
+    assert "tables" in schema
+    for table_name in [
+        "designs",
+        "runs",
+        "stages",
+        "artifacts",
+        "provenance",
+        "semantic_blocks",
+        "tech_layers",
+        "tech_vias",
+        "library_cells",
+        "patches",
+        "patch_neighbors",
+        "run_stage_patch_maps",
+        "run_stage_patch_features",
+        "run_patch_route_labels",
+        "run_patch_route_label_layers",
+        "patch_entity_refs",
+        "instances",
+        "instance_stage_state",
+        "pins",
+        "pin_stage_state",
+        "nets",
+        "net_terminals",
+        "wire_segments",
+        "wire_patch_intersections",
+        "routing_vertices",
+        "routing_edges",
+        "timing_paths",
+        "timing_path_points",
+        "timing_edges",
+        "timing_wire_path_nodes",
+        "stage_metrics",
+        "stage_deltas",
+    ]:
+        assert table_name in schema["tables"]
+        table_meta = manifest["tables"][table_name]
+        table_path = foundation_dir / table_meta["path"]
+        assert table_path.exists(), table_name
+        assert table_meta["format"] == "parquet"
+        assert table_meta["row_count"] >= 0
+        assert table_meta["primary_key"] == schema["tables"][table_name]["primary_key"]
+        assert len(table_meta["sha256"]) == 64
+        assert table_meta["size_bytes"] > 0
+
+    assert manifest["contract_name"] == "foundation_data/ecc"
+    assert manifest["storage_format"] == "parquet+json_views"
+    assert manifest["schema"] == "foundation_data/ecc/schema.json"
+    assert manifest["design_id"].startswith("design_")
+    assert manifest["run_id"].startswith("run_")
+    assert manifest["created_at"]
+    assert manifest["generated_by"]["extractor"] == "chipcompiler.data.foundation.FoundationExtractor"
+    assert [stage["stage_name"] for stage in manifest["stages"]] == [
+        "Floorplan",
+        "place",
+        "CTS",
+        "route",
+        "drc",
+    ]
+    assert manifest["tables"]["patches"]["row_count"] == 4
+    assert manifest["tables"]["run_stage_patch_features"]["row_count"] == 20
+    assert manifest["tables"]["run_patch_route_labels"]["row_count"] == 4
+    assert manifest["views"]["ml_task_views"] == "foundation_data/ecc/views/ml/task_views.json"
+    assert manifest["migration_report"] == "foundation_data/ecc/migration_report.json"
+    assert quality["tables"]["patches"]["row_count"] == 4
+    assert quality["legacy_outputs"]["vectors_default_enabled"] is False
+    assert quality["legacy_outputs"]["maps_default_enabled"] is False
+    assert quality["tables"]["semantic_blocks"]["row_count"] > 0
+    assert migration_report["contract_name"] == "foundation_data/ecc"
+    assert migration_report["source_docs_dir"] == "ecos/agent/docs/foundatio_data"
+    for source_doc in [
+        "vec_patches.md",
+        "vec_pins.md",
+        "vec_nets.md",
+        "vec_wires.md",
+        "vec_routing_graph.md",
+        "vec_timing_paths.md",
+        "labels_route_native_demand_capacity.md",
+        "views_ml.md",
+    ]:
+        assert source_doc in migration_report["source_docs"]
+    assert migration_report["information_families"]["route_native_labels"]["status"] == "preserved_as_table"
+    assert migration_report["information_families"]["source_refs_null_reason"]["status"] == "preserved_as_semantic_block"
+
+    dataset_index = json.loads((foundation_dir / "views" / "ml" / "dataset_index.json").read_text(encoding="utf-8"))
+    task_views = json.loads((foundation_dir / "views" / "ml" / "task_views.json").read_text(encoding="utf-8"))
+    assert dataset_index["tables_dir"] == "tables"
+    assert "progressive_patch_route_demand_capacity" in task_views["tasks"]
+    task = task_views["tasks"]["progressive_patch_route_demand_capacity"]
+    assert task["input_table"] == "run_stage_patch_features"
+    assert task["label_table"] == "run_patch_route_labels"
+    assert task["leakage_policy"]["route_truth_as_preroute_input"] == "forbidden"
+
+    assert not (foundation_dir / "vectors").exists()
+    assert not (foundation_dir / "maps").exists()
+    assert not (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").exists()
+
+
+def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    registry = write_tables(tmp_path, {})
+
+    assert registry["timing_paths"]["row_count"] == 0
+    table = pq.read_table(tmp_path / registry["timing_paths"]["path"])
+    assert table.num_rows == 0
+    assert table.schema.names == list(TABLE_SPECS["timing_paths"].columns)
+
+
+def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     assert result.foundation_dir == foundation_dir
@@ -512,10 +636,13 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert all(all("path" not in key.lower() for key in stage_metrics) for stage_metrics in metrics.values())
 
     manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert set(manifest) == {"options", "workspace", "sources", "artifacts"}
+    assert manifest["contract_name"] == "foundation_data/ecc"
+    assert manifest["storage_format"] == "parquet+json_views"
+    assert "tables" in manifest
     assert "version" not in manifest
     assert "profile" not in manifest
-    assert "created_at" not in manifest
+    assert manifest["created_at"]
+    assert manifest["generated_by"]["profile"] == "iccd_full_v1"
     assert manifest["workspace"] == str(ws.resolve())
     assert isinstance(manifest["sources"], list)
     assert "home/flow.json" in manifest["sources"]
@@ -527,6 +654,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
         "stage_index": "foundation_data/ecc/stage_index.json",
         "canonical_grid": "foundation_data/ecc/canonical_grid.json",
         "quality": "foundation_data/ecc/quality.json",
+        "schema": "foundation_data/ecc/schema.json",
         "ml_view": "foundation_data/ecc/views/ml/dataset_index.json",
         "agent_view": "foundation_data/ecc/views/agent/run_summary.json",
         "raw_refs": "foundation_data/ecc/raw_refs/artifacts.json",
@@ -709,7 +837,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
 def test_iccd_full_v1_orders_instance_record_fields_like_documented_schema(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"])
 
     row = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()[0])
     assert list(row) == [
@@ -761,7 +889,7 @@ def test_iccd_full_v1_timing_criticality_is_scoped_by_analysis_context(tmp_path:
             ],
         )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["route"])
 
     records = [
         json.loads(line)
@@ -775,7 +903,7 @@ def test_iccd_full_v1_timing_criticality_is_scoped_by_analysis_context(tmp_path:
 def test_iccd_full_v1_timing_paths_use_semantic_nulls_for_missing_spatial_maps(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_route_maps=False)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["route"])
 
     record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "timing_paths" / "route.jsonl").read_text().splitlines()[0])
     assert record["path_spatial"]["patch_count"] > 0
@@ -837,7 +965,7 @@ END DESIGN
         ],
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["Floorplan"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["Floorplan"])
 
     record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "timing_paths" / "Floorplan.jsonl").read_text().splitlines()[0])
     assert {point["spatial_anchor_source"] for point in record["path_points"]} == {"missing"}
@@ -892,7 +1020,7 @@ END DESIGN
         },
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     instances = [
@@ -949,7 +1077,7 @@ END DESIGN
         },
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["Floorplan"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["Floorplan"])
 
     row = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "Floorplan.jsonl").read_text())
     assert row["physical_state"]["placement_status"] == "unplaced"
@@ -973,7 +1101,7 @@ def test_iccd_full_v1_adds_instance_patch_anchor(tmp_path: Path):
         if path.name != "place_rudy_union.csv":
             path.unlink()
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"])
 
     record = json.loads((ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()[0])
     assert record["patch_anchor"]["primary_patch_id"] == 0
@@ -1024,7 +1152,7 @@ END DESIGN
         },
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"])
 
     rows = [json.loads(line) for line in (ws / "foundation_data" / "ecc" / "vectors" / "instances" / "place.jsonl").read_text().splitlines()]
     record = next(row for row in rows if row["identity"]["instance_key"] == "U1")
@@ -1107,7 +1235,7 @@ END DESIGN
         },
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "CTS"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place", "CTS"])
 
     cts_instances = [json.loads(line) for line in (ws / "foundation_data" / "ecc" / "vectors" / "instances" / "CTS.jsonl").read_text().splitlines()]
     cts_buf = next(item for item in cts_instances if item["name"] == "clk_leaf_0_0_buf")
@@ -1151,7 +1279,7 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     )
     _write_json(ws / "Floorplan_ecc" / "output" / "gcd_Floorplan.json", floorplan_layout)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     for rel in [
@@ -1213,7 +1341,7 @@ def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_dens
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[1, 2], [3, 4]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_lut_rudy_union.csv", [[5, 6], [7, 8]])
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     assert not (foundation_dir / "maps" / "canonical").exists()
@@ -1241,7 +1369,7 @@ def test_iccd_full_v1_drops_legacy_map_dirs_lutrudy_and_filler_from_allcell_dens
 def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_route_artifacts=False, include_route_maps=True)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
@@ -1259,7 +1387,7 @@ def test_iccd_full_v1_marks_labels_missing_without_true_route_artifacts(tmp_path
 def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_path: Path):
     ws = _make_workspace(tmp_path, include_native_demand_capacity=False)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
@@ -1289,7 +1417,7 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
 def test_iccd_full_v1_patch_records_follow_vec_patches_schema(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     place_patches = [
@@ -1461,7 +1589,7 @@ def test_iccd_full_v1_patch_records_compute_progressive_deltas_and_quality_stats
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "density_map" / "cts_macro_pin_density.csv", [[0, 0], [0, 0]])
     _write_csv(ws / "CTS_ecc" / "feature" / "gcell_patch_map" / "RUDY_map" / "cts_rudy_union.csv", [[110, 111], [112, 113]])
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     place0 = json.loads((foundation_dir / "vectors" / "patches" / "place.jsonl").read_text(encoding="utf-8").splitlines()[0])
@@ -1525,7 +1653,7 @@ def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
     stale.parent.mkdir(parents=True)
     stale.write_text('{"stale": true}\n', encoding="utf-8")
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     assert not stale.exists()
 
@@ -1534,7 +1662,7 @@ def test_iccd_full_v1_cleans_stale_outputs_before_rewrite(tmp_path: Path):
 def test_iccd_full_v1_honors_stage_filter_and_raw_refs_option(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"], include_raw_refs=False)
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"], include_raw_refs=False)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
@@ -1559,7 +1687,7 @@ def test_iccd_full_v1_rejects_unknown_stage_filter(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
     try:
-        FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["missing_stage"])
+        FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["missing_stage"])
     except ValueError as exc:
         assert "unknown foundation extraction stage" in str(exc)
     else:
@@ -1591,7 +1719,7 @@ END DESIGN
         + "\n",
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place"])
 
     rows = [
         json.loads(line)
@@ -1760,7 +1888,7 @@ END DESIGN
         [{"type": "short", "layer": "MET2", "bbox": {"llx": 10, "lly": 20, "urx": 20, "ury": 30}, "count": 2}],
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "route", "drc"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place", "route", "drc"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     place_rows = [json.loads(line) for line in (foundation_dir / "vectors" / "pins" / "place.jsonl").read_text().splitlines()]
@@ -1874,7 +2002,7 @@ END DESIGN
         + "\n",
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "CTS", "route"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place", "CTS", "route"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     place_pin = json.loads((foundation_dir / "vectors" / "pins" / "place.jsonl").read_text(encoding="utf-8").splitlines()[0])
@@ -1929,7 +2057,7 @@ END DESIGN
         + "\n",
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["route"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     wire = next(
@@ -1946,7 +2074,7 @@ END DESIGN
 def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
 
     foundation_dir = ws / "foundation_data" / "ecc"
     nets = [json.loads(line) for line in (foundation_dir / "vectors" / "nets" / "route.jsonl").read_text().splitlines()]
@@ -2430,7 +2558,7 @@ def test_iccd_full_v1_writes_nested_net_wire_graph_patch_and_tech_records(tmp_pa
 def test_routing_graph_records_follow_vec_routing_graph_schema(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["place", "route"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["place", "route"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     assert (foundation_dir / "vectors" / "routing_graphs" / "place.jsonl").read_text(encoding="utf-8") == ""
@@ -2532,7 +2660,7 @@ END DESIGN
         + "\n",
     )
 
-    FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route", "drc"])
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True, stages=["route", "drc"])
 
     foundation_dir = ws / "foundation_data" / "ecc"
     route_graphs = [

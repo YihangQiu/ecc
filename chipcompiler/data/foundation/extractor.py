@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from .parsers.route_native_demand_capacity import parse_route_native_demand_capa
 from .parsers.rt_log import parse_rt_log
 from .parsers.sta_parser import parse_sta_artifacts
 from .schema import ExtractionResult
+from .table_contract import CONTRACT_NAME, SCHEMA_VERSION, STORAGE_FORMAT, json_value, schema_document, write_tables
 from .writers import write_json, write_jsonl
 
 FOUNDATION_REL = Path("foundation_data") / "ecc"
@@ -73,7 +76,14 @@ class FoundationExtractor:
         self._lef_layers: dict[str, LefLayer] = {}
         self._lef_vias: dict[str, LefVia] = {}
 
-    def extract(self, *, force: bool = False, stages: Any = "all", include_raw_refs: bool = True) -> ExtractionResult:
+    def extract(
+        self,
+        *,
+        force: bool = False,
+        stages: Any = "all",
+        include_raw_refs: bool = True,
+        export_legacy_debug: bool = False,
+    ) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
@@ -81,7 +91,11 @@ class FoundationExtractor:
         parameters = self._read_json(self.workspace_dir / "home" / "parameters.json")
         self._lef_macros = self._load_lef_macros(parameters)
         selected_stages = self._filter_stages(self._stage_infos(flow), stages)
-        options = {"stages": [stage.name for stage in selected_stages], "include_raw_refs": bool(include_raw_refs)}
+        options = {
+            "stages": [stage.name for stage in selected_stages],
+            "include_raw_refs": bool(include_raw_refs),
+            "export_legacy_debug": bool(export_legacy_debug),
+        }
         def_data = self._collect_def_data(selected_stages)
         rt_logs = self._collect_rt_logs(selected_stages)
         sta_reports = self._collect_sta_reports(selected_stages)
@@ -106,16 +120,47 @@ class FoundationExtractor:
         metrics = self._collect_metrics(selected_stages)
         summary_parameters = self._build_summary_parameters(parameters, selected_stages, def_data)
         summary = self._build_summary(flow, summary_parameters, selected_stages, metrics, entity_counts, public_labels, def_data, sta_reports, drc_reports)
-        manifest = self._build_manifest(selected_stages, raw_maps, summary, options=options)
+        table_rows = self._build_table_rows(
+            flow=flow,
+            parameters=summary_parameters,
+            stages=selected_stages,
+            canonical_grid=canonical_grid,
+            canonical_maps=canonical_maps,
+            labels=labels,
+            metrics=metrics,
+        )
+        table_registry = write_tables(self.foundation_dir, table_rows)
+        schema = schema_document()
+        manifest = self._build_manifest(
+            selected_stages,
+            raw_maps,
+            summary,
+            options=options,
+            table_registry=table_registry,
+            table_rows=table_rows,
+        )
+        self._quality["tables"] = {
+            name: {"row_count": meta["row_count"], "path": meta["path"]}
+            for name, meta in table_registry.items()
+        }
+        self._quality["legacy_outputs"] = {
+            "vectors_default_enabled": bool(export_legacy_debug),
+            "maps_default_enabled": bool(export_legacy_debug),
+            "jsonl_export": "explicit_debug_export_only",
+        }
 
         write_json(self.foundation_dir / "canonical_grid.json", canonical_grid)
         write_json(self.foundation_dir / "stage_index.json", stage_index)
         write_json(self.foundation_dir / "summary.json", summary)
+        write_json(self.foundation_dir / "schema.json", schema)
+        write_json(self.foundation_dir / "migration_report.json", self._build_migration_report())
         if include_raw_refs:
             write_json(self.foundation_dir / "raw_refs" / "artifacts.json", {"artifacts": self._raw_refs})
         write_json(self.foundation_dir / "quality.json", self._quality)
         write_json(self.foundation_dir / "manifest.json", manifest)
         self._write_views(summary, metrics, stage_index, public_labels, include_raw_refs=bool(include_raw_refs))
+        if not export_legacy_debug:
+            self._remove_legacy_default_outputs()
 
         return ExtractionResult(
             workspace_dir=self.workspace_dir,
@@ -1706,22 +1751,1010 @@ class FoundationExtractor:
             return {name: value for name, value in values.items() if value is not None}
         return {}
 
-    def _build_manifest(self, stages: list[StageInfo], raw_maps: dict, summary: dict, *, options: dict[str, Any]) -> dict[str, Any]:
+    def _build_table_rows(
+        self,
+        *,
+        flow: dict[str, Any],
+        parameters: dict[str, Any],
+        stages: list[StageInfo],
+        canonical_grid: dict[str, Any],
+        canonical_maps: CanonicalMaps,
+        labels: dict[str, Any],
+        metrics: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        design_name = str(parameters.get("Design") or parameters.get("design") or "unknown")
+        top_module = str(parameters.get("Top module") or parameters.get("top_module") or design_name)
+        pdk = str(parameters.get("PDK") or parameters.get("pdk") or "unknown")
+        logical_source_hash = _stable_digest({"flow": flow.get("steps", []), "design": design_name, "top": top_module})
+        design_id = _stable_id("design", pdk, design_name, top_module, logical_source_hash)
+        run_id = _stable_id("run", design_id, parameters, self._source_signature())
+        stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
+
+        tables: dict[str, list[dict[str, Any]]] = {
+            "designs": [
+                {
+                    "design_id": design_id,
+                    "pdk": pdk,
+                    "design_name": design_name,
+                    "top_module": top_module,
+                    "logical_source_hash": logical_source_hash,
+                    "tech_profile": str(parameters.get("tech_profile") or pdk),
+                    "created_from_workspace": str(self.workspace_dir),
+                }
+            ],
+            "runs": [
+                {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "parameter_hash": _stable_digest(parameters),
+                    "flow_hash": _stable_digest(flow.get("steps", [])),
+                    "tool_version_hash": _stable_digest(self._source_signature()),
+                    "workspace_path": str(self.workspace_dir),
+                    "status": _overall_status(stages),
+                    "created_at": None,
+                }
+            ],
+            "stages": [
+                {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_id": stage_ids[stage.name],
+                    "stage_order": index,
+                    "stage_name": stage.name,
+                    "tool": stage.tool,
+                    "state": stage.state,
+                    "stage_dir": _relative_or_string(stage.directory, self.workspace_dir),
+                    "runtime_s": None,
+                    "peak_memory_mb": None,
+                }
+                for index, stage in enumerate(stages)
+            ],
+            "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids),
+            "provenance": [
+                {
+                    "provenance_id": "foundation_contract",
+                    "target_table": "*",
+                    "target_key": "*",
+                    "target_field": "*",
+                    "artifact_id": None,
+                    "source_section": "foundation_extractor",
+                    "source_index": None,
+                    "availability_code": "available",
+                    "null_reason": None,
+                    "confidence": 1.0,
+                    "notes": "Initial parquet contract generated from existing extractor records.",
+                }
+            ],
+            "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
+            "patches": self._patch_table_rows(design_id, canonical_grid),
+            "patch_neighbors": self._patch_neighbor_rows(design_id, canonical_grid),
+            "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
+            "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
+            "run_patch_route_labels": self._route_label_rows(design_id, run_id, labels),
+            "run_patch_route_label_layers": self._route_label_layer_rows(design_id, run_id, labels),
+            "tech_layers": self._tech_layer_rows(design_id),
+            "tech_vias": self._tech_via_rows(design_id),
+            "library_cells": self._library_cell_rows(design_id),
+            "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
+            "instances": self._instance_rows(design_id, stages),
+            "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
+            "pins": self._pin_rows(design_id, stages),
+            "pin_stage_state": self._pin_stage_state_rows(design_id, run_id, stages),
+            "nets": self._net_rows(design_id, stages),
+            "net_terminals": self._net_terminal_rows(design_id, run_id, stages),
+            "wire_segments": self._wire_segment_rows(design_id, run_id, stages),
+            "wire_patch_intersections": self._wire_patch_intersection_rows(design_id, run_id, stages),
+            "routing_vertices": self._routing_vertex_rows(design_id, run_id, stages),
+            "routing_edges": self._routing_edge_rows(design_id, run_id, stages),
+            "timing_paths": self._timing_path_rows(design_id, run_id, stages),
+            "timing_path_points": self._timing_path_point_rows(design_id, run_id, stages),
+            "timing_edges": self._timing_edge_rows(design_id, run_id, stages),
+            "timing_wire_path_nodes": self._timing_wire_path_node_rows(design_id, run_id, stages),
+            "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
+            "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
+        }
+        return tables
+
+    def _artifact_table_rows(
+        self, design_id: str, run_id: str, stage_ids: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        rows = []
+        seen: set[str] = set()
+        for index, ref in enumerate(self._raw_refs):
+            rel_path = str(ref.get("path") or "")
+            if not rel_path or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            path = self.workspace_dir / rel_path
+            stage_name = str(ref.get("stage") or "")
+            rows.append(
+                {
+                    "artifact_id": _stable_id("artifact", rel_path),
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_id": stage_ids.get(stage_name),
+                    "artifact_type": str(ref.get("type") or "unknown"),
+                    "relative_path": rel_path,
+                    "sha256": _file_digest(path),
+                    "size_bytes": path.stat().st_size if path.exists() else None,
+                    "parser": "FoundationExtractor",
+                    "parser_version": SCHEMA_VERSION,
+                    "availability": "available" if path.exists() else "missing",
+                }
+            )
+        for rel_path in ("home/flow.json", "home/parameters.json"):
+            if rel_path in seen:
+                continue
+            path = self.workspace_dir / rel_path
+            rows.append(
+                {
+                    "artifact_id": _stable_id("artifact", rel_path),
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_id": None,
+                    "artifact_type": "workspace_metadata",
+                    "relative_path": rel_path,
+                    "sha256": _file_digest(path),
+                    "size_bytes": path.stat().st_size if path.exists() else None,
+                    "parser": "FoundationExtractor",
+                    "parser_version": SCHEMA_VERSION,
+                    "availability": "available" if path.exists() else "missing",
+                }
+            )
+        return rows
+
+    def _semantic_block_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        rows = []
+        block_names = ("source_refs", "null_reason", "progressive_metadata")
+        for stage in stages:
+            for entity_type, key_field, path in (
+                ("patch", "patch_key", self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"),
+                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
+                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
+                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
+                ("wire_segment", "wire_key", self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"),
+                ("routing_graph", "graph_key", self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"),
+                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
+            ):
+                for record in _read_jsonl_records(path)[:10]:
+                    entity_key = str(record.get(key_field) or record.get("id"))
+                    for block_name in block_names:
+                        payload = record.get(block_name)
+                        if payload is None:
+                            continue
+                        rows.append(
+                            {
+                                "design_id": design_id,
+                                "run_id": run_id,
+                                "stage_name": stage.name,
+                                "entity_type": entity_type,
+                                "entity_key": entity_key,
+                                "block_name": block_name,
+                                "block_payload": json_value(payload),
+                                "source_schema_version": "legacy_jsonl_iccd_full_v1",
+                                "normalized_status": "preserved_only",
+                                "target_table": None,
+                                "target_key": None,
+                            }
+                        )
+        return rows
+
+    @staticmethod
+    def _build_migration_report() -> dict[str, Any]:
+        source_docs = [
+            "canonical_grid.md",
+            "labels_route_native_demand_capacity.md",
+            "maps.md",
+            "meta_manifest.md",
+            "quality.md",
+            "raw_refs.md",
+            "vec_instance.md",
+            "vec_nets.md",
+            "vec_patches.md",
+            "vec_pins.md",
+            "vec_routing_graph.md",
+            "vec_tech.md",
+            "vec_timing_paths.md",
+            "vec_wires.md",
+            "views_agent.md",
+            "views_ml.md",
+        ]
+        return {
+            "contract_name": CONTRACT_NAME,
+            "schema_version": SCHEMA_VERSION,
+            "source_docs_dir": "ecos/agent/docs/foundatio_data",
+            "source_docs": source_docs,
+            "information_families": {
+                "canonical_grid": {"status": "preserved_as_table", "target": ["patches", "patch_neighbors"]},
+                "stage_maps": {"status": "preserved_as_table", "target": ["run_stage_patch_maps", "run_stage_patch_features"]},
+                "patch_features": {"status": "preserved_as_table", "target": ["patches", "run_stage_patch_features", "patch_entity_refs"]},
+                "pin_connectivity_timing_route": {"status": "preserved_as_table", "target": ["pins", "pin_stage_state", "patch_entity_refs"]},
+                "net_connectivity_terminals": {"status": "preserved_as_table", "target": ["nets", "net_terminals"]},
+                "wire_route_attribution": {"status": "preserved_as_table", "target": ["wire_segments", "wire_patch_intersections"]},
+                "routing_graph_topology": {"status": "preserved_as_table", "target": ["routing_vertices", "routing_edges"]},
+                "timing_paths": {"status": "preserved_as_table", "target": ["timing_paths", "timing_path_points", "timing_edges", "timing_wire_path_nodes"]},
+                "route_native_labels": {"status": "preserved_as_table", "target": ["run_patch_route_labels", "run_patch_route_label_layers"]},
+                "tech_library": {"status": "preserved_as_table", "target": ["tech_layers", "tech_vias", "library_cells"]},
+                "source_refs_null_reason": {"status": "preserved_as_semantic_block", "target": ["provenance", "semantic_blocks"]},
+                "agent_views": {"status": "preserved_as_view", "target": ["views/agent"]},
+                "ml_views_leakage_policy": {"status": "preserved_as_view", "target": ["views/ml/task_views.json"]},
+            },
+            "semantic_block_policy": {
+                "allowed_status": ["preserved_only", "side_table", "strong_typed", "deprecated_with_reason"],
+                "preserved_only_requires_future_normalization_plan": True,
+            },
+        }
+
+    @staticmethod
+    def _patch_table_rows(design_id: str, canonical_grid: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = int(canonical_grid.get("rows") or 0)
+        cols = int(canonical_grid.get("cols") or 0)
+        out = []
+        for patch in canonical_grid.get("patches", []):
+            bbox = patch.get("bbox") or {}
+            llx = float(bbox.get("llx") or 0.0)
+            lly = float(bbox.get("lly") or 0.0)
+            urx = float(bbox.get("urx") or 0.0)
+            ury = float(bbox.get("ury") or 0.0)
+            row = int(patch.get("row") or 0)
+            col = int(patch.get("col") or 0)
+            out.append(
+                {
+                    "design_id": design_id,
+                    "grid_id": str(canonical_grid.get("grid_source") or "canonical_grid"),
+                    "patch_id": int(patch.get("patch_id") or 0),
+                    "row": row,
+                    "col": col,
+                    "bbox_llx": llx,
+                    "bbox_lly": lly,
+                    "bbox_urx": urx,
+                    "bbox_ury": ury,
+                    "center_x": (llx + urx) / 2.0,
+                    "center_y": (lly + ury) / 2.0,
+                    "width": urx - llx,
+                    "height": ury - lly,
+                    "area": max(0.0, urx - llx) * max(0.0, ury - lly),
+                    "edge_position": _edge_position(row, col, rows, cols),
+                }
+            )
+        return out
+
+    @staticmethod
+    def _patch_neighbor_rows(design_id: str, canonical_grid: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = int(canonical_grid.get("rows") or 0)
+        cols = int(canonical_grid.get("cols") or 0)
+        out = []
+        for patch in canonical_grid.get("patches", []):
+            patch_id = int(patch.get("patch_id") or 0)
+            row = int(patch.get("row") or 0)
+            col = int(patch.get("col") or 0)
+            for neighbor_id in _adjacent_patch_ids(row, col, rows, cols):
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "patch_id": patch_id,
+                        "neighbor_patch_id": int(neighbor_id),
+                        "relation": "adjacent_4",
+                    }
+                )
+            for neighbor_id in _neighbor_patch_ids(row, col, rows, cols):
+                if neighbor_id == patch_id:
+                    continue
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "patch_id": patch_id,
+                        "neighbor_patch_id": int(neighbor_id),
+                        "relation": "window_3x3",
+                    }
+                )
+        return out
+
+    @staticmethod
+    def _patch_map_rows(
+        design_id: str,
+        run_id: str,
+        stage_ids: dict[str, str],
+        canonical_grid: dict[str, Any],
+        canonical_maps: CanonicalMaps,
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage_name, stage_maps in canonical_maps.items():
+            for category, channels in stage_maps.items():
+                for channel, matrix in channels.items():
+                    for patch in canonical_grid.get("patches", []):
+                        row = int(patch.get("row") or 0)
+                        col = int(patch.get("col") or 0)
+                        value = _matrix_value(matrix, row, col)
+                        if value is None:
+                            continue
+                        out.append(
+                            {
+                                "design_id": design_id,
+                                "run_id": run_id,
+                                "stage_id": stage_ids.get(stage_name),
+                                "stage_name": stage_name,
+                                "patch_id": int(patch.get("patch_id") or 0),
+                                "category": category,
+                                "channel": channel,
+                                "value": value,
+                                "provenance_id": _stable_id("map", stage_name, category, channel),
+                            }
+                        )
+        return out
+
+    def _patch_feature_rows(
+        self, design_id: str, run_id: str, stage_ids: dict[str, str], stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(
+                self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"
+            ):
+                density = record.get("local_density") or {}
+                estimators = record.get("pre_route_estimators") or {}
+                oracle = record.get("route_oracle") or {}
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_id": stage_ids.get(stage.name),
+                        "stage_name": stage.name,
+                        "patch_id": _patch_id_from_record(record),
+                        "cell_density": density.get("cell_density"),
+                        "macro_density": density.get("macro_density"),
+                        "pin_density": density.get("pin_density"),
+                        "net_density": density.get("net_density"),
+                        "rudy_union": estimators.get("rudy_union"),
+                        "egr_overflow_horizontal": estimators.get("egr_overflow_horizontal"),
+                        "egr_overflow_vertical": estimators.get("egr_overflow_vertical"),
+                        "egr_overflow_union": estimators.get("egr_overflow_union"),
+                        "wire_length": density.get("wire_length") or oracle.get("wire_length"),
+                        "via_count": density.get("via_count") or oracle.get("via_count"),
+                        "feature_availability_code": "available",
+                        "provenance_id": _stable_id("patch_features", stage.name, record.get("patch_key")),
+                    }
+                )
+        return out
+
+    @staticmethod
+    def _route_label_rows(design_id: str, run_id: str, labels: dict[str, Any]) -> list[dict[str, Any]]:
+        out = []
+        for label in labels.get("_route_native_demand_capacity_records", []):
+            route_label = _demand_capacity_label(label)
+            oracle = _route_native_demand_capacity_oracle(route_label)
+            out.append(
+                {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "patch_id": int(label.get("patch_id") or 0),
+                    "horizontal_capacity": oracle.get("horizontal_capacity"),
+                    "horizontal_demand": oracle.get("horizontal_demand"),
+                    "horizontal_overflow": oracle.get("horizontal_overflow"),
+                    "horizontal_utilization": oracle.get("horizontal_utilization"),
+                    "vertical_capacity": oracle.get("vertical_capacity"),
+                    "vertical_demand": oracle.get("vertical_demand"),
+                    "vertical_overflow": oracle.get("vertical_overflow"),
+                    "vertical_utilization": oracle.get("vertical_utilization"),
+                    "union_overflow": oracle.get("union_overflow"),
+                    "union_demand_capacity": route_label.get("union"),
+                    "union_utilization": oracle.get("union_utilization"),
+                    "tightness_class": oracle.get("tightness_class"),
+                    "label_source_artifact_id": _stable_id("artifact", (label.get("source_artifacts") or {}).get("route_native_demand_capacity")),
+                    "availability_code": "available" if label else "missing",
+                }
+            )
+        return out
+
+    @staticmethod
+    def _route_label_layer_rows(
+        design_id: str, run_id: str, labels: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for label in labels.get("_route_native_demand_capacity_records", []):
+            patch_id = int(label.get("patch_id") or 0)
+            source_artifact_id = _stable_id(
+                "artifact", (label.get("source_artifacts") or {}).get("route_native_demand_capacity")
+            )
+            for layer_name, by_direction in (label.get("by_layer") or {}).items():
+                for direction in ("horizontal", "vertical"):
+                    demand = by_direction.get(f"{direction}_demand")
+                    capacity = by_direction.get(f"{direction}_capacity")
+                    overflow = by_direction.get(f"{direction}_overflow")
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "patch_id": patch_id,
+                            "layer_name": str(layer_name),
+                            "direction": direction,
+                            "capacity": capacity,
+                            "demand": demand,
+                            "overflow": overflow,
+                            "utilization": _safe_ratio(demand, capacity),
+                            "demand_capacity": (float(demand or 0.0) - float(capacity or 0.0)),
+                            "source_artifact_id": source_artifact_id,
+                        }
+                    )
+        return out
+
+    @staticmethod
+    def _stage_metric_rows(
+        design_id: str, run_id: str, metrics: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage_name, stage_metrics in metrics.items():
+            for metric_name, metric_value in stage_metrics.items():
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage_name,
+                        "metric_name": metric_name,
+                        "metric_value": json_value(metric_value),
+                        "source_artifact_id": _stable_id("metric", stage_name, metric_name),
+                    }
+                )
+        return out
+
+    def _tech_layer_rows(self, design_id: str) -> list[dict[str, Any]]:
+        out = []
+        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "layers.json"):
+            identity = record.get("identity") or {}
+            routing = record.get("routing_properties") or {}
+            out.append(
+                {
+                    "design_id": design_id,
+                    "layer_name": str(record.get("name") or identity.get("name")),
+                    "layer_index": identity.get("order"),
+                    "routing_direction": routing.get("preferred_direction"),
+                    "pitch": routing.get("pitch"),
+                    "default_width": routing.get("width"),
+                    "metadata": json_value(record),
+                }
+            )
+        return out
+
+    def _tech_via_rows(self, design_id: str) -> list[dict[str, Any]]:
+        out = []
+        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "vias.json"):
+            stack = record.get("layer_stack") or {}
+            out.append(
+                {
+                    "design_id": design_id,
+                    "via_name": str(record.get("name") or (record.get("identity") or {}).get("via_key")),
+                    "cut_layer": stack.get("cut_layer"),
+                    "lower_layer": stack.get("bottom_layer"),
+                    "upper_layer": stack.get("top_layer"),
+                    "is_default": (record.get("identity") or {}).get("via_type") == "default",
+                    "metadata": json_value(record),
+                }
+            )
+        return out
+
+    def _library_cell_rows(self, design_id: str) -> list[dict[str, Any]]:
+        out = []
+        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "cells.json"):
+            classification = record.get("classification") or {}
+            physical = record.get("physical_properties") or {}
+            pins = record.get("pin_summary") or {}
+            out.append(
+                {
+                    "design_id": design_id,
+                    "master": str(record.get("name") or (record.get("identity") or {}).get("cell_key")),
+                    "cell_class": classification.get("cell_class"),
+                    "physical_class": classification.get("physical_class"),
+                    "width": physical.get("width"),
+                    "height": physical.get("height"),
+                    "area": physical.get("area"),
+                    "pin_count": pins.get("pin_count"),
+                    "is_sequential": classification.get("cell_class") == "sequential",
+                    "is_physical_only": (record.get("identity") or {}).get("is_physical_only"),
+                    "metadata": json_value(record),
+                }
+            )
+        return out
+
+    def _patch_entity_ref_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for entity, key_field, path in (
+                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
+                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
+                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
+                ("wire_segment", "wire_key", self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"),
+                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
+            ):
+                for record in _read_jsonl_records(path):
+                    anchor = record.get("patch_anchor") or {}
+                    geometry = record.get("geometry") or record.get("geometry_proxy") or {}
+                    primary = anchor.get("primary_patch_id") or geometry.get("patch_id")
+                    patch_ids = anchor.get("overlap_patch_ids") or geometry.get("overlap_patch_ids") or geometry.get("patch_ids") or []
+                    if primary is not None and primary not in patch_ids:
+                        patch_ids = [primary, *patch_ids]
+                    for patch_id in patch_ids:
+                        out.append(
+                            {
+                                "design_id": design_id,
+                                "run_id": run_id,
+                                "stage_name": stage.name,
+                                "patch_id": int(patch_id),
+                                "entity_type": entity,
+                                "entity_key": str(record.get(key_field) or record.get("id")),
+                                "relation": "primary" if patch_id == primary else "overlap",
+                                "weight": None,
+                                "is_primary": patch_id == primary,
+                            }
+                        )
+        return out
+
+    def _instance_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        by_key = {}
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"):
+                identity = record.get("identity") or {}
+                key = str(identity.get("instance_key") or record.get("name"))
+                by_key.setdefault(
+                    key,
+                    {
+                        "design_id": design_id,
+                        "instance_key": key,
+                        "master": identity.get("master"),
+                        "cell_class": identity.get("cell_class"),
+                        "physical_class": identity.get("physical_class"),
+                        "is_macro": identity.get("is_macro"),
+                        "is_physical_only": identity.get("is_physical_only"),
+                        "is_clock_related": identity.get("is_clock_related"),
+                    },
+                )
+        return list(by_key.values())
+
+    def _instance_stage_state_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"):
+                identity = record.get("identity") or {}
+                state = record.get("physical_state") or {}
+                bbox = state.get("bbox") or {}
+                origin = state.get("origin") or {}
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "instance_key": str(identity.get("instance_key") or record.get("name")),
+                        "placement_status": state.get("placement_status"),
+                        "origin_x": origin.get("x"),
+                        "origin_y": origin.get("y"),
+                        "bbox_llx": bbox.get("llx"),
+                        "bbox_lly": bbox.get("lly"),
+                        "bbox_urx": bbox.get("urx"),
+                        "bbox_ury": bbox.get("ury"),
+                        "orientation": state.get("orientation"),
+                        "patch_id": state.get("patch_id") or (record.get("patch_anchor") or {}).get("primary_patch_id"),
+                        "overlap_patch_ids": json_value(state.get("overlap_patch_ids") or []),
+                        "summary_json": json_value(record),
+                    }
+                )
+        return out
+
+    def _pin_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        by_key = {}
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"):
+                identity = record.get("identity") or {}
+                key = str(record.get("pin_key") or identity.get("pin_key"))
+                by_key.setdefault(
+                    key,
+                    {
+                        "design_id": design_id,
+                        "pin_key": key,
+                        "pin_kind": identity.get("pin_kind"),
+                        "instance_key": identity.get("parent_instance_key"),
+                        "pin_name": identity.get("pin_name"),
+                        "full_name": identity.get("full_name"),
+                        "parent_master": identity.get("parent_master"),
+                        "is_io": identity.get("is_io"),
+                        "is_macro_pin": identity.get("is_macro_pin"),
+                    },
+                )
+        return list(by_key.values())
+
+    def _pin_stage_state_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"):
+                geometry = record.get("geometry") or {}
+                center = geometry.get("center") or {}
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "pin_key": str(record.get("pin_key") or (record.get("identity") or {}).get("pin_key")),
+                        "geometry_status": geometry.get("geometry_status"),
+                        "center_x": center.get("x"),
+                        "center_y": center.get("y"),
+                        "patch_id": geometry.get("patch_id") or (record.get("patch_anchor") or {}).get("primary_patch_id"),
+                        "overlap_patch_ids": json_value(geometry.get("overlap_patch_ids") or []),
+                        "electrical_json": json_value(record.get("electrical_context") or {}),
+                        "timing_json": json_value(record.get("timing_context") or {}),
+                        "route_json": json_value(record.get("route_context") or {}),
+                    }
+                )
+        return out
+
+    def _net_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        by_key = {}
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"):
+                identity = record.get("identity") or {}
+                key = str(record.get("net_key") or identity.get("net_key"))
+                by_key.setdefault(
+                    key,
+                    {
+                        "design_id": design_id,
+                        "net_key": key,
+                        "name": record.get("name") or identity.get("name"),
+                        "use": identity.get("use"),
+                        "net_class": identity.get("net_class"),
+                        "is_clock": identity.get("is_clock"),
+                        "is_reset": identity.get("is_reset"),
+                        "is_power_ground": identity.get("is_power_ground"),
+                        "is_signal": identity.get("is_signal"),
+                    },
+                )
+        return list(by_key.values())
+
+    def _net_terminal_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"):
+                net_key = str(record.get("net_key") or (record.get("identity") or {}).get("net_key"))
+                for terminal in record.get("terminal_refs") or []:
+                    role = str(terminal.get("role") or terminal.get("terminal_role") or "")
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "net_key": net_key,
+                            "pin_key": str(terminal.get("pin_key") or terminal.get("full_name") or terminal.get("name")),
+                            "terminal_role": role,
+                            "is_driver": role.lower() == "driver",
+                            "is_sink": role.lower() == "sink",
+                            "patch_id": terminal.get("patch_id"),
+                            "geometry_status": terminal.get("geometry_status"),
+                            "critical_path_flag": terminal.get("critical_path_flag"),
+                        }
+                    )
+        return out
+
+    def _wire_segment_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"):
+                identity = record.get("identity") or {}
+                geometry = record.get("geometry") or {}
+                start = geometry.get("start") or {}
+                end = geometry.get("end") or {}
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "wire_segment_key": str(record.get("wire_key") or identity.get("wire_key")),
+                        "net_key": identity.get("net_key"),
+                        "source_section": identity.get("source_section"),
+                        "segment_index": identity.get("segment_index"),
+                        "layer": geometry.get("layer"),
+                        "start_x": start.get("x"),
+                        "start_y": start.get("y"),
+                        "end_x": end.get("x"),
+                        "end_y": end.get("y"),
+                        "bbox_json": json_value(geometry.get("bbox") or {}),
+                        "length": geometry.get("length"),
+                        "direction": geometry.get("direction"),
+                        "via_name": (record.get("via_context") or {}).get("via_name"),
+                        "summary_json": json_value(record),
+                    }
+                )
+        return out
+
+    def _wire_patch_intersection_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"):
+                key = str(record.get("wire_key") or (record.get("identity") or {}).get("wire_key"))
+                for item in record.get("patch_intersections") or []:
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "wire_segment_key": key,
+                            "patch_id": int(item.get("patch_id") or 0),
+                            "intersect_length": item.get("intersect_length") or item.get("length"),
+                            "area_proxy": item.get("area_proxy"),
+                            "layer": item.get("layer") or (record.get("geometry") or {}).get("layer"),
+                            "direction": item.get("direction") or (record.get("geometry") or {}).get("direction"),
+                            "is_primary": item.get("is_primary"),
+                            "capacity_contribution": item.get("capacity_contribution"),
+                        }
+                    )
+        return out
+
+    def _routing_vertex_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for graph in _read_jsonl_records(self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"):
+                net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
+                for vertex in graph.get("vertices") or []:
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "net_key": net_key,
+                            "vertex_id": int(vertex.get("vertex_id") or vertex.get("id") or 0),
+                            "x": vertex.get("x") or (vertex.get("point") or {}).get("x"),
+                            "y": vertex.get("y") or (vertex.get("point") or {}).get("y"),
+                            "layer": vertex.get("layer"),
+                            "vertex_kind": vertex.get("vertex_kind") or vertex.get("kind"),
+                            "patch_id": vertex.get("patch_id"),
+                            "terminal_pin_key": vertex.get("terminal_pin_key") or vertex.get("pin_key"),
+                            "match_status": vertex.get("match_status"),
+                        }
+                    )
+        return out
+
+    def _routing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for graph in _read_jsonl_records(self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"):
+                net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
+                for edge in graph.get("edges") or []:
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "net_key": net_key,
+                            "edge_id": int(edge.get("edge_id") or edge.get("id") or 0),
+                            "source_vertex_id": edge.get("source_vertex_id") or edge.get("src") or edge.get("source"),
+                            "target_vertex_id": edge.get("target_vertex_id") or edge.get("dst") or edge.get("target"),
+                            "edge_kind": edge.get("edge_kind") or edge.get("kind"),
+                            "geometry_json": json_value(edge.get("geometry") or {}),
+                            "layer": edge.get("layer"),
+                            "length": edge.get("length"),
+                            "wire_segment_refs": json_value(edge.get("wire_segment_refs") or []),
+                        }
+                    )
+        return out
+
+    def _timing_path_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+                timing = record.get("path_timing") or {}
+                endpoints = record.get("endpoints") or {}
+                out.append(
+                    {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "path_id": str(record.get("path_key") or record.get("id")),
+                        "startpoint": json_value(endpoints.get("startpoint") or {}),
+                        "endpoint": json_value(endpoints.get("endpoint") or {}),
+                        "delay_type": (record.get("analysis_context") or {}).get("delay_type") or (record.get("identity") or {}).get("delay_type"),
+                        "slack": timing.get("slack"),
+                        "arrival": timing.get("arrival"),
+                        "required": timing.get("path_required"),
+                        "path_group": (record.get("identity") or {}).get("clock_group"),
+                        "path_length_summary": json_value(record.get("path_spatial") or {}),
+                        "criticality": timing.get("normalized_criticality"),
+                    }
+                )
+        return out
+
+    def _timing_path_point_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+                path_id = str(record.get("path_key") or record.get("id"))
+                for index, point in enumerate(record.get("path_points") or []):
+                    center = point.get("center") or {}
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "path_id": path_id,
+                            "point_index": int(point.get("point_index") or index),
+                            "pin_key": point.get("pin_key"),
+                            "instance_key": point.get("instance_key"),
+                            "net_key": point.get("net_key"),
+                            "x": center.get("x") or point.get("x"),
+                            "y": center.get("y") or point.get("y"),
+                            "patch_id": point.get("patch_id"),
+                            "arrival": point.get("arrival"),
+                            "slew": point.get("slew"),
+                            "cap": point.get("cap"),
+                            "incr_delay": point.get("incr_delay"),
+                        }
+                    )
+        return out
+
+    def _timing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+                path_id = str(record.get("path_key") or record.get("id"))
+                for index, edge in enumerate(record.get("timing_edges") or []):
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "path_id": path_id,
+                            "edge_id": int(edge.get("edge_id") or index),
+                            "from_pin_key": edge.get("from_pin_key"),
+                            "to_pin_key": edge.get("to_pin_key"),
+                            "edge_delay": edge.get("edge_delay"),
+                            "transition": edge.get("transition"),
+                            "net_key": edge.get("net_key"),
+                            "edge_kind_source": edge.get("edge_kind_source") or edge.get("source"),
+                        }
+                    )
+        return out
+
+    def _timing_wire_path_node_rows(
+        self, design_id: str, run_id: str, stages: list[StageInfo]
+    ) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+                path_id = str(record.get("path_key") or record.get("id"))
+                for index, node in enumerate(record.get("wire_path_nodes") or []):
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "path_id": path_id,
+                            "node_id": int(node.get("node_id") or index),
+                            "point": node.get("point") or node.get("Point"),
+                            "cap": node.get("cap") or node.get("Capacitance"),
+                            "slew": node.get("slew"),
+                            "incr_delay": node.get("incr_delay") or node.get("Incr"),
+                            "match_status": node.get("match_status"),
+                            "payload_json": json_value(node),
+                        }
+                    )
+        return out
+
+    def _stage_delta_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
+        out = []
+        for stage in stages:
+            for entity, key_field, path in (
+                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
+                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
+                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
+                ("patch", "patch_key", self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"),
+                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
+            ):
+                for record in _read_jsonl_records(path):
+                    progressive = record.get("progressive_metadata") or {}
+                    prev_stage = progressive.get("prev_stage")
+                    if not prev_stage:
+                        continue
+                    out.append(
+                        {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "from_stage": prev_stage,
+                            "to_stage": stage.name,
+                            "entity_type": entity,
+                            "entity_key": str(record.get(key_field) or record.get("id")),
+                            "change_type": "progressive_metadata",
+                            "metric_name": "progressive_metadata",
+                            "old_value": None,
+                            "new_value": json_value(progressive),
+                            "delta_value": None,
+                            "provenance_id": _stable_id("stage_delta", stage.name, entity, record.get(key_field)),
+                        }
+                    )
+        return out
+
+    def _remove_legacy_default_outputs(self) -> None:
+        for name in ("vectors", "maps", "labels"):
+            path = self.foundation_dir / name
+            if path.exists():
+                shutil.rmtree(path)
+
+    def _build_manifest(
+        self,
+        stages: list[StageInfo],
+        raw_maps: dict,
+        summary: dict,
+        *,
+        options: dict[str, Any],
+        table_registry: dict[str, Any],
+        table_rows: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
         del stages, raw_maps, summary
+        design_row = (table_rows.get("designs") or [{}])[0]
+        run_row = (table_rows.get("runs") or [{}])[0]
+        stage_rows = table_rows.get("stages") or []
         artifacts = {
             "summary": str((self.foundation_dir / "summary.json").relative_to(self.workspace_dir)),
             "stage_index": str((self.foundation_dir / "stage_index.json").relative_to(self.workspace_dir)),
             "canonical_grid": str((self.foundation_dir / "canonical_grid.json").relative_to(self.workspace_dir)),
             "quality": str((self.foundation_dir / "quality.json").relative_to(self.workspace_dir)),
+            "schema": str((self.foundation_dir / "schema.json").relative_to(self.workspace_dir)),
             "ml_view": str((self.foundation_dir / "views" / "ml" / "dataset_index.json").relative_to(self.workspace_dir)),
             "agent_view": str((self.foundation_dir / "views" / "agent" / "run_summary.json").relative_to(self.workspace_dir)),
         }
         if options.get("include_raw_refs"):
             artifacts["raw_refs"] = str((self.foundation_dir / "raw_refs" / "artifacts.json").relative_to(self.workspace_dir))
         return {
+            "schema_version": SCHEMA_VERSION,
+            "contract_name": CONTRACT_NAME,
+            "storage_format": STORAGE_FORMAT,
             "options": options,
             "workspace": str(self.workspace_dir),
+            "source_workspace": str(self.workspace_dir),
+            "design_id": design_row.get("design_id"),
+            "run_id": run_row.get("run_id"),
+            "stages": [
+                {
+                    "stage_id": row.get("stage_id"),
+                    "stage_order": row.get("stage_order"),
+                    "stage_name": row.get("stage_name"),
+                    "tool": row.get("tool"),
+                    "state": row.get("state"),
+                }
+                for row in stage_rows
+            ],
+            "created_at": datetime.now(UTC).isoformat(),
+            "generated_by": {
+                "extractor": "chipcompiler.data.foundation.FoundationExtractor",
+                "profile": self.profile,
+                "schema_version": SCHEMA_VERSION,
+                "parser_versions": {"foundation_contract": SCHEMA_VERSION},
+            },
             "sources": self._source_signature(),
+            "schema": "foundation_data/ecc/schema.json",
+            "migration_report": "foundation_data/ecc/migration_report.json",
+            "tables": table_registry,
+            "views": {
+                "agent_run_summary": "foundation_data/ecc/views/agent/run_summary.json",
+                "agent_qor_snapshot": "foundation_data/ecc/views/agent/qor_snapshot.json",
+                "agent_evidence_index": "foundation_data/ecc/views/agent/evidence_index.json",
+                "ml_dataset_index": "foundation_data/ecc/views/ml/dataset_index.json",
+                "ml_task_views": "foundation_data/ecc/views/ml/task_views.json",
+                "ml_progressive_patch_dataset": "foundation_data/ecc/views/ml/progressive_patch_dataset.json",
+            },
             "artifacts": artifacts,
         }
 
@@ -1865,14 +2898,41 @@ class FoundationExtractor:
             self.foundation_dir / "views" / "ml" / "dataset_index.json",
             {
                 "profile": self.profile,
+                "schema_version": SCHEMA_VERSION,
+                "tables_dir": "tables",
                 "canonical_grid": "canonical_grid.json",
-                "vectors_dir": "vectors",
-                "maps_dir": "maps",
-                "labels_dir": "labels",
-                "tasks": ["route_demand_capacity"],
+                "sample_keys": ["design_id", "run_id", "patch_id"],
+                "available_tasks": ["progressive_patch_route_demand_capacity"],
             },
         )
-        write_json(self.foundation_dir / "views" / "ml" / "patch_memory_index.json", {"canonical_grid": "canonical_grid.json", "progressive_inputs": {"P1": ["Floorplan"], "P2": ["Floorplan", "place"], "P3": ["Floorplan", "place", "CTS"]}})
+        task_view = {
+            "tasks": {
+                "progressive_patch_route_demand_capacity": {
+                    "input_table": "run_stage_patch_features",
+                    "label_table": "run_patch_route_labels",
+                    "join_keys": ["design_id", "run_id", "patch_id"],
+                    "stage_policy": {
+                        "P1": ["Floorplan"],
+                        "P2": ["Floorplan", "place"],
+                        "P3": ["Floorplan", "place", "CTS"],
+                    },
+                    "leakage_policy": {
+                        "route_truth_as_preroute_input": "forbidden",
+                        "route_only_fields": ["run_patch_route_labels", "run_patch_route_label_layers"],
+                    },
+                }
+            }
+        }
+        write_json(self.foundation_dir / "views" / "ml" / "task_views.json", task_view)
+        write_json(
+            self.foundation_dir / "views" / "ml" / "progressive_patch_dataset.json",
+            {
+                "task": "progressive_patch_route_demand_capacity",
+                "sample_key": ["design_id", "run_id", "patch_id"],
+                "input_table": "run_stage_patch_features",
+                "label_table": "run_patch_route_labels",
+            },
+        )
         write_json(
             self.foundation_dir / "views" / "agent" / "run_summary.json",
             {
@@ -1888,6 +2948,8 @@ class FoundationExtractor:
         write_json(
             self.foundation_dir / "views" / "agent" / "evidence_index.json",
             {
+                "schema": "schema.json",
+                "table_index": "manifest.json:tables",
                 "stage_index": stage_index,
                 "raw_refs": "raw_refs/artifacts.json" if include_raw_refs else None,
                 "raw_refs_disabled": not include_raw_refs,
@@ -3610,6 +4672,65 @@ def _bbox_union(boxes: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
+def _stable_digest(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    digest = _stable_digest(parts)[:16]
+    return f"{prefix}_{digest}"
+
+
+def _stage_id(run_id: str, stage_order: int, stage_name: str) -> str:
+    return _stable_id("stage", run_id, stage_order, stage_name)
+
+
+def _file_digest(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _relative_or_string(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _overall_status(stages: list[StageInfo]) -> str:
+    if not stages:
+        return "unknown"
+    states = {stage.state for stage in stages}
+    return "Success" if states == {"Success"} else ",".join(sorted(states))
+
+
+def _patch_id_from_record(record: dict[str, Any]) -> int:
+    for value in (
+        record.get("id"),
+        record.get("patch_id"),
+        (record.get("identity") or {}).get("patch_id"),
+    ):
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    patch_key = str(record.get("patch_key") or "")
+    if patch_key.startswith("patch:"):
+        try:
+            return int(patch_key.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def _matrix_value(matrix: list[list[float]] | None, row: int, col: int) -> float | None:
     if not matrix or row >= len(matrix) or not matrix[row] or col >= len(matrix[row]):
         return None
@@ -3633,6 +4754,21 @@ def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+
+
+
+def _read_json_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        return [payload]
+    return []
 
 
 def _records_by_name(path: Path) -> dict[str, dict[str, Any]]:
