@@ -8,6 +8,12 @@ from chipcompiler.data.foundation import FoundationExtractor
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
 
 
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -554,6 +560,89 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert not (foundation_dir / "maps").exists()
     assert not (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").exists()
 
+
+def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
+    foundation_dir = result.foundation_dir
+    schema = json.loads((foundation_dir / "schema.json").read_text(encoding="utf-8"))
+
+    def table_rows(name: str, columns: list[str] | None = None) -> list[dict]:
+        return pq.read_table(foundation_dir / schema["tables"][name]["path"], columns=columns).to_pylist()
+
+    semantic_rows = table_rows(
+        "semantic_blocks",
+        [
+            "stage_name",
+            "entity_type",
+            "entity_key",
+            "block_name",
+            "block_payload",
+            "source_doc",
+            "source_field_path",
+            "preserved_reason",
+            "future_normalization_plan",
+        ],
+    )
+    expected = 0
+    for stage in ["Floorplan", "place", "CTS", "route", "drc"]:
+        for entity, folder in (
+            ("patch", "patches"),
+            ("instance", "instances"),
+            ("pin", "pins"),
+            ("net", "nets"),
+            ("wire_segment", "wires"),
+            ("routing_graph", "routing_graphs"),
+            ("timing_path", "timing_paths"),
+        ):
+            for record in _read_jsonl(foundation_dir / "vectors" / folder / f"{stage}.jsonl"):
+                expected += sum(1 for block in ("source_refs", "null_reason", "progressive_metadata") if record.get(block) is not None)
+    assert len(semantic_rows) == expected
+    assert all(row["source_doc"] and row["source_field_path"] for row in semantic_rows)
+    assert all(row["preserved_reason"] and row["future_normalization_plan"] for row in semantic_rows)
+    assert not any(token in row["block_payload"] for row in semantic_rows for token in ("vectors/", "maps/", "labels/"))
+
+    feature_columns = schema["tables"]["run_stage_patch_features"]["columns"]
+    assert {"macro_count", "net_count_overlap"} <= set(feature_columns)
+    feature_rows = table_rows("run_stage_patch_features")
+    place0 = next(row for row in feature_rows if row["stage_name"] == "place" and row["patch_id"] == 0)
+    assert place0["macro_count"] == 1
+    assert place0["net_count_overlap"] == 1
+
+    provenance_rows = table_rows("provenance", ["provenance_id", "artifact_id", "derived_from_artifact_ids"])
+    provenance_by_id = {row["provenance_id"]: row for row in provenance_rows}
+    artifact_ids = {row["artifact_id"] for row in table_rows("artifacts", ["artifact_id"])}
+    for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas"):
+        refs = {row["provenance_id"] for row in table_rows(table_name, ["provenance_id"]) if row["provenance_id"]}
+        assert refs <= set(provenance_by_id)
+        assert any(
+            provenance_by_id[ref]["artifact_id"] in artifact_ids
+            or set(json.loads(provenance_by_id[ref]["derived_from_artifact_ids"] or "[]")) <= artifact_ids
+            for ref in refs
+        )
+
+    delta_rows = table_rows("stage_deltas", ["entity_type", "change_type", "metric_name"])
+    assert any(row["entity_type"] == "patch" and row["change_type"] == "metric_changed" for row in delta_rows)
+    assert any(row["entity_type"] == "timing_path" and row["change_type"] == "state_changed" for row in delta_rows)
+
+    top_patches = json.loads((foundation_dir / "views" / "agent" / "top_patches.json").read_text(encoding="utf-8"))["items"]
+    patch_scores = [item["score"] for item in top_patches]
+    assert patch_scores == sorted(patch_scores, reverse=True)
+    assert top_patches[0]["patch_id"] == 1
+    assert all("score_source" in item and "provenance" in item for item in top_patches)
+
+    top_nets = json.loads((foundation_dir / "views" / "agent" / "top_nets.json").read_text(encoding="utf-8"))["items"]
+    net_scores = [item["score"] for item in top_nets]
+    assert net_scores == sorted(net_scores, reverse=True)
+    assert all("score_source" in item and "provenance" in item for item in top_nets)
+
+    progressive = json.loads((foundation_dir / "views" / "ml" / "progressive_patch_dataset.json").read_text(encoding="utf-8"))
+    assert progressive["stage_policy"] == {"P1": ["Floorplan"], "P2": ["Floorplan", "place"], "P3": ["Floorplan", "place", "CTS"]}
+    assert progressive["leakage_policy"]["route_truth_as_preroute_input"] == "forbidden"
+    assert "route" not in progressive["allowed_input_stages"]["P3"]
+    assert "run_patch_route_label_layers" in progressive["forbidden_input_tables"]
 
 def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     import pyarrow.parquet as pq
@@ -1250,6 +1339,28 @@ END DESIGN
     assert moved["progressive_metadata"]["moved_from_prev_stage"] is True
     assert moved["progressive_metadata"]["dx_from_prev_stage"] == 2.0
     assert moved["progressive_metadata"]["dy_from_prev_stage"] == 2.0
+
+    import pyarrow.parquet as pq
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    delta_rows = pq.read_table(
+        foundation_dir / "tables" / "stage_deltas.parquet",
+        columns=["entity_type", "entity_key", "change_type", "metric_name", "delta_value"],
+    ).to_pylist()
+    assert any(
+        row["entity_type"] == "instance"
+        and row["entity_key"] == "Instance_U1"
+        and row["change_type"] == "moved"
+        and row["metric_name"] == "moved_from_prev_stage"
+        for row in delta_rows
+    )
+    assert any(
+        row["entity_type"] == "instance"
+        and row["entity_key"] == "Instance_U1"
+        and row["metric_name"] == "dx_from_prev_stage"
+        and row["delta_value"] == 2.0
+        for row in delta_rows
+    )
 
 
 def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tmp_path: Path):

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import shutil
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +72,7 @@ class FoundationExtractor:
         self.foundation_dir = self.workspace_dir / FOUNDATION_REL
         self._quality: dict[str, Any] = {"availability": {}, "null_reason": {}, "warnings": []}
         self._raw_refs: list[dict[str, Any]] = []
+        self._raw_ref_by_stage_type_key: dict[tuple[str, str, str], str] = {}
         self._exact_gcell_map_keys: set[tuple[str, str, str]] = set()
         self._lef_macros: dict[str, LefMacro] = {}
         self._lef_layers: dict[str, LefLayer] = {}
@@ -1809,22 +1811,8 @@ class FoundationExtractor:
                 }
                 for index, stage in enumerate(stages)
             ],
-            "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids),
-            "provenance": [
-                {
-                    "provenance_id": "foundation_contract",
-                    "target_table": "*",
-                    "target_key": "*",
-                    "target_field": "*",
-                    "artifact_id": None,
-                    "source_section": "foundation_extractor",
-                    "source_index": None,
-                    "availability_code": "available",
-                    "null_reason": None,
-                    "confidence": 1.0,
-                    "notes": "Initial parquet contract generated from existing extractor records.",
-                }
-            ],
+            "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids, labels, metrics),
+            "provenance": [],
             "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
             "patches": self._patch_table_rows(design_id, canonical_grid),
             "patch_neighbors": self._patch_neighbor_rows(design_id, canonical_grid),
@@ -1853,10 +1841,11 @@ class FoundationExtractor:
             "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
             "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
         }
+        tables["provenance"] = self._provenance_rows(tables)
         return tables
 
     def _artifact_table_rows(
-        self, design_id: str, run_id: str, stage_ids: dict[str, str]
+        self, design_id: str, run_id: str, stage_ids: dict[str, str], labels: dict[str, Any], metrics: dict[str, Any]
     ) -> list[dict[str, Any]]:
         rows = []
         seen: set[str] = set()
@@ -1901,7 +1890,193 @@ class FoundationExtractor:
                     "availability": "available" if path.exists() else "missing",
                 }
             )
+        for label in labels.get("_route_native_demand_capacity_records", []):
+            rel_path = _workspace_relative_path(
+                (label.get("source_artifacts") or {}).get("route_native_demand_capacity"),
+                self.workspace_dir,
+            )
+            if not rel_path or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            path = self.workspace_dir / rel_path
+            rows.append(
+                {
+                    "artifact_id": _source_artifact_id(rel_path),
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_id": stage_ids.get("route"),
+                    "artifact_type": "route_native_demand_capacity",
+                    "relative_path": rel_path,
+                    "sha256": _file_digest(path),
+                    "size_bytes": path.stat().st_size if path.exists() else None,
+                    "parser": "route_native_demand_capacity",
+                    "parser_version": SCHEMA_VERSION,
+                    "availability": "available" if path.exists() else "derived_or_missing_raw",
+                }
+            )
+        metric_artifact_ids: set[str] = set()
+        for stage_name, stage_metrics in metrics.items():
+            for metric_name in stage_metrics:
+                rel_path = _metric_artifact_relative_path(stage_name, metric_name)
+                artifact_id = _stable_id("metric", stage_name, metric_name)
+                if not rel_path or artifact_id in metric_artifact_ids:
+                    continue
+                metric_artifact_ids.add(artifact_id)
+                path = self.workspace_dir / rel_path
+                rows.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_id": stage_ids.get(stage_name),
+                        "artifact_type": "stage_metric_bundle" if metric_name == "features" else "metrics_json",
+                        "relative_path": rel_path,
+                        "sha256": _file_digest(path),
+                        "size_bytes": path.stat().st_size if path.exists() else None,
+                        "parser": "FoundationExtractor",
+                        "parser_version": SCHEMA_VERSION,
+                        "availability": "available" if path.exists() else "derived_bundle",
+                    }
+                )
         return rows
+
+    def _provenance_rows(self, tables: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {
+            "foundation_contract": {
+                "provenance_id": "foundation_contract",
+                "target_table": "*",
+                "target_key": "*",
+                "target_field": "*",
+                "artifact_id": None,
+                "source_section": "foundation_extractor",
+                "source_index": None,
+                "availability_code": "available",
+                "null_reason": None,
+                "confidence": 1.0,
+                "notes": "Parquet contract generated from normalized foundation-data table builders.",
+            }
+        }
+
+        def add(
+            provenance_id: Any,
+            *,
+            target_table: str,
+            target_key: Any = "*",
+            target_field: str = "*",
+            artifact_id: Any = None,
+            derived_from_artifact_ids: list[str] | None = None,
+            source_section: str = "foundation_extractor",
+            source_index: Any = None,
+            availability_code: str = "available",
+            null_reason: Any = None,
+            confidence: float = 1.0,
+            notes: str = "",
+        ) -> None:
+            if not provenance_id:
+                return
+            key = str(provenance_id)
+            rows.setdefault(
+                key,
+                {
+                    "provenance_id": key,
+                    "target_table": target_table,
+                    "target_key": str(target_key),
+                    "target_field": target_field,
+                    "artifact_id": artifact_id,
+                    "derived_from_artifact_ids": json_value(sorted(set(derived_from_artifact_ids or []))),
+                    "source_section": source_section,
+                    "source_index": None if source_index is None else str(source_index),
+                    "availability_code": availability_code,
+                    "null_reason": None if null_reason is None else str(null_reason),
+                    "confidence": float(confidence),
+                    "notes": notes,
+                },
+            )
+
+        for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas"):
+            for row in tables.get(table_name, []):
+                artifact_ids = self._row_artifact_ids_for_provenance(table_name, row)
+                add(
+                    row.get("provenance_id"),
+                    target_table=table_name,
+                    target_key=_provenance_target_key(row),
+                    target_field="*",
+                    artifact_id=artifact_ids[0] if len(artifact_ids) == 1 else None,
+                    derived_from_artifact_ids=artifact_ids,
+                    source_section=table_name,
+                    availability_code=str(row.get("feature_availability_code") or "available"),
+                    notes="Generated from normalized table row provenance.",
+                )
+        for row in tables.get("semantic_blocks", []):
+            add(
+                _stable_id("semantic_block", row.get("stage_name"), row.get("entity_type"), row.get("entity_key"), row.get("block_name")),
+                target_table="semantic_blocks",
+                target_key=_provenance_target_key(row),
+                target_field=str(row.get("block_name") or "*"),
+                source_section=str(row.get("source_doc") or "legacy_schema_migration"),
+                availability_code="available",
+                notes=str(row.get("preserved_reason") or "Preserved semantic block."),
+            )
+        return list(rows.values())
+
+    def _row_artifact_ids_for_provenance(self, table_name: str, row: dict[str, Any]) -> list[str]:
+        if table_name == "run_stage_patch_maps":
+            rel_path = self._map_source_path(str(row.get("stage_name") or ""), str(row.get("category") or ""), str(row.get("channel") or ""))
+            return [_source_artifact_id(rel_path)] if rel_path else []
+        if table_name == "run_stage_patch_features":
+            stage_name = str(row.get("stage_name") or "")
+            artifact_ids = []
+            for rel_path in self._stage_feature_source_paths(stage_name):
+                artifact_ids.append(_source_artifact_id(rel_path))
+            return sorted(set(artifact_ids))
+        if table_name == "stage_deltas":
+            rel_path = self._entity_stage_source_path(str(row.get("to_stage") or ""), str(row.get("entity_type") or ""))
+            return [_source_artifact_id(rel_path)] if rel_path else []
+        return []
+
+    def _map_source_path(self, stage_name: str, category: str, channel: str) -> str | None:
+        preferred_types = ("gcell_patch_map_csv", "egr_demand_capacity_map_csv", "map_csv")
+        candidate_keys = [channel]
+        if category == "congestion" and channel in {"horizontal", "vertical", "union"}:
+            candidate_keys.append(f"{channel}_overflow")
+        for artifact_type in preferred_types:
+            for key in candidate_keys:
+                rel_path = self._raw_ref_by_stage_type_key.get((stage_name, artifact_type, key))
+                if rel_path:
+                    return rel_path
+        stage_dir = _stage_directory_name(stage_name)
+        if category == "density":
+            return f"{stage_dir}/feature/gcell_patch_map/density_map/{stage_name}_{channel}.csv"
+        if category == "rudy":
+            return f"{stage_dir}/feature/gcell_patch_map/RUDY_map/{stage_name}_{channel}.csv"
+        if category == "margin":
+            return f"{stage_dir}/feature/gcell_patch_map/margin_map/{stage_name}_{channel}_margin.csv"
+        if category == "congestion":
+            return f"{stage_dir}/feature/egr_congestion_map/{stage_name}_egr_{channel}_overflow.csv"
+        return None
+
+    def _stage_feature_source_paths(self, stage_name: str) -> list[str]:
+        paths = []
+        stage_dir = _stage_directory_name(stage_name)
+        for ref in self._raw_refs:
+            if ref.get("stage") == stage_name and ref.get("type") in {"gcell_patch_map_csv", "egr_demand_capacity_map_csv", "map_csv", "def", "sta_report_json", "drc_violation_map"}:
+                paths.append(str(ref.get("path")))
+        if not paths:
+            paths.append(f"{stage_dir}/output/gcd_{stage_name}.def")
+        return [path for path in paths if path]
+
+    def _entity_stage_source_path(self, stage_name: str, entity_type: str) -> str | None:
+        for ref in self._raw_refs:
+            if ref.get("stage") == stage_name and ref.get("type") == "def":
+                return str(ref.get("path"))
+        if entity_type == "timing_path":
+            for ref in self._raw_refs:
+                if ref.get("stage") == stage_name and ref.get("type") == "sta_report_json":
+                    return str(ref.get("path"))
+        stage_dir = _stage_directory_name(stage_name)
+        if entity_type == "timing_path":
+            return f"{stage_dir}/data/sta/gcd.rpt.json"
+        return f"{stage_dir}/output/gcd_{stage_name}.def"
 
     def _semantic_block_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
@@ -1918,12 +2093,13 @@ class FoundationExtractor:
                 ("routing_graph", "graph_key", self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"),
                 ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
             ):
-                for record in _read_jsonl_records(path)[:10]:
+                for record in _read_jsonl_records(path):
                     entity_key = str(record.get(key_field) or record.get("id"))
                     for block_name in block_names:
                         payload = record.get(block_name)
                         if payload is None:
                             continue
+                        landing = _semantic_block_landing(entity_type, block_name)
                         rows.append(
                             {
                                 "design_id": design_id,
@@ -1932,11 +2108,15 @@ class FoundationExtractor:
                                 "entity_type": entity_type,
                                 "entity_key": entity_key,
                                 "block_name": block_name,
-                                "block_payload": json_value(payload),
+                                "block_payload": json_value(_semantic_block_payload(payload, entity_type, block_name, stage.name)),
                                 "source_schema_version": "legacy_jsonl_iccd_full_v1",
-                                "normalized_status": "preserved_only",
-                                "target_table": None,
-                                "target_key": None,
+                                "source_doc": _semantic_block_source_doc(entity_type),
+                                "source_field_path": f"{_semantic_block_source_doc(entity_type)}:{block_name}",
+                                "preserved_reason": "Preserved legacy nested semantics during parquet normalization.",
+                                "normalized_status": landing["normalized_status"],
+                                "future_normalization_plan": landing["future_normalization_plan"],
+                                "target_table": landing["target_table"],
+                                "target_key": landing["target_key"],
                             }
                         )
         return rows
@@ -1985,6 +2165,7 @@ class FoundationExtractor:
                 "allowed_status": ["preserved_only", "side_table", "strong_typed", "deprecated_with_reason"],
                 "preserved_only_requires_future_normalization_plan": True,
             },
+            "field_migration_checklist": _field_migration_checklist(),
         }
 
     @staticmethod
@@ -2094,7 +2275,10 @@ class FoundationExtractor:
                 self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"
             ):
                 density = record.get("local_density") or {}
+                connectivity = record.get("local_connectivity") or {}
                 estimators = record.get("pre_route_estimators") or {}
+                timing = record.get("timing_context") or {}
+                drc = record.get("drc_context") or {}
                 oracle = record.get("route_oracle") or {}
                 out.append(
                     {
@@ -2107,12 +2291,35 @@ class FoundationExtractor:
                         "macro_density": density.get("macro_density"),
                         "pin_density": density.get("pin_density"),
                         "net_density": density.get("net_density"),
+                        "instance_count_center": density.get("instance_count_center"),
+                        "instance_count_overlap": density.get("instance_count_overlap"),
+                        "stdcell_count": density.get("stdcell_count_center") or density.get("stdcell_count_overlap"),
+                        "macro_count": density.get("macro_count_overlap") or density.get("macro_count_center"),
+                        "physical_only_count": density.get("physical_only_count_overlap"),
+                        "net_count_anchor": connectivity.get("net_count_anchor"),
+                        "net_count_overlap": connectivity.get("net_count_overlap"),
+                        "cross_patch_net_count": connectivity.get("cross_patch_net_count"),
+                        "high_fanout_net_count": connectivity.get("high_fanout_net_count"),
+                        "clock_net_count": connectivity.get("clock_net_count"),
+                        "reset_net_count": connectivity.get("reset_net_count"),
+                        "local_hpwl_sum": connectivity.get("local_hpwl_sum"),
+                        "local_hpwl_max": connectivity.get("local_hpwl_max"),
+                        "local_hpwl_mean": connectivity.get("local_hpwl_mean"),
+                        "rudy_horizontal": estimators.get("rudy_horizontal"),
+                        "rudy_vertical": estimators.get("rudy_vertical"),
                         "rudy_union": estimators.get("rudy_union"),
+                        "margin_horizontal": estimators.get("margin_horizontal"),
+                        "margin_vertical": estimators.get("margin_vertical"),
                         "egr_overflow_horizontal": estimators.get("egr_overflow_horizontal"),
                         "egr_overflow_vertical": estimators.get("egr_overflow_vertical"),
                         "egr_overflow_union": estimators.get("egr_overflow_union"),
                         "wire_length": density.get("wire_length") or oracle.get("wire_length"),
                         "via_count": density.get("via_count") or oracle.get("via_count"),
+                        "critical_path_count": timing.get("critical_path_count"),
+                        "worst_slack_min": timing.get("worst_slack_min"),
+                        "max_slew": timing.get("max_slew"),
+                        "max_cap": timing.get("max_cap"),
+                        "drc_count": drc.get("count"),
                         "feature_availability_code": "available",
                         "provenance_id": _stable_id("patch_features", stage.name, record.get("patch_key")),
                     }
@@ -2142,7 +2349,7 @@ class FoundationExtractor:
                     "union_demand_capacity": route_label.get("union"),
                     "union_utilization": oracle.get("union_utilization"),
                     "tightness_class": oracle.get("tightness_class"),
-                    "label_source_artifact_id": _stable_id("artifact", (label.get("source_artifacts") or {}).get("route_native_demand_capacity")),
+                    "label_source_artifact_id": _source_artifact_id((label.get("source_artifacts") or {}).get("route_native_demand_capacity")),
                     "availability_code": "available" if label else "missing",
                 }
             )
@@ -2155,8 +2362,8 @@ class FoundationExtractor:
         out = []
         for label in labels.get("_route_native_demand_capacity_records", []):
             patch_id = int(label.get("patch_id") or 0)
-            source_artifact_id = _stable_id(
-                "artifact", (label.get("source_artifacts") or {}).get("route_native_demand_capacity")
+            source_artifact_id = _source_artifact_id(
+                (label.get("source_artifacts") or {}).get("route_native_demand_capacity")
             )
             for layer_name, by_direction in (label.get("by_layer") or {}).items():
                 for direction in ("horizontal", "vertical"):
@@ -2468,7 +2675,7 @@ class FoundationExtractor:
                         "length": geometry.get("length"),
                         "direction": geometry.get("direction"),
                         "via_name": (record.get("via_context") or {}).get("via_name"),
-                        "summary_json": json_value(record),
+                        "summary_json": json_value(_wire_segment_summary(record)),
                     }
                 )
         return out
@@ -2666,25 +2873,75 @@ class FoundationExtractor:
                 for record in _read_jsonl_records(path):
                     progressive = record.get("progressive_metadata") or {}
                     prev_stage = progressive.get("prev_stage")
+                    if not prev_stage and (entity == "timing_path" or progressive.get("exists_in_prev_stage") is not None):
+                        prev_stage = _previous_stage_name(stages, stage.name)
                     if not prev_stage:
                         continue
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "from_stage": prev_stage,
-                            "to_stage": stage.name,
-                            "entity_type": entity,
-                            "entity_key": str(record.get(key_field) or record.get("id")),
-                            "change_type": "progressive_metadata",
-                            "metric_name": "progressive_metadata",
-                            "old_value": None,
-                            "new_value": json_value(progressive),
-                            "delta_value": None,
-                            "provenance_id": _stable_id("stage_delta", stage.name, entity, record.get(key_field)),
-                        }
-                    )
+                    entity_key = str(record.get(key_field) or record.get("id"))
+                    emitted = False
+                    for metric_name, (change_type, value) in self._progressive_delta_metrics(progressive).items():
+                        out.append(
+                            {
+                                "design_id": design_id,
+                                "run_id": run_id,
+                                "from_stage": prev_stage,
+                                "to_stage": stage.name,
+                                "entity_type": entity,
+                                "entity_key": entity_key,
+                                "change_type": change_type,
+                                "metric_name": metric_name,
+                                "old_value": None,
+                                "new_value": None if value is None else str(value),
+                                "delta_value": value,
+                                "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, metric_name),
+                            }
+                        )
+                        emitted = True
+                    if not emitted:
+                        out.append(
+                            {
+                                "design_id": design_id,
+                                "run_id": run_id,
+                                "from_stage": prev_stage,
+                                "to_stage": stage.name,
+                                "entity_type": entity,
+                                "entity_key": entity_key,
+                                "change_type": "state_changed" if progressive.get("exists_in_prev_stage") is False else "metadata_changed",
+                                "metric_name": "available_from",
+                                "old_value": None,
+                                "new_value": str(progressive.get("available_from") or progressive.get("created_stage") or stage.name),
+                                "delta_value": None,
+                                "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, "available_from"),
+                            }
+                        )
         return out
+
+
+    @staticmethod
+    def _progressive_delta_metrics(progressive: dict[str, Any]) -> dict[str, tuple[str, float | None]]:
+        metrics: dict[str, tuple[str, float | None]] = {}
+        for key, value in progressive.items():
+            if key.endswith("_delta_from_prev_stage"):
+                numeric = _to_float(value)
+                if numeric is not None:
+                    metrics[key] = ("metric_changed", numeric)
+            elif key in {"moved_from_prev_stage", "is_new_routed_geometry"} and value is True:
+                metrics[key] = ("moved", None)
+            elif key in {"dx_from_prev_stage", "dy_from_prev_stage"}:
+                numeric = _to_float(value)
+                if numeric is not None and numeric != 0.0:
+                    metrics[key] = ("moved", numeric)
+            elif key in {"geometry_changed_from_prev_stage"} and value is True:
+                metrics[key] = ("geometry_changed", None)
+            elif key in {"net_changed_from_prev_stage", "terminal_count_changed_from_prev_stage", "patch_span_delta_from_prev_stage"}:
+                numeric = _to_float(value)
+                if value is True or (numeric is not None and numeric != 0.0):
+                    metrics[key] = ("connectivity_changed", numeric)
+            elif key in {"slack_delta_from_prev_stage", "delay_delta_from_prev_stage", "rank_delta_from_prev_stage", "endpoint_best_slack_delta_from_prev_stage"}:
+                numeric = _to_float(value)
+                if numeric is not None:
+                    metrics[key] = ("timing_changed", numeric)
+        return metrics
 
     def _remove_legacy_default_outputs(self) -> None:
         for name in ("vectors", "maps", "labels"):
@@ -2924,6 +3181,7 @@ class FoundationExtractor:
             }
         }
         write_json(self.foundation_dir / "views" / "ml" / "task_views.json", task_view)
+        progressive_policy = task_view["tasks"]["progressive_patch_route_demand_capacity"]
         write_json(
             self.foundation_dir / "views" / "ml" / "progressive_patch_dataset.json",
             {
@@ -2931,6 +3189,13 @@ class FoundationExtractor:
                 "sample_key": ["design_id", "run_id", "patch_id"],
                 "input_table": "run_stage_patch_features",
                 "label_table": "run_patch_route_labels",
+                "join_keys": progressive_policy["join_keys"],
+                "stage_policy": progressive_policy["stage_policy"],
+                "allowed_input_stages": progressive_policy["stage_policy"],
+                "label_source": {"table": "run_patch_route_labels", "stage": "route", "artifact_table": "artifacts"},
+                "forbidden_input_tables": ["run_patch_route_labels", "run_patch_route_label_layers"],
+                "forbidden_input_columns": ["route_oracle", "label_refs", "label_source_artifact_id", "source_artifact_id"],
+                "leakage_policy": progressive_policy["leakage_policy"],
             },
         )
         write_json(
@@ -2945,6 +3210,10 @@ class FoundationExtractor:
             },
         )
         write_json(self.foundation_dir / "views" / "agent" / "qor_snapshot.json", {"metrics": metrics, "labels": labels})
+        top_patches = _top_patch_view_items(self.foundation_dir)
+        top_nets = _top_net_view_items(self.foundation_dir)
+        write_json(self.foundation_dir / "views" / "agent" / "top_patches.json", {"items": top_patches})
+        write_json(self.foundation_dir / "views" / "agent" / "top_nets.json", {"items": top_nets})
         write_json(
             self.foundation_dir / "views" / "agent" / "evidence_index.json",
             {
@@ -2953,6 +3222,11 @@ class FoundationExtractor:
                 "stage_index": stage_index,
                 "raw_refs": "raw_refs/artifacts.json" if include_raw_refs else None,
                 "raw_refs_disabled": not include_raw_refs,
+                "entity_evidence": {
+                    "patches": {"view": "views/agent/top_patches.json", "table": "run_stage_patch_features", "key": "patch_id"},
+                    "nets": {"view": "views/agent/top_nets.json", "table": "nets", "key": "net_key"},
+                    "provenance": {"table": "provenance", "key": "provenance_id"},
+                },
             },
         )
 
@@ -2962,11 +3236,31 @@ class FoundationExtractor:
         except ValueError:
             relative = str(path)
         self._raw_refs.append({"stage": stage.name, "type": artifact_type, "path": relative, "metadata": metadata})
+        for key in _raw_ref_lookup_keys(metadata):
+            self._raw_ref_by_stage_type_key[(stage.name, artifact_type, key)] = relative
 
     def _mark(self, entity: str, key: str, status: str, reason: str = "") -> None:
         self._quality.setdefault("availability", {}).setdefault(entity, {})[key] = status
         if status != "available":
             self._quality.setdefault("null_reason", {}).setdefault(entity, {})[key] = reason or "missing"
+
+
+def _previous_stage_name(stages: list[StageInfo], stage_name: str) -> str | None:
+    names = [stage.name for stage in stages]
+    if stage_name not in names:
+        return None
+    index = names.index(stage_name)
+    return names[index - 1] if index > 0 else None
+
+
+def _raw_ref_lookup_keys(metadata: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for raw_key in (metadata.get("key"), metadata.get("category")):
+        if raw_key:
+            keys.add(str(raw_key))
+    if metadata.get("category") == "congestion":
+        keys.update({"horizontal", "vertical", "union", "horizontal_overflow", "vertical_overflow", "union_overflow"})
+    return keys
 
 
 def _matrix_to_patch_values(matrix: list[list[float]], canonical_grid: dict) -> list[dict[str, Any]]:
@@ -4703,6 +4997,152 @@ def _relative_or_string(path: Path, root: Path) -> str:
         return str(path)
 
 
+
+
+def _workspace_relative_artifact_path(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    path = Path(text)
+    parts = path.parts
+    for marker in (
+        "Synthesis_yosys",
+        "Floorplan_ecc",
+        "fixFanout_ecc",
+        "place_dreamplace",
+        "CTS_ecc",
+        "legalization_dreamplace",
+        "route_ecc",
+        "drc_ecc",
+        "filler_ecc",
+        "home",
+    ):
+        if marker in parts:
+            return str(Path(*parts[parts.index(marker):]))
+    return text
+
+
+def _source_artifact_id(value: Any) -> str:
+    return _stable_id("artifact", _workspace_relative_artifact_path(value))
+
+def _metric_artifact_relative_path(stage_name: str, metric_name: str) -> str:
+    directory = _stage_directory_name(stage_name)
+    if metric_name == "features":
+        return f"{directory}/feature"
+    return f"{directory}/analysis/{metric_name}"
+
+
+def _stage_directory_name(stage_name: str) -> str:
+    mapping = {
+        "Synthesis": "Synthesis_yosys",
+        "Floorplan": "Floorplan_ecc",
+        "fixFanout": "fixFanout_ecc",
+        "place": "place_dreamplace",
+        "CTS": "CTS_ecc",
+        "legalization": "legalization_dreamplace",
+        "route": "route_ecc",
+        "drc": "drc_ecc",
+        "filler": "filler_ecc",
+    }
+    return mapping.get(stage_name, stage_name)
+
+
+def _provenance_target_key(row: dict[str, Any]) -> str:
+    preferred = [
+        "design_id",
+        "run_id",
+        "stage_name",
+        "patch_id",
+        "entity_type",
+        "entity_key",
+        "net_key",
+        "pin_key",
+        "instance_key",
+        "wire_segment_key",
+        "path_id",
+        "metric_name",
+        "category",
+        "channel",
+        "block_name",
+    ]
+    return json_value({key: row.get(key) for key in preferred if key in row and row.get(key) is not None})
+
+
+def _semantic_block_source_doc(entity_type: str) -> str:
+    return {
+        "patch": "vec_patches.md",
+        "instance": "vec_instance.md",
+        "pin": "vec_pins.md",
+        "net": "vec_nets.md",
+        "wire_segment": "vec_wires.md",
+        "routing_graph": "vec_routing_graph.md",
+        "timing_path": "vec_timing_paths.md",
+    }.get(entity_type, "legacy_foundation_schema.md")
+
+
+def _semantic_block_landing(entity_type: str, block_name: str) -> dict[str, str]:
+    if block_name == "source_refs":
+        return {
+            "normalized_status": "side_table",
+            "target_table": "provenance",
+            "target_key": "entity scoped provenance_id",
+            "future_normalization_plan": "Keep detailed source refs in provenance/artifacts; migrate residual source-specific fields into field-level provenance rows.",
+        }
+    if block_name == "progressive_metadata":
+        return {
+            "normalized_status": "side_table",
+            "target_table": "stage_deltas",
+            "target_key": "entity scoped delta rows",
+            "future_normalization_plan": "Expand high-value movement, geometry, connectivity and timing deltas into scalar stage_deltas metrics.",
+        }
+    return {
+        "normalized_status": "preserved_only",
+        "target_table": "semantic_blocks",
+        "target_key": f"{entity_type}:{block_name}",
+        "future_normalization_plan": "Normalize recurring null/availability reasons into provenance and quality summaries after migration audit.",
+    }
+
+
+def _semantic_block_payload(payload: Any, entity_type: str, block_name: str, stage_name: str) -> Any:
+    if block_name != "source_refs":
+        return payload
+    rewritten = _rewrite_legacy_refs(payload, entity_type, stage_name)
+    if isinstance(rewritten, dict):
+        return {**rewritten, "semantic_entity_type": entity_type}
+    return rewritten
+
+
+def _rewrite_legacy_refs(value: Any, entity_type: str, stage_name: str) -> Any:
+    table_map = {
+        "patches": "run_stage_patch_features",
+        "instances": "instance_stage_state",
+        "pins": "pin_stage_state",
+        "nets": "net_terminals",
+        "wires": "wire_segments",
+        "timing_paths": "timing_paths",
+        "routing_graph": "routing_vertices/routing_edges",
+        "density_maps": "run_stage_patch_maps:category=density",
+        "rudy_maps": "run_stage_patch_maps:category=rudy",
+        "egr_maps": "run_stage_patch_maps:category=congestion",
+        "maps": "run_stage_patch_maps",
+        "tech_layer": "tech_layers",
+        "tech_via": "tech_vias",
+    }
+    if isinstance(value, str):
+        if any(token in value for token in ("vectors/", "maps/", "labels/")):
+            return {
+                "table": table_map.get(entity_type, "table_index"),
+                "query": {"stage_name": stage_name},
+                "legacy_ref_replaced": True,
+                "legacy_ref_hash": _stable_digest((value,))[:16],
+            }
+        return value
+    if isinstance(value, list):
+        return [_rewrite_legacy_refs(item, entity_type, stage_name) for item in value]
+    if isinstance(value, dict):
+        return {key: _rewrite_legacy_refs(item, str(key), stage_name) for key, item in value.items()}
+    return value
+
 def _overall_status(stages: list[StageInfo]) -> str:
     if not stages:
         return "unknown"
@@ -5106,6 +5546,88 @@ def _summary_flow(flow: dict[str, Any], stages: list[StageInfo]) -> dict[str, An
         normalized["steps"] = [by_name[stage.name] for stage in stages if stage.name in by_name]
     return normalized
 
+
+
+def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
+    rows = _read_jsonl_records(foundation_dir / "vectors" / "patches" / "route.jsonl")
+    if not rows:
+        for path in sorted((foundation_dir / "vectors" / "patches").glob("*.jsonl")):
+            rows = _read_jsonl_records(path)
+            if rows:
+                break
+    items = []
+    for record in rows:
+        patch_id = _patch_id_from_record(record)
+        oracle = record.get("route_oracle") or {}
+        native = oracle.get("native_demand_capacity") if isinstance(oracle, dict) else {}
+        drc = record.get("drc_context") if isinstance(record.get("drc_context"), dict) else {}
+        timing = record.get("timing_context") if isinstance(record.get("timing_context"), dict) else {}
+        density = record.get("local_density") if isinstance(record.get("local_density"), dict) else {}
+        score = _first_numeric(
+            native.get("union_overflow") if isinstance(native, dict) else None,
+            drc.get("count"),
+            _negative_or_none(timing.get("worst_slack_min")),
+            density.get("cell_density"),
+        )
+        if score is None:
+            continue
+        items.append(
+            {
+                "patch_id": patch_id,
+                "stage": record.get("stage"),
+                "table": "run_stage_patch_features",
+                "query": {"patch_id": patch_id},
+                "label_table": "run_patch_route_labels",
+                "score": score,
+                "score_source": "route_native_union_overflow" if isinstance(native, dict) and native.get("union_overflow") is not None else "fallback_qor_or_density",
+                "provenance": {"table": "provenance", "query": {"target_table": "run_stage_patch_features", "patch_id": patch_id}},
+            }
+        )
+    return sorted(items, key=lambda item: (item["score"] is not None, item["score"]), reverse=True)[:20]
+
+
+def _top_net_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
+    rows = _read_jsonl_records(foundation_dir / "vectors" / "nets" / "route.jsonl")
+    if not rows:
+        for path in sorted((foundation_dir / "vectors" / "nets").glob("*.jsonl")):
+            rows = _read_jsonl_records(path)
+            if rows:
+                break
+    items = []
+    for record in rows:
+        net_key = str(record.get("net_key") or (record.get("identity") or {}).get("net_key"))
+        summary = record.get("connectivity_summary") or {}
+        route = record.get("route_analysis") or {}
+        fanout = _to_float(summary.get("fanout")) or 0.0
+        route_wire_length = _to_float(route.get("total_routed_length"))
+        score = _first_numeric(route_wire_length, fanout)
+        items.append(
+            {
+                "net_key": net_key,
+                "stage": record.get("stage"),
+                "table": "nets",
+                "query": {"entity_key": net_key},
+                "fanout": summary.get("fanout"),
+                "route_wire_length": route.get("total_routed_length"),
+                "score": score,
+                "score_source": "route_wire_length" if route_wire_length is not None else "fanout",
+                "provenance": {"table": "provenance", "query": {"target_table": "nets", "entity_key": net_key}},
+            }
+        )
+    return sorted(items, key=lambda item: (item["score"] is not None, item["score"]), reverse=True)[:20]
+
+
+def _first_numeric(*values: Any) -> float | None:
+    for value in values:
+        numeric = _to_float(value)
+        if numeric is not None:
+            return numeric
+    return None
+
+
+def _negative_or_none(value: Any) -> float | None:
+    numeric = _to_float(value)
+    return -numeric if numeric is not None else None
 
 def _summary_stages(summary: dict[str, Any]) -> list[dict[str, Any]]:
     steps = summary.get("flow", {}).get("steps", [])
@@ -5938,6 +6460,25 @@ def _ordered_net_record(record: dict[str, Any], record_id: int) -> dict[str, Any
 
 
 
+
+def _wire_segment_summary(record: dict[str, Any]) -> dict[str, Any]:
+    identity = record.get("identity") or {}
+    geometry = record.get("geometry") or {}
+    layer_context = record.get("layer_context") or {}
+    track_context = record.get("track_context") or {}
+    patch_anchor = record.get("patch_anchor") or {}
+    return {
+        "wire_key": record.get("wire_key") or identity.get("wire_key"),
+        "net_key": identity.get("net_key"),
+        "wire_class": identity.get("wire_class"),
+        "segment_kind": identity.get("segment_kind"),
+        "geometry_status": geometry.get("geometry_status"),
+        "shape_type": geometry.get("shape_type"),
+        "layer_index": layer_context.get("layer_index"),
+        "track_available": track_context.get("available"),
+        "primary_patch_id": patch_anchor.get("primary_patch_id"),
+    }
+
 def _wire_class(net: DefNet) -> str:
     identity = _net_identity(net)
     return str(identity["net_class"])
@@ -6576,6 +7117,39 @@ def _distance_to_die_boundary(bbox: dict[str, Any], die_bbox: dict[str, Any] | N
         return None
     return {"left": float(bbox["llx"]) - float(die_bbox["llx"]), "right": float(die_bbox["urx"]) - float(bbox["urx"]), "bottom": float(bbox["lly"]) - float(die_bbox["lly"]), "top": float(die_bbox["ury"]) - float(bbox["ury"])}
 
+
+
+def _field_migration_checklist() -> list[dict[str, Any]]:
+    rows = [
+        ("vec_patches.md:identity", "preserved_as_table", ["patches"], "patch stable key and grid identity"),
+        ("vec_patches.md:geometry", "preserved_as_table", ["patches"], "patch bbox/center/die geometry"),
+        ("vec_patches.md:local_density.instance_count_center", "preserved_as_table", ["run_stage_patch_features.instance_count_center"], "patch density scalar"),
+        ("vec_patches.md:local_connectivity.cross_patch_net_count", "preserved_as_table", ["run_stage_patch_features.cross_patch_net_count"], "connectivity scalar"),
+        ("vec_patches.md:pre_route_estimators.rudy_horizontal", "preserved_as_table", ["run_stage_patch_features.rudy_horizontal"], "pre-route estimator scalar"),
+        ("vec_patches.md:timing_context", "preserved_as_table", ["run_stage_patch_features", "timing_paths", "semantic_blocks"], "timing summary and detailed path tables"),
+        ("vec_patches.md:drc_context", "preserved_as_table", ["run_stage_patch_features.drc_count", "semantic_blocks"], "DRC count and residual context"),
+        ("vec_patches.md:source_refs", "preserved_as_semantic_block", ["provenance", "semantic_blocks"], "source refs are rewritten to table/API refs"),
+        ("vec_patches.md:null_reason", "preserved_as_semantic_block", ["quality", "semantic_blocks"], "null reasons remain auditable"),
+        ("vec_patches.md:progressive_metadata", "preserved_as_table", ["stage_deltas", "semantic_blocks"], "progressive deltas and residual metadata"),
+        ("labels_route_native_demand_capacity.md:by_layer", "preserved_as_table", ["run_patch_route_label_layers"], "direction/layer attribution"),
+        ("vec_wires.md:patch_intersections", "preserved_as_table", ["wire_patch_intersections"], "wire per-patch contribution"),
+        ("vec_wires.md:route_context", "preserved_as_semantic_block", ["semantic_blocks", "wire_segments"], "route context is not embedded in core wire row"),
+        ("vec_nets.md:terminal_refs", "preserved_as_table", ["net_terminals"], "terminal refs split from net row"),
+        ("vec_timing_paths.md:path_points", "preserved_as_table", ["timing_path_points"], "point sequence"),
+        ("vec_timing_paths.md:wire_path_nodes", "preserved_as_table", ["timing_wire_path_nodes"], "wire path evidence"),
+        ("views_ml.md:leakage_policy", "preserved_as_view", ["views/ml/task_views.json"], "training leakage policy"),
+        ("views_agent.md:evidence_index", "preserved_as_view", ["views/agent/evidence_index.json", "views/agent/top_patches.json", "views/agent/top_nets.json"], "agent evidence entrypoints"),
+    ]
+    return [
+        {
+            "source_field_path": source,
+            "status": status,
+            "target": target,
+            "preserved_reason": reason,
+            "deprecated_with_reason": None,
+        }
+        for source, status, target, reason in rows
+    ]
 
 def _edge_position(row: int, col: int, rows: int, cols: int) -> str:
     vertical = "top" if row == 0 else "bottom" if row == rows - 1 else ""
