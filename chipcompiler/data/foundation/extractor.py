@@ -2044,16 +2044,7 @@ class FoundationExtractor:
                 rel_path = self._raw_ref_by_stage_type_key.get((stage_name, artifact_type, key))
                 if rel_path:
                     return rel_path
-        stage_dir = _stage_directory_name(stage_name)
-        if category == "density":
-            return f"{stage_dir}/feature/gcell_patch_map/density_map/{stage_name}_{channel}.csv"
-        if category == "rudy":
-            return f"{stage_dir}/feature/gcell_patch_map/RUDY_map/{stage_name}_{channel}.csv"
-        if category == "margin":
-            return f"{stage_dir}/feature/gcell_patch_map/margin_map/{stage_name}_{channel}_margin.csv"
-        if category == "congestion":
-            return f"{stage_dir}/feature/egr_congestion_map/{stage_name}_egr_{channel}_overflow.csv"
-        return None
+        return self._fallback_existing_artifact_path(stage_name)
 
     def _stage_feature_source_paths(self, stage_name: str) -> list[str]:
         paths = []
@@ -2062,7 +2053,9 @@ class FoundationExtractor:
             if ref.get("stage") == stage_name and ref.get("type") in {"gcell_patch_map_csv", "egr_demand_capacity_map_csv", "map_csv", "def", "sta_report_json", "drc_violation_map"}:
                 paths.append(str(ref.get("path")))
         if not paths:
-            paths.append(f"{stage_dir}/output/gcd_{stage_name}.def")
+            fallback = self._fallback_existing_artifact_path(stage_name)
+            if fallback:
+                paths.append(fallback)
         return [path for path in paths if path]
 
     def _entity_stage_source_path(self, stage_name: str, entity_type: str) -> str | None:
@@ -2073,10 +2066,16 @@ class FoundationExtractor:
             for ref in self._raw_refs:
                 if ref.get("stage") == stage_name and ref.get("type") == "sta_report_json":
                     return str(ref.get("path"))
+        return self._fallback_existing_artifact_path(stage_name)
+
+    def _fallback_existing_artifact_path(self, stage_name: str) -> str | None:
         stage_dir = _stage_directory_name(stage_name)
-        if entity_type == "timing_path":
-            return f"{stage_dir}/data/sta/gcd.rpt.json"
-        return f"{stage_dir}/output/gcd_{stage_name}.def"
+        prefixes = (f"{stage_dir}/output/", f"{stage_dir}/data/", f"{stage_dir}/analysis/", f"{stage_dir}/feature/")
+        for ref in self._raw_refs:
+            rel_path = str(ref.get("path") or "")
+            if rel_path.startswith(prefixes):
+                return rel_path
+        return None
 
     def _semantic_block_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
@@ -5580,7 +5579,7 @@ def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
                 "label_table": "run_patch_route_labels",
                 "score": score,
                 "score_source": "route_native_union_overflow" if isinstance(native, dict) and native.get("union_overflow") is not None else "fallback_qor_or_density",
-                "provenance": {"table": "provenance", "query": {"target_table": "run_stage_patch_features", "patch_id": patch_id}},
+                "provenance": {"table": "provenance", "query": {"provenance_id": _stable_id("patch_features", record.get("stage"), record.get("patch_key"))}},
             }
         )
     return sorted(items, key=lambda item: (item["score"] is not None, item["score"]), reverse=True)[:20]
@@ -5611,7 +5610,7 @@ def _top_net_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
                 "route_wire_length": route.get("total_routed_length"),
                 "score": score,
                 "score_source": "route_wire_length" if route_wire_length is not None else "fanout",
-                "provenance": {"table": "provenance", "query": {"target_table": "nets", "entity_key": net_key}},
+                "provenance": {"table": "provenance", "query": {"provenance_id": _stable_id("semantic_block", record.get("stage"), "net", net_key, "source_refs")}},
             }
         )
     return sorted(items, key=lambda item: (item["score"] is not None, item["score"]), reverse=True)[:20]

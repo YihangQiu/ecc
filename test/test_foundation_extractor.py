@@ -617,11 +617,10 @@ def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_
     for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas"):
         refs = {row["provenance_id"] for row in table_rows(table_name, ["provenance_id"]) if row["provenance_id"]}
         assert refs <= set(provenance_by_id)
-        assert any(
-            provenance_by_id[ref]["artifact_id"] in artifact_ids
-            or set(json.loads(provenance_by_id[ref]["derived_from_artifact_ids"] or "[]")) <= artifact_ids
-            for ref in refs
-        )
+        for ref in refs:
+            derived = set(json.loads(provenance_by_id[ref]["derived_from_artifact_ids"] or "[]"))
+            direct = provenance_by_id[ref]["artifact_id"]
+            assert direct in artifact_ids or (derived and derived <= artifact_ids), ref
 
     delta_rows = table_rows("stage_deltas", ["entity_type", "change_type", "metric_name"])
     assert any(row["entity_type"] == "patch" and row["change_type"] == "metric_changed" for row in delta_rows)
@@ -632,11 +631,13 @@ def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_
     assert patch_scores == sorted(patch_scores, reverse=True)
     assert top_patches[0]["patch_id"] == 1
     assert all("score_source" in item and "provenance" in item for item in top_patches)
+    assert all(item["provenance"].get("query", {}).get("provenance_id") for item in top_patches)
 
     top_nets = json.loads((foundation_dir / "views" / "agent" / "top_nets.json").read_text(encoding="utf-8"))["items"]
     net_scores = [item["score"] for item in top_nets]
     assert net_scores == sorted(net_scores, reverse=True)
     assert all("score_source" in item and "provenance" in item for item in top_nets)
+    assert all(item["provenance"].get("query", {}).get("provenance_id") for item in top_nets)
 
     progressive = json.loads((foundation_dir / "views" / "ml" / "progressive_patch_dataset.json").read_text(encoding="utf-8"))
     assert progressive["stage_policy"] == {"P1": ["Floorplan"], "P2": ["Floorplan", "place"], "P3": ["Floorplan", "place", "CTS"]}
