@@ -66,10 +66,10 @@ def _labels_from_records(
             "col": int(patch["col"]),
             "horizontal_demand": 0.0,
             "horizontal_capacity": 0.0,
-            "horizontal_overflow": 0.0,
+            "horizontal_demand_capacity": 0.0,
             "vertical_demand": 0.0,
             "vertical_capacity": 0.0,
-            "vertical_overflow": 0.0,
+            "vertical_demand_capacity": 0.0,
             "by_layer": {},
             "source": "irt_space_router_native",
             "source_artifacts": {"route_native_demand_capacity": str(path)},
@@ -94,13 +94,11 @@ def _labels_from_records(
             continue
         demand = demand or 0.0
         capacity = capacity or 0.0
-        overflow = _float_or_none(record.get("overflow"))
-        if overflow is None:
-            overflow = max(0.0, demand - capacity)
+        demand_capacity = demand - capacity
         item = patch_totals[patch_id]
         item[f"{direction}_demand"] += demand
         item[f"{direction}_capacity"] += capacity
-        item[f"{direction}_overflow"] += overflow
+        item[f"{direction}_demand_capacity"] += demand_capacity
         layer = str(
             record.get("layer")
             or record.get("layer_name")
@@ -111,28 +109,26 @@ def _labels_from_records(
             {
                 "horizontal_demand": 0.0,
                 "horizontal_capacity": 0.0,
-                "horizontal_overflow": 0.0,
+                "horizontal_demand_capacity": 0.0,
                 "vertical_demand": 0.0,
                 "vertical_capacity": 0.0,
-                "vertical_overflow": 0.0,
+                "vertical_demand_capacity": 0.0,
             },
         )
         layer_item[f"{direction}_demand"] += demand
         layer_item[f"{direction}_capacity"] += capacity
-        layer_item[f"{direction}_overflow"] += overflow
+        layer_item[f"{direction}_demand_capacity"] += demand_capacity
         matched = True
 
     if not matched:
         return []
     labels = []
     for item in patch_totals.values():
-        h_margin = item["horizontal_demand"] - item["horizontal_capacity"]
-        v_margin = item["vertical_demand"] - item["vertical_capacity"]
+        h_margin = item["horizontal_demand_capacity"]
+        v_margin = item["vertical_demand_capacity"]
         labels.append(
             {
                 **item,
-                "horizontal_demand_capacity": h_margin,
-                "vertical_demand_capacity": v_margin,
                 "union_demand_capacity": max(h_margin, v_margin),
                 "horizontal_utilization": _safe_ratio(
                     item["horizontal_demand"], item["horizontal_capacity"]
@@ -140,7 +136,6 @@ def _labels_from_records(
                 "vertical_utilization": _safe_ratio(
                     item["vertical_demand"], item["vertical_capacity"]
                 ),
-                "union_overflow": max(item["horizontal_overflow"], item["vertical_overflow"]),
             }
         )
     return labels

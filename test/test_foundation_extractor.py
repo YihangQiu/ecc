@@ -338,7 +338,6 @@ END DESIGN
                                 "capacity": 3.0,
                                 "demand_capacity": 3.0,
                                 "utilization": 2.0,
-                                "overflow": 3.0,
                                 "source": "irt_space_router_native",
                                 "stage": "space_router_final",
                             }
@@ -355,7 +354,6 @@ END DESIGN
                                 "capacity": 2.0,
                                 "demand_capacity": 2.0,
                                 "utilization": 2.0,
-                                "overflow": 2.0,
                                 "source": "irt_space_router_native",
                                 "stage": "space_router_final",
                             }
@@ -370,7 +368,6 @@ END DESIGN
                                 "capacity": 3.0,
                                 "demand_capacity": 5.0,
                                 "utilization": 2.6666666666666665,
-                                "overflow": 5.0,
                                 "source": "irt_space_router_native",
                                 "stage": "space_router_final",
                             }
@@ -387,7 +384,6 @@ END DESIGN
                                 "capacity": 5.0,
                                 "demand_capacity": -4.0,
                                 "utilization": 0.2,
-                                "overflow": 0.0,
                                 "source": "irt_space_router_native",
                                 "stage": "space_router_final",
                             }
@@ -525,6 +521,16 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert manifest["tables"]["patches"]["row_count"] == 4
     assert manifest["tables"]["run_stage_patch_features"]["row_count"] == 20
     assert manifest["tables"]["run_patch_route_labels"]["row_count"] == 4
+    route_label_columns = schema["tables"]["run_patch_route_labels"]["columns"]
+    assert "horizontal_demand_capacity" in route_label_columns
+    assert "vertical_demand_capacity" in route_label_columns
+    assert "union_demand_capacity" in route_label_columns
+    assert "horizontal_overflow" not in route_label_columns
+    assert "vertical_overflow" not in route_label_columns
+    assert "union_overflow" not in route_label_columns
+    layer_label_columns = schema["tables"]["run_patch_route_label_layers"]["columns"]
+    assert "demand_capacity" in layer_label_columns
+    assert "overflow" not in layer_label_columns
     assert manifest["views"]["ml_task_views"] == "foundation_data/ecc/views/ml/task_views.json"
     assert manifest["migration_report"] == "foundation_data/ecc/migration_report.json"
     assert quality["tables"]["patches"]["row_count"] == 4
@@ -892,11 +898,14 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     native = patch0["route_oracle"]["native_demand_capacity"]
     assert native["horizontal_demand"] == 6.0
     assert native["horizontal_capacity"] == 3.0
-    assert native["horizontal_overflow"] == 3.0
-    assert native["vertical_overflow"] == 2.0
-    assert native["union_overflow"] == 3.0
+    assert native["horizontal_demand_capacity"] == 3.0
+    assert native["vertical_demand_capacity"] == 2.0
+    assert native["union_demand_capacity"] == 3.0
+    assert "horizontal_overflow" not in native
+    assert "vertical_overflow" not in native
+    assert "union_overflow" not in native
     assert native["union_utilization"] == 2.0
-    assert native["tightness_class"] == "overflow"
+    assert native["tightness_class"] == "over_capacity"
     assert patch0["route_oracle"]["feature_role"] == "route_only_oracle"
     assert patch0["route_oracle"]["available_for_training_input"] is False
     assert patch0["timing_context"]["worst_slack_min"] == 1.0
@@ -1511,12 +1520,13 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
     native = (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").read_text(encoding="utf-8")
     assert "route_true_overflow" not in patches[0]
     assert "route_native_demand_capacity" not in patches[0]
-    assert patches[0]["route_oracle"]["native_demand_capacity"]["union_overflow"] is None
+    assert patches[0]["route_oracle"]["native_demand_capacity"]["union_demand_capacity"] is None
+    assert "union_overflow" not in patches[0]["route_oracle"]["native_demand_capacity"]
     assert "route_reconstructed_demand_capacity" not in patches[0]
     assert "route_reconstructed_congestion" not in patches[0]
     assert "route_demand_capacity" not in patches[0]
     assert patches[0]["label_refs"]["label_source_status"] == "missing"
-    assert patches[0]["null_reason"]["route_oracle"] == "missing_router_native_route_overflow_artifact"
+    assert patches[0]["null_reason"]["route_oracle"] == "missing_router_native_route_demand_capacity_artifact"
     assert not (foundation_dir / "labels" / "candidate_qor_summary.json").exists()
     assert native == ""
     assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
@@ -1671,21 +1681,24 @@ def test_iccd_full_v1_patch_records_follow_vec_patches_schema(tmp_path: Path):
     assert route0["route_oracle"]["wire_length"] > 0
     assert native["horizontal_demand"] == 6.0
     assert native["horizontal_capacity"] == 3.0
-    assert native["horizontal_overflow"] == 3.0
+    assert native["horizontal_demand_capacity"] == 3.0
     assert native["horizontal_utilization"] == 2.0
     assert native["vertical_demand"] == 4.0
     assert native["vertical_capacity"] == 2.0
-    assert native["vertical_overflow"] == 2.0
+    assert native["vertical_demand_capacity"] == 2.0
     assert native["vertical_utilization"] == 2.0
-    assert native["union_overflow"] == 3.0
+    assert native["union_demand_capacity"] == 3.0
+    assert "horizontal_overflow" not in native
+    assert "vertical_overflow" not in native
+    assert "union_overflow" not in native
     assert native["union_utilization"] == 2.0
-    assert native["tightness_class"] == "overflow"
+    assert native["tightness_class"] == "over_capacity"
     assert route0["label_refs"]["route_native_demand_capacity"] == "labels/route_native_demand_capacity.jsonl#patch_id=0"
     assert route0["label_refs"]["label_source_status"] == "available"
     assert route0["progressive_metadata"]["is_progressive_input_stage"] is False
     assert route0["progressive_metadata"]["is_route_oracle_stage"] is True
     assert route0["progressive_metadata"]["oracle_blocks"] == ["route_oracle"]
-    assert route0["source_refs"]["route_label_definition"] == "route_oracle.native_demand_capacity.union_overflow=max(horizontal_overflow,vertical_overflow); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={overflow,near_capacity,relaxed,unknown}"
+    assert route0["source_refs"]["route_label_definition"] == "route_oracle.native_demand_capacity.union_demand_capacity=max(horizontal_demand_capacity,vertical_demand_capacity); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={over_capacity,near_capacity,relaxed,unknown}"
 
 
 def test_iccd_full_v1_patch_records_compute_progressive_deltas_and_quality_stats(tmp_path: Path):
@@ -1749,7 +1762,7 @@ def test_iccd_full_v1_patch_records_compute_progressive_deltas_and_quality_stats
     assert patch_quality["pre_route_estimators_availability_by_stage"]["place"] == {"available": 4, "missing": 0, "not_applicable": 0}
     assert patch_quality["pre_route_estimators_availability_by_stage"]["route"] == {"available": 0, "missing": 0, "not_applicable": 4}
     assert patch_quality["route_label_availability"] == {"available": 4, "missing": 0, "partial": 0}
-    assert patch_quality["route_oracle_tightness_class_distribution"] == {"overflow": 2, "near_capacity": 0, "relaxed": 2, "unknown": 0}
+    assert patch_quality["route_oracle_tightness_class_distribution"] == {"over_capacity": 2, "near_capacity": 0, "relaxed": 2, "unknown": 0}
     assert patch_quality["refs_truncated_count_by_stage"]["route"] == 0
     assert patch_quality["timing_context_availability_by_stage"]["route"] == {"available": 1, "missing": 3, "not_applicable": 0}
     assert patch_quality["electrical_context_availability_by_stage"]["route"] == {"available": 1, "missing": 3, "not_applicable": 0}
@@ -1989,8 +2002,8 @@ END DESIGN
         ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.jsonl",
         "\n".join(
             [
-                json.dumps({"row": 0, "col": 0, "gcell": {"x": 0, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 6, "capacity": 3, "demand_capacity": 3, "utilization": 2, "overflow": 3, "source": "irt_space_router_native"}),
-                json.dumps({"row": 0, "col": 1, "gcell": {"x": 1, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 2, "capacity": 3, "demand_capacity": -1, "utilization": 0.67, "overflow": 0, "source": "irt_space_router_native"}),
+                json.dumps({"row": 0, "col": 0, "gcell": {"x": 0, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 6, "capacity": 3, "demand_capacity": 3, "utilization": 2, "source": "irt_space_router_native"}),
+                json.dumps({"row": 0, "col": 1, "gcell": {"x": 1, "y": 0}, "layer": "MET2", "direction": "horizontal", "demand": 2, "capacity": 3, "demand_capacity": -1, "utilization": 0.67, "source": "irt_space_router_native"}),
             ]
         )
         + "\n",

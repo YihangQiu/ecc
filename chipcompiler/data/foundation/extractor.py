@@ -1195,7 +1195,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         if not parsed_def:
             return []
-        route_label_overflow_by_patch = _route_label_overflow_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}
+        route_label_demand_capacity_by_patch = _route_label_demand_capacity_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}
         pins_by_net: dict[str, list[dict[str, Any]]] = {}
         for pin in pins:
             net_name = str(pin.get("identity", {}).get("net") or "")
@@ -1204,7 +1204,7 @@ class FoundationExtractor:
         records = []
         for idx, net in enumerate(parsed_def.nets):
             net_pins = pins_by_net.get(net.name, [])
-            records.append(_ordered_net_record(_build_net_record(stage, parsed_def, net, idx, net_pins, canonical_grid, stage_maps, sta_report, route_label_overflow_by_patch), idx))
+            records.append(_ordered_net_record(_build_net_record(stage, parsed_def, net, idx, net_pins, canonical_grid, stage_maps, sta_report, route_label_demand_capacity_by_patch), idx))
         return records
 
     def _pin_records(
@@ -1515,7 +1515,7 @@ class FoundationExtractor:
                 "label_refs": {"route_patch_overflow": None, "route_native_demand_capacity": f"labels/route_native_demand_capacity.jsonl#patch_id={patch_id}" if native_demand_capacity else None, "route_reconstructed_congestion": None, "label_source_status": "available" if native_demand_capacity else "missing"},
                 "drc_context": drc_context,
                 "progressive_metadata": {"available_from": "Floorplan" if stage_order else stage, "grid_stable_across_stages": True, "stage_order_index": stage_index, "is_progressive_input_stage": is_progressive_input_stage, "is_route_oracle_stage": stage == "route", "input_blocks": input_blocks if is_progressive_input_stage else [], "oracle_blocks": ["route_oracle"] if stage == "route" else [], "prev_stage": prev_stage, "density_delta_from_prev_stage": None, "pin_count_delta_from_prev_stage": None, "rudy_delta_from_prev_stage": None, "egr_overflow_delta_from_prev_stage": None},
-                "source_refs": {"canonical_grid": "canonical_grid.json", "stage_def": def_source, "density_maps": f"maps/{stage}/density.json" if density_maps else None, "rudy_maps": f"maps/{stage}/rudy.json" if rudy_maps else None, "egr_maps": f"maps/{stage}/congestion.json" if congestion_maps else None, "instances": f"vectors/instances/{stage}.jsonl", "pins": f"vectors/pins/{stage}.jsonl", "nets": f"vectors/nets/{stage}.jsonl", "wires": f"vectors/wires/{stage}.jsonl", "timing_paths": f"vectors/timing_paths/{stage}.jsonl", "route": def_source if stage == "route" else None, "drc": "drc_artifacts" if drc_context.get("availability") == "available" else None, "route_label_definition": "route_oracle.native_demand_capacity.union_overflow=max(horizontal_overflow,vertical_overflow); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={overflow,near_capacity,relaxed,unknown}" if stage == "route" and native_demand_capacity else None},
+                "source_refs": {"canonical_grid": "canonical_grid.json", "stage_def": def_source, "density_maps": f"maps/{stage}/density.json" if density_maps else None, "rudy_maps": f"maps/{stage}/rudy.json" if rudy_maps else None, "egr_maps": f"maps/{stage}/congestion.json" if congestion_maps else None, "instances": f"vectors/instances/{stage}.jsonl", "pins": f"vectors/pins/{stage}.jsonl", "nets": f"vectors/nets/{stage}.jsonl", "wires": f"vectors/wires/{stage}.jsonl", "timing_paths": f"vectors/timing_paths/{stage}.jsonl", "route": def_source if stage == "route" else None, "drc": "drc_artifacts" if drc_context.get("availability") == "available" else None, "route_label_definition": "route_oracle.native_demand_capacity.union_demand_capacity=max(horizontal_demand_capacity,vertical_demand_capacity); union_utilization=max(horizontal_utilization,vertical_utilization); tightness_class={over_capacity,near_capacity,relaxed,unknown}" if stage == "route" and native_demand_capacity else None},
                 "null_reason": null_reason,
             }
             records.append(record)
@@ -2338,14 +2338,13 @@ class FoundationExtractor:
                     "patch_id": int(label.get("patch_id") or 0),
                     "horizontal_capacity": oracle.get("horizontal_capacity"),
                     "horizontal_demand": oracle.get("horizontal_demand"),
-                    "horizontal_overflow": oracle.get("horizontal_overflow"),
+                    "horizontal_demand_capacity": oracle.get("horizontal_demand_capacity"),
                     "horizontal_utilization": oracle.get("horizontal_utilization"),
                     "vertical_capacity": oracle.get("vertical_capacity"),
                     "vertical_demand": oracle.get("vertical_demand"),
-                    "vertical_overflow": oracle.get("vertical_overflow"),
+                    "vertical_demand_capacity": oracle.get("vertical_demand_capacity"),
                     "vertical_utilization": oracle.get("vertical_utilization"),
-                    "union_overflow": oracle.get("union_overflow"),
-                    "union_demand_capacity": route_label.get("union"),
+                    "union_demand_capacity": oracle.get("union_demand_capacity"),
                     "union_utilization": oracle.get("union_utilization"),
                     "tightness_class": oracle.get("tightness_class"),
                     "label_source_artifact_id": _source_artifact_id((label.get("source_artifacts") or {}).get("route_native_demand_capacity")),
@@ -2368,7 +2367,9 @@ class FoundationExtractor:
                 for direction in ("horizontal", "vertical"):
                     demand = by_direction.get(f"{direction}_demand")
                     capacity = by_direction.get(f"{direction}_capacity")
-                    overflow = by_direction.get(f"{direction}_overflow")
+                    demand_capacity = by_direction.get(f"{direction}_demand_capacity")
+                    if demand_capacity is None and demand is not None and capacity is not None:
+                        demand_capacity = float(demand or 0.0) - float(capacity or 0.0)
                     out.append(
                         {
                             "design_id": design_id,
@@ -2378,9 +2379,8 @@ class FoundationExtractor:
                             "direction": direction,
                             "capacity": capacity,
                             "demand": demand,
-                            "overflow": overflow,
+                            "demand_capacity": demand_capacity,
                             "utilization": _safe_ratio(demand, capacity),
-                            "demand_capacity": (float(demand or 0.0) - float(capacity or 0.0)),
                             "source_artifact_id": source_artifact_id,
                         }
                     )
@@ -3020,7 +3020,7 @@ class FoundationExtractor:
             "schema_coverage_by_stage": {},
             "pre_route_estimators_availability_by_stage": {},
             "route_label_availability": {"available": 0, "missing": 0, "partial": 0},
-            "route_oracle_tightness_class_distribution": {"overflow": 0, "near_capacity": 0, "relaxed": 0, "unknown": 0},
+            "route_oracle_tightness_class_distribution": {"over_capacity": 0, "near_capacity": 0, "relaxed": 0, "unknown": 0},
             "refs_truncated_count_by_stage": {},
             "timing_context_availability_by_stage": {},
             "electrical_context_availability_by_stage": {},
@@ -3569,7 +3569,7 @@ def _build_pin_record(
         null_reason["timing_context"] = "pin_not_found_in_timing_paths"
     elif not timing_context["available"]:
         null_reason["timing_context"] = "missing_sta_artifacts"
-    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps, canonical_grid, _route_label_overflow_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}, drc_report)
+    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps, canonical_grid, _route_label_demand_capacity_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}, drc_report)
     if route_context is None:
         null_reason["route_context"] = "not_route_stage"
     return {
@@ -3966,7 +3966,7 @@ def _pin_route_context(
     parsed_def: DefData,
     stage_maps: dict[str, dict[str, MapMatrix]],
     canonical_grid: dict,
-    route_label_overflow_by_patch: dict[int, float],
+    route_label_demand_capacity_by_patch: dict[int, float],
     drc_report: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     if stage_name != "route":
@@ -3979,7 +3979,7 @@ def _pin_route_context(
         if row_col:
             local_final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1])
         if local_final_overflow is None:
-            local_final_overflow = route_label_overflow_by_patch.get(int(patch_id))
+            local_final_overflow = route_label_demand_capacity_by_patch.get(int(patch_id))
     nearby_wires = [wire for wire in net_wires if not wire.via and _wire_near_geometry(wire, geometry)]
     nearby_vias = [wire for wire in net_wires if wire.via and _wire_near_geometry(wire, geometry)]
     return {
@@ -5406,32 +5406,32 @@ def _electrical_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | No
 
 
 def _route_native_demand_capacity_oracle(label: dict[str, Any]) -> dict[str, Any]:
-    h_overflow = label.get("horizontal")
-    v_overflow = label.get("vertical")
+    h_demand_capacity = label.get("horizontal")
+    v_demand_capacity = label.get("vertical")
     h_util = label.get("horizontal_utilization")
     v_util = label.get("vertical_utilization")
-    union_overflow = _max_optional([h_overflow, v_overflow])
+    union_demand_capacity = _max_optional([h_demand_capacity, v_demand_capacity])
     union_utilization = _max_optional([h_util, v_util])
     return {
         "horizontal_demand": label.get("horizontal_demand"),
         "horizontal_capacity": label.get("horizontal_capacity"),
-        "horizontal_overflow": h_overflow,
+        "horizontal_demand_capacity": h_demand_capacity,
         "horizontal_utilization": h_util,
         "vertical_demand": label.get("vertical_demand"),
         "vertical_capacity": label.get("vertical_capacity"),
-        "vertical_overflow": v_overflow,
+        "vertical_demand_capacity": v_demand_capacity,
         "vertical_utilization": v_util,
-        "union_overflow": union_overflow,
+        "union_demand_capacity": union_demand_capacity,
         "union_utilization": union_utilization,
-        "tightness_class": _tightness_class(union_overflow, union_utilization),
+        "tightness_class": _tightness_class(union_demand_capacity, union_utilization),
     }
 
 
-def _tightness_class(union_overflow: Any, union_utilization: Any) -> str:
-    if union_overflow is None and union_utilization is None:
+def _tightness_class(union_demand_capacity: Any, union_utilization: Any) -> str:
+    if union_demand_capacity is None and union_utilization is None:
         return "unknown"
-    if union_overflow is not None and float(union_overflow) > 0:
-        return "overflow"
+    if union_demand_capacity is not None and float(union_demand_capacity) > 0:
+        return "over_capacity"
     if union_utilization is not None and float(union_utilization) >= 0.9:
         return "near_capacity"
     return "relaxed"
@@ -5460,7 +5460,7 @@ def _patch_null_reason(
     if stage != "route":
         out["route_oracle"] = "not_route_stage"
     elif route_oracle is not None and not native_demand_capacity:
-        out["route_oracle"] = "missing_router_native_route_overflow_artifact"
+        out["route_oracle"] = "missing_router_native_route_demand_capacity_artifact"
     if drc_context.get("availability") == "missing":
         out["drc_context"] = "missing_drc_artifacts"
     return out
@@ -5563,7 +5563,7 @@ def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
         timing = record.get("timing_context") if isinstance(record.get("timing_context"), dict) else {}
         density = record.get("local_density") if isinstance(record.get("local_density"), dict) else {}
         score = _first_numeric(
-            native.get("union_overflow") if isinstance(native, dict) else None,
+            native.get("union_demand_capacity") if isinstance(native, dict) else None,
             drc.get("count"),
             _negative_or_none(timing.get("worst_slack_min")),
             density.get("cell_density"),
@@ -5578,7 +5578,7 @@ def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
                 "query": {"patch_id": patch_id},
                 "label_table": "run_patch_route_labels",
                 "score": score,
-                "score_source": "route_native_union_overflow" if isinstance(native, dict) and native.get("union_overflow") is not None else "fallback_qor_or_density",
+                "score_source": "route_native_union_demand_capacity" if isinstance(native, dict) and native.get("union_demand_capacity") is not None else "fallback_qor_or_density",
                 "provenance": {"table": "provenance", "query": {"provenance_id": _stable_id("patch_features", record.get("stage"), record.get("patch_key"))}},
             }
         )
@@ -6216,7 +6216,7 @@ def _route_analysis_for_net(
     terminal_hpwl: float | None,
     canonical_grid: dict,
     stage_maps: dict[str, dict[str, MapMatrix]],
-    route_label_overflow_by_patch: dict[int, float],
+    route_label_demand_capacity_by_patch: dict[int, float],
 ) -> dict[str, Any] | None:
     if stage.name != "route":
         return None
@@ -6248,7 +6248,7 @@ def _route_analysis_for_net(
         row_col = _patch_row_col(canonical_grid, patch_id)
         final_overflow = _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1]) if row_col else None
         if final_overflow is None:
-            final_overflow = route_label_overflow_by_patch.get(patch_id)
+            final_overflow = route_label_demand_capacity_by_patch.get(patch_id)
         stat["final_overflow"] = final_overflow
         stat["contribution_score"] = stat["wire_length_in_patch"] * max(final_overflow or 0.0, 0.0)
     attribution_refs = [
@@ -6285,21 +6285,21 @@ def _route_analysis_for_net(
     }
 
 
-def _route_label_union_overflow(stage_dir: Path, canonical_grid: dict, patch_id: int) -> float | None:
+def _route_label_union_demand_capacity(stage_dir: Path, canonical_grid: dict, patch_id: int) -> float | None:
     labels = parse_route_native_demand_capacity_artifacts(stage_dir, canonical_grid).get("labels", [])
     for label in labels:
         if int(label.get("patch_id", -1)) == int(patch_id):
-            value = label.get("union_overflow")
+            value = label.get("union_demand_capacity")
             return float(value) if value is not None else None
     return None
 
 
-def _route_label_overflow_by_patch(stage_dir: Path, canonical_grid: dict) -> dict[int, float]:
+def _route_label_demand_capacity_by_patch(stage_dir: Path, canonical_grid: dict) -> dict[int, float]:
     labels = parse_route_native_demand_capacity_artifacts(stage_dir, canonical_grid).get("labels", [])
     return {
-        int(label["patch_id"]): float(label["union_overflow"])
+        int(label["patch_id"]): float(label["union_demand_capacity"])
         for label in labels
-        if label.get("patch_id") is not None and label.get("union_overflow") is not None
+        if label.get("patch_id") is not None and label.get("union_demand_capacity") is not None
     }
 
 
@@ -6312,7 +6312,7 @@ def _build_net_record(
     canonical_grid: dict,
     stage_maps: dict[str, dict[str, MapMatrix]],
     sta_report: dict[str, Any] | None,
-    route_label_overflow_by_patch: dict[int, float] | None = None,
+    route_label_demand_capacity_by_patch: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     source_rel = _workspace_relative_from_parsed_def(parsed_def)
     terminal_refs = _terminal_refs_for_net(pins) or [
@@ -6378,7 +6378,7 @@ def _build_net_record(
         "missing_anchor_terminal_count": sum(1 for ref in terminal_refs if not ref.get("center") and not ref.get("bbox")),
     }
     patch_anchor = _net_patch_anchor(terminal_refs, geometry_proxy, canonical_grid, stage_maps)
-    route_analysis = _route_analysis_for_net(stage, parsed_def, net, route_wires, hpwl, canonical_grid, stage_maps, route_label_overflow_by_patch or {})
+    route_analysis = _route_analysis_for_net(stage, parsed_def, net, route_wires, hpwl, canonical_grid, stage_maps, route_label_demand_capacity_by_patch or {})
     return {
         "stage": stage.name,
         "net_key": net.name,
@@ -6824,8 +6824,8 @@ def _wire_patch_anchor(stage_maps: dict[str, dict[str, MapMatrix]], canonical_gr
 def _route_wire_local_overflow(primary_patch_id: int | None, native_demand_capacity_by_patch: dict[int, dict[str, Any]], stage_maps: dict[str, dict[str, MapMatrix]], row_col: tuple[int, int] | None) -> float | None:
     if primary_patch_id is not None:
         label = native_demand_capacity_by_patch.get(int(primary_patch_id))
-        if isinstance(label, dict) and label.get("union_overflow") is not None:
-            return float(label["union_overflow"])
+        if isinstance(label, dict) and label.get("union_demand_capacity") is not None:
+            return float(label["union_demand_capacity"])
     if row_col:
         return _matrix_value(stage_maps.get("congestion", {}).get("union"), row_col[0], row_col[1])
     return None
