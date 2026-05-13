@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 
 from chipcompiler.data.foundation import FoundationExtractor
+import chipcompiler.data.foundation.extractor as extractor_module
+from chipcompiler.data.foundation.grid.canonical_grid import build_patch_grid
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
 
 
@@ -1211,6 +1213,30 @@ def test_iccd_full_v1_adds_instance_patch_anchor(tmp_path: Path):
     assert record["patch_anchor"]["local_pin_density"] == 2.0
     assert record["patch_anchor"]["local_rudy"] == 0.01
     assert record["patch_anchor"]["local_egr_overflow"] == 3.0
+
+
+def test_patch_anchor_uses_grid_lookup_without_scanning_all_patches():
+    canonical_grid = build_patch_grid(128, 128, {"llx": 0.0, "lly": 0.0, "urx": 1280.0, "ury": 1280.0})
+    record = {
+        "physical_state": {
+            "bbox": {"llx": 15.0, "lly": 25.0, "urx": 35.0, "ury": 45.0},
+            "center": {"x": 25.0, "y": 35.0},
+        }
+    }
+    original_patch_for_point = extractor_module._patch_for_point
+    original_overlap_patch_ids = extractor_module._overlap_patch_ids
+    try:
+        extractor_module._patch_for_point = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("slow point scan used"))
+        extractor_module._overlap_patch_ids = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("slow overlap scan used"))
+
+        extractor_module._attach_patch_anchor(record, canonical_grid, {})
+    finally:
+        extractor_module._patch_for_point = original_patch_for_point
+        extractor_module._overlap_patch_ids = original_overlap_patch_ids
+
+    assert record["patch_anchor"]["primary_patch_id"] == 386
+    assert record["patch_anchor"]["overlap_patch_ids"] == [257, 258, 259, 385, 386, 387, 513, 514, 515]
+    assert record["physical_state"]["patch_id"] == 386
 
 
 def test_iccd_full_v1_adds_instance_connectivity_summary(tmp_path: Path):

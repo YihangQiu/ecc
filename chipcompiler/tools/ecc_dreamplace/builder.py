@@ -11,20 +11,29 @@ from chipcompiler.tools.ecc import builder as ecc_builder
 from chipcompiler.utility import json_read, json_write
 
 
+_ECOS_TO_DREAMPLACE_PARAMETERS = {
+    "Target density": "target_density",
+    "Target overflow": "stop_overflow",
+    "Cell padding x": "cell_padding_x",
+    "Routability opt flag": "routability_opt_flag",
+}
+
+
 def apply_parameter_overrides(
     base_params: dict,
     parameter_data: dict,
 ) -> dict:
-    """Apply direct DreamPlace overrides onto a DreamPlace config dictionary.
+    """Apply ECOS and direct DreamPlace overrides to a DreamPlace config.
 
-    Args:
-        base_params: The generated DreamPlace config contents.
-        parameter_data: The workspace ``home/parameters.json`` data.
-
-    Returns:
-        A copied config dictionary with ``DreamPlace`` values applied directly.
+    Top-level ECOS parameters provide the normal GUI/API surface. The nested
+    ``DreamPlace`` mapping remains available for advanced direct overrides and
+    intentionally takes precedence when both surfaces set the same field.
     """
     params = deepcopy(base_params)
+
+    for ecos_key, dreamplace_key in _ECOS_TO_DREAMPLACE_PARAMETERS.items():
+        if ecos_key in parameter_data:
+            params[dreamplace_key] = deepcopy(parameter_data[ecos_key])
 
     dreamplace_overrides = parameter_data.get("DreamPlace", {})
     if not isinstance(dreamplace_overrides, dict):

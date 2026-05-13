@@ -56,6 +56,23 @@ class StageInfo:
     directory: Path
 
 
+@dataclass(frozen=True)
+class _PatchGridLookup:
+    patches_by_coord: dict[tuple[int, int], dict[str, Any]]
+    patches_by_id: dict[int, dict[str, Any]]
+    row_bounds: list[tuple[float, float]]
+    col_bounds: list[tuple[float, float]]
+    rectangular: bool
+    uniform: bool
+    row_origin: float | None
+    col_origin: float | None
+    row_step: float | None
+    col_step: float | None
+
+
+_PATCH_GRID_LOOKUP_CACHE: dict[tuple[int, int], _PatchGridLookup | None] = {}
+
+
 class FoundationExtractor:
     """Post-run foundation-data extractor for ECOS/ECC workspaces.
 
@@ -98,6 +115,11 @@ class FoundationExtractor:
             "include_raw_refs": bool(include_raw_refs),
             "export_legacy_debug": bool(export_legacy_debug),
         }
+        self._legacy_debug_enabled = bool(export_legacy_debug)
+        self._vector_records: dict[str, dict[str, list[dict[str, Any]]]] = {
+            entity: {} for entity in _ENTITY_NAMES
+        }
+        self._large_design_mode = False
         def_data = self._collect_def_data(selected_stages)
         rt_logs = self._collect_rt_logs(selected_stages)
         sta_reports = self._collect_sta_reports(selected_stages)
@@ -108,13 +130,14 @@ class FoundationExtractor:
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         self._ensure_floorplan_maps(selected_stages, canonical_grid, canonical_maps, def_data)
-        self._write_indexed_maps(canonical_maps, canonical_grid)
-        self._write_floorplan_specific_maps(selected_stages, canonical_grid, def_data)
+        if export_legacy_debug:
+            self._write_indexed_maps(canonical_maps, canonical_grid)
+            self._write_floorplan_specific_maps(selected_stages, canonical_grid, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
-        labels = self._write_labels(native_demand_capacity.get("labels", []))
+        labels = self._write_labels(native_demand_capacity.get("labels", []), export_legacy_debug=export_legacy_debug)
         self._write_tech(def_data, rt_logs, selected_stages)
-        entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports)
+        entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports, export_legacy_debug=export_legacy_debug)
         self._record_wire_quality(selected_stages)
         self._record_patch_quality(selected_stages, canonical_grid)
         public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
@@ -984,6 +1007,8 @@ class FoundationExtractor:
         labels: dict[str, Any],
         sta_reports: dict[str, dict[str, Any]],
         drc_reports: dict[str, dict[str, Any]],
+        *,
+        export_legacy_debug: bool,
     ) -> dict[str, dict[str, int]]:
         counts: dict[str, dict[str, int]] = {entity: {} for entity in _ENTITY_NAMES}
         native_demand_capacity_by_patch = {
@@ -1031,11 +1056,15 @@ class FoundationExtractor:
                 canonical_grid,
                 canonical_maps.get(stage.name, {}),
             )
-            counts["instances"][stage.name] = write_jsonl(
-                self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl",
-                instances,
-                sort_keys=False,
-            )
+            self._vector_records["instances"][stage.name] = instances
+            if export_legacy_debug:
+                counts["instances"][stage.name] = write_jsonl(
+                    self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl",
+                    instances,
+                    sort_keys=False,
+                )
+            else:
+                counts["instances"][stage.name] = len(instances)
             stage_vectors = {
                 "nets": nets,
                 "pins": pins,
@@ -1044,7 +1073,11 @@ class FoundationExtractor:
                 "timing_paths": timing_paths,
             }
             for entity, records in stage_vectors.items():
-                counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths", "nets", "wires", "routing_graphs", "patches"))
+                self._vector_records[entity][stage.name] = records
+                if export_legacy_debug:
+                    counts[entity][stage.name] = write_jsonl(self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl", records, sort_keys=entity not in ("pins", "timing_paths", "nets", "wires", "routing_graphs", "patches"))
+                else:
+                    counts[entity][stage.name] = len(records)
                 if entity == "routing_graphs" and stage.name != "route" and not records:
                     status = "optional_post_route_snapshot" if stage.name in {"drc", "filler"} else "not_available_before_route"
                     self._quality.setdefault("availability", {}).setdefault(entity, {})[stage.name] = status
@@ -1065,12 +1098,23 @@ class FoundationExtractor:
                 parsed_def,
                 stage_order,
             )
-            counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches, sort_keys=False)
+            self._vector_records["patches"][stage.name] = patches
+            if export_legacy_debug:
+                counts["patches"][stage.name] = write_jsonl(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl", patches, sort_keys=False)
+            else:
+                counts["patches"][stage.name] = len(patches)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
-        _attach_patch_progressive_metadata(stages, self.foundation_dir / "vectors" / "patches")
-        _attach_net_progressive_metadata(stages, self.foundation_dir / "vectors" / "nets")
-        _attach_pin_progressive_metadata(stages, self.foundation_dir / "vectors" / "pins")
-        _attach_wire_progressive_metadata(stages, self.foundation_dir / "vectors" / "wires")
+        if export_legacy_debug:
+            _attach_patch_progressive_metadata(stages, self.foundation_dir / "vectors" / "patches")
+            _attach_net_progressive_metadata(stages, self.foundation_dir / "vectors" / "nets")
+            _attach_pin_progressive_metadata(stages, self.foundation_dir / "vectors" / "pins")
+            _attach_wire_progressive_metadata(stages, self.foundation_dir / "vectors" / "wires")
+            self._reload_legacy_vector_records(stages)
+        else:
+            _attach_patch_progressive_metadata_in_memory(stages, self._vector_records["patches"])
+            _attach_net_progressive_metadata_in_memory(stages, self._vector_records["nets"])
+            _attach_pin_progressive_metadata_in_memory(stages, self._vector_records["pins"])
+            _attach_wire_progressive_metadata_in_memory(stages, self._vector_records["wires"])
         return counts
 
     def _parse_instances(
@@ -1080,6 +1124,12 @@ class FoundationExtractor:
         canonical_grid: dict | None = None,
         stage_maps: dict[str, dict[str, list[list[float]]]] | None = None,
     ) -> list[dict[str, Any]]:
+        if self._should_use_def_instance_fast_path(stage, parsed_def):
+            records = self._instance_records_from_def(stage, parsed_def, canonical_grid or {}, stage_maps or {})
+            self._quality.setdefault("availability", {}).setdefault("instances", {})[stage.name] = "available" if records else "missing"
+            if records:
+                _attach_connectivity_summaries(records, parsed_def)
+                return records
         records: list[dict[str, Any]] = []
         components_by_name = {
             _component_lookup_key(component.get("name")): component
@@ -1110,6 +1160,91 @@ class FoundationExtractor:
         if not records:
             self._quality.setdefault("null_reason", {}).setdefault("instances", {})[stage.name] = "missing_layout_json_instances"
         return records
+
+    def _should_use_def_instance_fast_path(self, stage: StageInfo, parsed_def: DefData | None) -> bool:
+        if not parsed_def or not parsed_def.components:
+            return False
+        if not self._lef_macros:
+            return False
+        layout_paths = sorted((stage.directory / "output").glob("*.json"))
+        if not layout_paths:
+            return True
+        # KLayout JSON can be hundreds of MB on real ICCD workspaces.  When LEF
+        # sizes are available, DEF components preserve placement semantics for
+        # instance anchors without paying that JSON parse cost.
+        return any(path.stat().st_size > 50 * 1024 * 1024 for path in layout_paths if path.exists())
+
+    def _instance_records_from_def(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData,
+        canonical_grid: dict,
+        stage_maps: dict[str, dict[str, list[list[float]]]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for component in parsed_def.components:
+            record = self._instance_record_from_component(stage, parsed_def, component)
+            _attach_patch_anchor(record, canonical_grid, stage_maps)
+            records.append(_ordered_instance_record(record, len(records)))
+        if records:
+            self._record_raw_ref(stage, parsed_def.path, "def_components", {"count": len(records)})
+        return records
+
+    def _instance_record_from_component(
+        self,
+        stage: StageInfo,
+        parsed_def: DefData,
+        component: dict[str, Any],
+    ) -> dict[str, Any]:
+        name = str(component.get("name") or "")
+        master = str(component.get("master") or "")
+        origin = component.get("origin") if isinstance(component.get("origin"), dict) else None
+        orientation = component.get("orientation")
+        physical_class = _physical_class(master, name)
+        is_macro = physical_class == "macro"
+        is_physical_only = _is_physical_only_cell_name(name, master)
+        bbox = _component_bbox_from_def(component, self._lef_macros.get(master), parsed_def.units)
+        null_reason: dict[str, str] = {}
+        if bbox is None:
+            null_reason["physical_state_bbox"] = "missing_lef_macro_size"
+        if orientation is None:
+            null_reason["physical_state_orientation"] = "def_component_missing_orientation"
+        center = None if bbox is None else {"x": (bbox["llx"] + bbox["urx"]) / 2.0, "y": (bbox["lly"] + bbox["ury"]) / 2.0}
+        width = None if bbox is None else bbox["urx"] - bbox["llx"]
+        height = None if bbox is None else bbox["ury"] - bbox["lly"]
+        return {
+            "stage": stage.name,
+            "name": name,
+            "source": _workspace_relative_path(parsed_def.path, self.workspace_dir),
+            "identity": {
+                "instance_key": name,
+                "master": master or None,
+                "cell_class": _cell_class(master, name),
+                "physical_class": physical_class,
+                "is_macro": is_macro,
+                "is_physical_only": is_physical_only,
+                "is_clock_related": _is_clock_related(master, name),
+                "classification_source": "heuristic_name_rule",
+            },
+            "physical_state": {
+                "placement_status": "placed" if origin and bbox is not None else "unplaced",
+                "origin": {"x": float(origin["x"]), "y": float(origin["y"])} if origin else None,
+                "bbox": bbox,
+                "center": center,
+                "width": width,
+                "height": height,
+                "area": None if width is None or height is None else max(0.0, width * height),
+                "orientation": orientation,
+                "patch_id": None,
+                "overlap_patch_ids": [],
+            },
+            "connectivity_summary": {},
+            "patch_anchor": {},
+            "progressive_metadata": {},
+            "clock_tree": None,
+            "route_analysis": None,
+            "null_reason": null_reason,
+        }
 
     def _instance_record_from_layout(
         self,
@@ -1245,6 +1380,33 @@ class FoundationExtractor:
             return []
         records: list[dict[str, Any]] = []
         net_records = {str(record.get("net_key")): record for record in nets}
+        net_contexts = {net.name: _wire_net_context(net, net_records.get(net.name)) for net in parsed_def.nets}
+        total_wire_count = sum(len(item.wires) for item in parsed_def.nets)
+        large_design_route = stage.name == "route" and total_wire_count > 1000
+        if large_design_route:
+            self._large_design_mode = True
+            self._quality["large_design_mode"] = {
+                "enabled": True,
+                "reason": "route_wire_count_exceeds_in_memory_table_threshold",
+                "route_wire_count": total_wire_count,
+                "degraded_tables": [
+                    "semantic_blocks",
+                    "patch_entity_refs",
+                    "instance_stage_state",
+                    "pin_stage_state",
+                    "wire_segments",
+                    "wire_patch_intersections",
+                    "timing_path_points",
+                    "timing_edges",
+                    "timing_wire_path_nodes",
+                    "stage_deltas",
+                ],
+                "preserved_tables": ["run_patch_route_labels", "run_stage_patch_features", "nets", "pins", "instances"],
+            }
+            self._quality.setdefault("warnings", []).append(
+                "large_design_mode: detailed wire/timing delta tables are intentionally degraded; "
+                "core progressive patch features and route labels are preserved"
+            )
         tech_layers = _records_by_name(self.foundation_dir / "vectors" / "tech" / "layers.json")
         tech_vias = _records_by_name(self.foundation_dir / "vectors" / "tech" / "vias.json")
         net_segment_index: dict[str, int] = {}
@@ -1268,6 +1430,8 @@ class FoundationExtractor:
                             drc_report,
                             tech_layers,
                             tech_vias,
+                            net_contexts.get(net.name),
+                            large_design_route,
                         )
                     )
                 )
@@ -1286,6 +1450,12 @@ class FoundationExtractor:
         if stage.name != "route":
             self._quality.setdefault("availability", {}).setdefault("routing_graphs", {})[stage.name] = "not_available_before_route"
             self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = "not_available_before_route"
+            return []
+        if sum(len(net.wires) for net in parsed_def.nets) > 1000:
+            status = "skipped_large_route_design"
+            self._quality.setdefault("availability", {}).setdefault("routing_graphs", {})[stage.name] = status
+            self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = status
+            self._large_design_mode = True
             return []
         net_records = {str(record.get("net_key")): record for record in nets}
         pins_by_net: dict[str, list[dict[str, Any]]] = {}
@@ -1397,19 +1567,63 @@ class FoundationExtractor:
         stage_index = stage_order.index(stage) if stage in stage_order else None
         prev_stage = stage_order[stage_index - 1] if isinstance(stage_index, int) and stage_index > 0 else None
         def_source = _workspace_relative_from_parsed_def(parsed_def) if parsed_def else None
+
+        def _index_by_primary(items: list[dict[str, Any]], primary_getter) -> dict[int, list[dict[str, Any]]]:
+            out: dict[int, list[dict[str, Any]]] = {}
+            for item in items:
+                patch_id = primary_getter(item)
+                if patch_id is None:
+                    continue
+                out.setdefault(int(patch_id), []).append(item)
+            return out
+
+        def _index_by_many(items: list[dict[str, Any]], ids_getter) -> dict[int, list[dict[str, Any]]]:
+            out: dict[int, list[dict[str, Any]]] = {}
+            for item in items:
+                for patch_id in ids_getter(item) or []:
+                    if patch_id is None:
+                        continue
+                    out.setdefault(int(patch_id), []).append(item)
+            return out
+
+        instances_by_primary = _index_by_primary(
+            instances,
+            lambda item: item.get("patch_anchor", {}).get("primary_patch_id")
+            if item.get("patch_anchor", {}).get("primary_patch_id") is not None
+            else item.get("physical_state", {}).get("patch_id"),
+        )
+        instances_by_overlap = _index_by_many(
+            instances,
+            lambda item: item.get("patch_anchor", {}).get("overlap_patch_ids")
+            or item.get("physical_state", {}).get("overlap_patch_ids")
+            or [],
+        )
+        pins_by_primary = _index_by_primary(pins, lambda item: item.get("patch_anchor", {}).get("primary_patch_id"))
+        pins_by_overlap = _index_by_many(
+            pins,
+            lambda item: item.get("patch_anchor", {}).get("overlap_patch_ids")
+            or item.get("geometry", {}).get("overlap_patch_ids")
+            or [],
+        )
+        wires_by_overlap = _index_by_many(wires, lambda item: item.get("patch_anchor", {}).get("overlap_patch_ids") or [])
+        nets_by_primary = _index_by_primary(nets, lambda item: item.get("patch_anchor", {}).get("primary_patch_id"))
+        nets_by_overlap = _index_by_many(nets, lambda item: item.get("geometry_proxy", {}).get("patch_ids") or [])
+        timing_by_patch = _index_by_many(timing_paths, _timing_path_patch_ids)
+
         for patch in canonical_grid.get("patches", []):
             patch_id = int(patch["patch_id"])
             row = int(patch["row"])
             col = int(patch["col"])
             bbox = patch["bbox"]
             center = _bbox_center(bbox)
-            patch_instances = [item for item in instances if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id or item.get("physical_state", {}).get("patch_id") == patch_id]
-            overlap_instances = [item for item in instances if patch_id in (item.get("patch_anchor", {}).get("overlap_patch_ids") or item.get("physical_state", {}).get("overlap_patch_ids") or [])]
-            patch_pins = [item for item in pins if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id]
-            overlap_pins = [item for item in pins if patch_id in (item.get("patch_anchor", {}).get("overlap_patch_ids") or item.get("geometry", {}).get("overlap_patch_ids") or [])]
-            patch_wires = [item for item in wires if patch_id in item.get("patch_anchor", {}).get("overlap_patch_ids", [])]
-            patch_nets = [item for item in nets if item.get("patch_anchor", {}).get("primary_patch_id") == patch_id]
-            overlap_nets = [item for item in nets if patch_id in item.get("geometry_proxy", {}).get("patch_ids", [])]
+            patch_instances = instances_by_primary.get(patch_id, [])
+            overlap_instances = instances_by_overlap.get(patch_id, [])
+            patch_pins = pins_by_primary.get(patch_id, [])
+            overlap_pins = pins_by_overlap.get(patch_id, [])
+            patch_wires = wires_by_overlap.get(patch_id, [])
+            patch_nets = nets_by_primary.get(patch_id, [])
+            overlap_nets = nets_by_overlap.get(patch_id, [])
+            patch_timing_paths = timing_by_patch.get(patch_id, [])
             wire_length_by_layer: dict[str, float] = {}
             wire_length = 0.0
             for wire in patch_wires:
@@ -1507,8 +1721,8 @@ class FoundationExtractor:
                 "local_density": {"feature_role": "progressive_input", "available_for_training_input": input_available, "instance_count_center": len(patch_instances), "instance_count_overlap": len(overlap_instances), "stdcell_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "stdcell"), "macro_count_overlap": len(macro_instances), "physical_only_count_overlap": len(physical_only_instances), "stdcell_area_overlap": stdcell_area, "macro_area_overlap": macro_area, "instance_area_overlap": instance_area, "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col), "macro_density": _value_from_named_map(density_maps, "macro_density", row, col), "pin_count_anchor": len(patch_pins), "pin_count_overlap": len(overlap_pins), "pin_density": pin_density, "net_density": net_density, "wire_length": wire_length, "wire_length_by_layer": wire_length_by_layer, "via_count": sum(1 for wire in patch_wires if wire.get("identity", {}).get("segment_kind") == "via"), "source": "maps_and_vectors"},
                 "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": input_available, "net_count_anchor": len(patch_nets), "net_count_overlap": len(overlap_nets), "cross_patch_net_count": sum(1 for net in overlap_nets if net.get("connectivity_summary", {}).get("cross_patch")), "entering_net_count": sum(1 for net in overlap_nets if patch_id != net.get("patch_anchor", {}).get("primary_patch_id")), "leaving_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "internal_net_count": sum(1 for net in patch_nets if not net.get("connectivity_summary", {}).get("cross_patch")), "high_fanout_net_count": sum(1 for net in overlap_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "clock_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_clock")), "reset_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_reset")), "pg_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_power_ground")), "signal_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_signal")), "local_hpwl_sum": _sum_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_max": _max_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_mean": _mean_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "source": f"vectors/nets/{stage}.jsonl"},
                 "pre_route_estimators": {"feature_role": "progressive_input", "available_for_training_input": input_available, "rudy_horizontal": _value_from_named_map(rudy_maps, "rudy_horizontal", row, col), "rudy_vertical": _value_from_named_map(rudy_maps, "rudy_vertical", row, col), "rudy_union": rudy_union, "egr_overflow_horizontal": egr_horizontal, "egr_overflow_vertical": egr_vertical, "egr_overflow_union": egr_union, "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col), "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col), "source": "canonical_maps"},
-                "neighbor_context": {"feature_role": "progressive_input", "available_for_training_input": input_available, "adjacent_patch_ids": adjacent_ids, "window_3x3_patch_ids": neighbor_ids, "window_3x3_valid_count": len(neighbor_ids), "edge_position": _edge_position(row, col, rows, cols), "window_3x3_cell_density_mean": _mean_optional(window_cell_values), "window_3x3_pin_density_sum": _sum_optional(window_pin_density_values), "window_3x3_pin_count_sum": sum(1 for pin in pins if pin.get("patch_anchor", {}).get("primary_patch_id") in neighbor_ids), "window_3x3_rudy_max": _max_optional(window_rudy_values), "window_3x3_egr_overflow_max": _max_optional(window_egr_values), "source": f"vectors/patches/{stage}.jsonl"},
-                "entity_refs": {"anchor_semantics": "primary_patch_or_center", "overlap_semantics": "bbox_or_segment_intersection", "instance_count": len(patch_instances), "instance_overlap_count": len(overlap_instances), "pin_count": len(patch_pins), "pin_overlap_count": len(overlap_pins), "net_count": len(patch_nets), "net_overlap_count": len(overlap_nets), "wire_count": len(patch_wires), "timing_path_count": sum(1 for path in timing_paths if patch_id in _timing_path_patch_ids(path)), "drc_count": patch_drc.get("count"), "sample_instance_keys": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "sample_pin_keys": [item.get("pin_key") for item in patch_pins[:32]], "sample_net_keys": [item.get("net_key") for item in patch_nets[:32]], "sample_wire_ids": [item.get("wire_key") for item in patch_wires[:32]], "sample_timing_path_ids": [item.get("id") for item in timing_paths if patch_id in _timing_path_patch_ids(item)][:32], "sample_drc_ids": [], "refs_truncated": any(count > 32 for count in (len(patch_instances), len(patch_pins), len(patch_nets), len(patch_wires), sum(1 for path in timing_paths if patch_id in _timing_path_patch_ids(path)))), "ref_limit": 32},
+                "neighbor_context": {"feature_role": "progressive_input", "available_for_training_input": input_available, "adjacent_patch_ids": adjacent_ids, "window_3x3_patch_ids": neighbor_ids, "window_3x3_valid_count": len(neighbor_ids), "edge_position": _edge_position(row, col, rows, cols), "window_3x3_cell_density_mean": _mean_optional(window_cell_values), "window_3x3_pin_density_sum": _sum_optional(window_pin_density_values), "window_3x3_pin_count_sum": sum(len(pins_by_primary.get(item, [])) for item in neighbor_ids), "window_3x3_rudy_max": _max_optional(window_rudy_values), "window_3x3_egr_overflow_max": _max_optional(window_egr_values), "source": f"vectors/patches/{stage}.jsonl"},
+                "entity_refs": {"anchor_semantics": "primary_patch_or_center", "overlap_semantics": "bbox_or_segment_intersection", "instance_count": len(patch_instances), "instance_overlap_count": len(overlap_instances), "pin_count": len(patch_pins), "pin_overlap_count": len(overlap_pins), "net_count": len(patch_nets), "net_overlap_count": len(overlap_nets), "wire_count": len(patch_wires), "timing_path_count": len(patch_timing_paths), "drc_count": patch_drc.get("count"), "sample_instance_keys": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "sample_pin_keys": [item.get("pin_key") for item in patch_pins[:32]], "sample_net_keys": [item.get("net_key") for item in patch_nets[:32]], "sample_wire_ids": [item.get("wire_key") for item in patch_wires[:32]], "sample_timing_path_ids": [item.get("id") for item in patch_timing_paths[:32]], "sample_drc_ids": [], "refs_truncated": any(count > 32 for count in (len(patch_instances), len(patch_pins), len(patch_nets), len(patch_wires), len(patch_timing_paths))), "ref_limit": 32},
                 "timing_context": timing_context,
                 "electrical_context": electrical_context,
                 "route_oracle": route_oracle,
@@ -1521,8 +1735,9 @@ class FoundationExtractor:
             records.append(record)
         return records
 
-    def _write_labels(self, native_demand_capacity: list[dict[str, Any]]) -> dict[str, Any]:
-        write_jsonl(self.foundation_dir / "labels" / "route_native_demand_capacity.jsonl", native_demand_capacity)
+    def _write_labels(self, native_demand_capacity: list[dict[str, Any]], *, export_legacy_debug: bool) -> dict[str, Any]:
+        if export_legacy_debug:
+            write_jsonl(self.foundation_dir / "labels" / "route_native_demand_capacity.jsonl", native_demand_capacity)
         self._mark(
             "labels",
             "route_native_demand_capacity",
@@ -1771,6 +1986,7 @@ class FoundationExtractor:
         design_id = _stable_id("design", pdk, design_name, top_module, logical_source_hash)
         run_id = _stable_id("run", design_id, parameters, self._source_signature())
         stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
+        large_design_mode = bool(getattr(self, "_large_design_mode", False))
 
         tables: dict[str, list[dict[str, Any]]] = {
             "designs": [
@@ -1813,7 +2029,7 @@ class FoundationExtractor:
             ],
             "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids, labels, metrics),
             "provenance": [],
-            "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
+            "semantic_blocks": [] if large_design_mode else self._semantic_block_rows(design_id, run_id, stages),
             "patches": self._patch_table_rows(design_id, canonical_grid),
             "patch_neighbors": self._patch_neighbor_rows(design_id, canonical_grid),
             "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
@@ -1823,23 +2039,23 @@ class FoundationExtractor:
             "tech_layers": self._tech_layer_rows(design_id),
             "tech_vias": self._tech_via_rows(design_id),
             "library_cells": self._library_cell_rows(design_id),
-            "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
+            "patch_entity_refs": [] if large_design_mode else self._patch_entity_ref_rows(design_id, run_id, stages),
             "instances": self._instance_rows(design_id, stages),
-            "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
+            "instance_stage_state": [] if large_design_mode else self._instance_stage_state_rows(design_id, run_id, stages),
             "pins": self._pin_rows(design_id, stages),
-            "pin_stage_state": self._pin_stage_state_rows(design_id, run_id, stages),
+            "pin_stage_state": [] if large_design_mode else self._pin_stage_state_rows(design_id, run_id, stages),
             "nets": self._net_rows(design_id, stages),
             "net_terminals": self._net_terminal_rows(design_id, run_id, stages),
-            "wire_segments": self._wire_segment_rows(design_id, run_id, stages),
-            "wire_patch_intersections": self._wire_patch_intersection_rows(design_id, run_id, stages),
+            "wire_segments": [] if large_design_mode else self._wire_segment_rows(design_id, run_id, stages),
+            "wire_patch_intersections": [] if large_design_mode else self._wire_patch_intersection_rows(design_id, run_id, stages),
             "routing_vertices": self._routing_vertex_rows(design_id, run_id, stages),
             "routing_edges": self._routing_edge_rows(design_id, run_id, stages),
             "timing_paths": self._timing_path_rows(design_id, run_id, stages),
-            "timing_path_points": self._timing_path_point_rows(design_id, run_id, stages),
-            "timing_edges": self._timing_edge_rows(design_id, run_id, stages),
-            "timing_wire_path_nodes": self._timing_wire_path_node_rows(design_id, run_id, stages),
+            "timing_path_points": [] if large_design_mode else self._timing_path_point_rows(design_id, run_id, stages),
+            "timing_edges": [] if large_design_mode else self._timing_edge_rows(design_id, run_id, stages),
+            "timing_wire_path_nodes": [] if large_design_mode else self._timing_wire_path_node_rows(design_id, run_id, stages),
             "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
-            "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
+            "stage_deltas": [] if large_design_mode else self._stage_delta_rows(design_id, run_id, stages),
         }
         tables["provenance"] = self._provenance_rows(tables)
         return tables
@@ -2077,22 +2293,38 @@ class FoundationExtractor:
                 return rel_path
         return None
 
+    def _reload_legacy_vector_records(self, stages: list[StageInfo]) -> None:
+        for entity in _ENTITY_NAMES:
+            for stage in stages:
+                self._vector_records[entity][stage.name] = _read_jsonl_records(
+                    self.foundation_dir / "vectors" / entity / f"{stage.name}.jsonl"
+                )
+
+    def _records_for_stage(self, entity: str, stage_name: str) -> list[dict[str, Any]]:
+        records = self._vector_records.get(entity, {}).get(stage_name)
+        if records is not None:
+            return records
+        return _read_jsonl_records(self.foundation_dir / "vectors" / entity / f"{stage_name}.jsonl")
+
+    def _semantic_block_sources(self, stage_name: str) -> tuple[tuple[str, str, list[dict[str, Any]]], ...]:
+        return (
+            ("patch", "patch_key", self._records_for_stage("patches", stage_name)),
+            ("instance", "name", self._records_for_stage("instances", stage_name)),
+            ("pin", "pin_key", self._records_for_stage("pins", stage_name)),
+            ("net", "net_key", self._records_for_stage("nets", stage_name)),
+            ("wire_segment", "wire_key", self._records_for_stage("wires", stage_name)),
+            ("routing_graph", "graph_key", self._records_for_stage("routing_graphs", stage_name)),
+            ("timing_path", "path_key", self._records_for_stage("timing_paths", stage_name)),
+        )
+
     def _semantic_block_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
     ) -> list[dict[str, Any]]:
         rows = []
         block_names = ("source_refs", "null_reason", "progressive_metadata")
         for stage in stages:
-            for entity_type, key_field, path in (
-                ("patch", "patch_key", self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"),
-                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
-                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
-                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
-                ("wire_segment", "wire_key", self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"),
-                ("routing_graph", "graph_key", self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"),
-                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
-            ):
-                for record in _read_jsonl_records(path):
+            for entity_type, key_field, records in self._semantic_block_sources(stage.name):
+                for record in records:
                     entity_key = str(record.get(key_field) or record.get("id"))
                     for block_name in block_names:
                         payload = record.get(block_name)
@@ -2270,9 +2502,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(
-                self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"
-            ):
+            for record in self._records_for_stage("patches", stage.name):
                 density = record.get("local_density") or {}
                 connectivity = record.get("local_connectivity") or {}
                 estimators = record.get("pre_route_estimators") or {}
@@ -2468,14 +2698,14 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for entity, key_field, path in (
-                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
-                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
-                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
-                ("wire_segment", "wire_key", self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"),
-                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
+            for entity, key_field, records in (
+                ("instance", "name", self._records_for_stage("instances", stage.name)),
+                ("pin", "pin_key", self._records_for_stage("pins", stage.name)),
+                ("net", "net_key", self._records_for_stage("nets", stage.name)),
+                ("wire_segment", "wire_key", self._records_for_stage("wires", stage.name)),
+                ("timing_path", "path_key", self._records_for_stage("timing_paths", stage.name)),
             ):
-                for record in _read_jsonl_records(path):
+                for record in records:
                     anchor = record.get("patch_anchor") or {}
                     geometry = record.get("geometry") or record.get("geometry_proxy") or {}
                     primary = anchor.get("primary_patch_id") or geometry.get("patch_id")
@@ -2501,7 +2731,7 @@ class FoundationExtractor:
     def _instance_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         by_key = {}
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("instances", stage.name):
                 identity = record.get("identity") or {}
                 key = str(identity.get("instance_key") or record.get("name"))
                 by_key.setdefault(
@@ -2524,7 +2754,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("instances", stage.name):
                 identity = record.get("identity") or {}
                 state = record.get("physical_state") or {}
                 bbox = state.get("bbox") or {}
@@ -2553,7 +2783,7 @@ class FoundationExtractor:
     def _pin_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         by_key = {}
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("pins", stage.name):
                 identity = record.get("identity") or {}
                 key = str(record.get("pin_key") or identity.get("pin_key"))
                 by_key.setdefault(
@@ -2577,7 +2807,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("pins", stage.name):
                 geometry = record.get("geometry") or {}
                 center = geometry.get("center") or {}
                 out.append(
@@ -2601,7 +2831,7 @@ class FoundationExtractor:
     def _net_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         by_key = {}
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("nets", stage.name):
                 identity = record.get("identity") or {}
                 key = str(record.get("net_key") or identity.get("net_key"))
                 by_key.setdefault(
@@ -2625,7 +2855,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("nets", stage.name):
                 net_key = str(record.get("net_key") or (record.get("identity") or {}).get("net_key"))
                 for terminal in record.get("terminal_refs") or []:
                     role = str(terminal.get("role") or terminal.get("terminal_role") or "")
@@ -2651,7 +2881,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("wires", stage.name):
                 identity = record.get("identity") or {}
                 geometry = record.get("geometry") or {}
                 start = geometry.get("start") or {}
@@ -2684,7 +2914,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("wires", stage.name):
                 key = str(record.get("wire_key") or (record.get("identity") or {}).get("wire_key"))
                 for item in record.get("patch_intersections") or []:
                     out.append(
@@ -2709,7 +2939,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for graph in _read_jsonl_records(self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"):
+            for graph in self._records_for_stage("routing_graphs", stage.name):
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for vertex in graph.get("vertices") or []:
                     out.append(
@@ -2733,7 +2963,7 @@ class FoundationExtractor:
     def _routing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for graph in _read_jsonl_records(self.foundation_dir / "vectors" / "routing_graphs" / f"{stage.name}.jsonl"):
+            for graph in self._records_for_stage("routing_graphs", stage.name):
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for edge in graph.get("edges") or []:
                     out.append(
@@ -2759,7 +2989,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("timing_paths", stage.name):
                 timing = record.get("path_timing") or {}
                 endpoints = record.get("endpoints") or {}
                 out.append(
@@ -2786,7 +3016,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, point in enumerate(record.get("path_points") or []):
                     center = point.get("center") or {}
@@ -2814,7 +3044,7 @@ class FoundationExtractor:
     def _timing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, edge in enumerate(record.get("timing_edges") or []):
                     out.append(
@@ -2839,7 +3069,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for record in _read_jsonl_records(self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"):
+            for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, node in enumerate(record.get("wire_path_nodes") or []):
                     out.append(
@@ -2862,14 +3092,14 @@ class FoundationExtractor:
     def _stage_delta_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         out = []
         for stage in stages:
-            for entity, key_field, path in (
-                ("instance", "name", self.foundation_dir / "vectors" / "instances" / f"{stage.name}.jsonl"),
-                ("pin", "pin_key", self.foundation_dir / "vectors" / "pins" / f"{stage.name}.jsonl"),
-                ("net", "net_key", self.foundation_dir / "vectors" / "nets" / f"{stage.name}.jsonl"),
-                ("patch", "patch_key", self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl"),
-                ("timing_path", "path_key", self.foundation_dir / "vectors" / "timing_paths" / f"{stage.name}.jsonl"),
+            for entity, key_field, records in (
+                ("instance", "name", self._records_for_stage("instances", stage.name)),
+                ("pin", "pin_key", self._records_for_stage("pins", stage.name)),
+                ("net", "net_key", self._records_for_stage("nets", stage.name)),
+                ("patch", "patch_key", self._records_for_stage("patches", stage.name)),
+                ("timing_path", "path_key", self._records_for_stage("timing_paths", stage.name)),
             ):
-                for record in _read_jsonl_records(path):
+                for record in records:
                     progressive = record.get("progressive_metadata") or {}
                     prev_stage = progressive.get("prev_stage")
                     if not prev_stage and (entity == "timing_path" or progressive.get("exists_in_prev_stage") is not None):
@@ -3051,7 +3281,7 @@ class FoundationExtractor:
         )
         expected_rows = int(canonical_grid.get("rows") or 0) * int(canonical_grid.get("cols") or 0)
         for stage in stages:
-            records = _read_jsonl_records(self.foundation_dir / "vectors" / "patches" / f"{stage.name}.jsonl")
+            records = self._records_for_stage("patches", stage.name)
             patch_quality["rows_by_stage"][stage.name] = len(records)
             complete_records = sum(1 for record in records if all(key in record for key in required_top))
             patch_quality["schema_coverage_by_stage"][stage.name] = {
@@ -3113,7 +3343,7 @@ class FoundationExtractor:
             "null_reason",
         )
         for stage in stages:
-            records = _read_jsonl_records(self.foundation_dir / "vectors" / "wires" / f"{stage.name}.jsonl")
+            records = self._records_for_stage("wires", stage.name)
             record_count = len(records)
             route_context_count = sum(1 for record in records if isinstance(record.get("route_context"), dict))
             route_context_source: dict[str, int] = {}
@@ -3317,6 +3547,29 @@ def _component_lookup_key(name: Any) -> str:
     return str(name).strip()
 
 
+def _component_bbox_from_def(
+    component: dict[str, Any],
+    lef_macro: LefMacro | None,
+    units: int | None,
+) -> dict[str, float] | None:
+    origin = component.get("origin")
+    size = getattr(lef_macro, "size", None) if lef_macro is not None else None
+    if not isinstance(origin, dict) or not isinstance(size, dict):
+        return None
+    width = size.get("width")
+    height = size.get("height")
+    if width is None or height is None:
+        return None
+    llx = float(origin["x"])
+    lly = float(origin["y"])
+    return {
+        "llx": llx,
+        "lly": lly,
+        "urx": llx + float(width) * _lef_scale(units),
+        "ury": lly + float(height) * _lef_scale(units),
+    }
+
+
 def _cell_class(master: str, name: str) -> str:
     lower = f"{master} {name}".lower()
     if "dff" in lower or "df" in lower or "latch" in lower or "reg" in lower:
@@ -3474,6 +3727,8 @@ def _pin_records_for_stage(
     component_by_name = {str(component.get("name")): component for component in parsed_def.components}
     net_by_name = {net.name: net for net in parsed_def.nets}
     net_use_by_name = {net.name: net.use for net in parsed_def.nets if net.use}
+    wires_by_net = {net.name: list(net.wires) for net in parsed_def.nets}
+    route_label_demand_capacity_by_patch = _route_label_demand_capacity_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}
     raw_pins: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -3521,6 +3776,8 @@ def _pin_records_for_stage(
             parsed_def,
             lef_macros or {},
             drc_report,
+            route_label_demand_capacity_by_patch,
+            wires_by_net,
         )
         for record_id, raw_pin in enumerate(raw_pins)
     ]
@@ -3545,6 +3802,8 @@ def _build_pin_record(
     parsed_def: DefData,
     lef_macros: dict[str, LefMacro],
     drc_report: dict[str, Any] | None,
+    route_label_demand_capacity_by_patch: dict[int, float] | None = None,
+    wires_by_net: dict[str, list[DefWire]] | None = None,
 ) -> dict[str, Any]:
     del record_id
     pin_kind = str(raw_pin.get("pin_kind") or "instance_terminal")
@@ -3569,7 +3828,7 @@ def _build_pin_record(
         null_reason["timing_context"] = "pin_not_found_in_timing_paths"
     elif not timing_context["available"]:
         null_reason["timing_context"] = "missing_sta_artifacts"
-    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps, canonical_grid, _route_label_demand_capacity_by_patch(stage.directory, canonical_grid) if stage.name == "route" else {}, drc_report)
+    route_context = _pin_route_context(stage.name, net, geometry, parsed_def, stage_maps, canonical_grid, route_label_demand_capacity_by_patch or {}, drc_report, wires_by_net or {})
     if route_context is None:
         null_reason["route_context"] = "not_route_stage"
     return {
@@ -3778,7 +4037,10 @@ def _pin_geometry(
             if boxes:
                 bbox = _bbox_union(boxes)
                 center = _bbox_center(bbox)
-                patch = _patch_for_point(canonical_grid.get("patches", []), center)
+                lookup = _patch_grid_lookup(canonical_grid)
+                patch = _grid_patch_for_point(lookup, center)
+                if patch is None:
+                    patch = _patch_for_point(canonical_grid.get("patches", []), center)
                 return {
                     "geometry_status": "exact",
                     "anchor_source": "io_pin_shape",
@@ -3800,11 +4062,14 @@ def _pin_geometry(
                     ],
                     "absolute_shapes": absolute_shapes,
                     "patch_id": int(patch["patch_id"]) if patch else None,
-                    "overlap_patch_ids": _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
+                    "overlap_patch_ids": _grid_overlap_patch_ids(lookup, bbox) or _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
                 }
         if isinstance(origin, dict):
             center = {"x": float(origin["x"]), "y": float(origin["y"])}
-            patch = _patch_for_point(canonical_grid.get("patches", []), center)
+            lookup = _patch_grid_lookup(canonical_grid)
+            patch = _grid_patch_for_point(lookup, center)
+            if patch is None:
+                patch = _patch_for_point(canonical_grid.get("patches", []), center)
             null_reason["geometry_bbox"] = "missing_def_pin_shape"
             return _empty_pin_geometry("fallback_to_instance_anchor", "io_pin_origin", center, int(patch["patch_id"]) if patch else None)
         null_reason["geometry_bbox"] = "missing_def_pin_shape"
@@ -3835,7 +4100,10 @@ def _pin_geometry(
         if boxes:
             bbox = _bbox_union(boxes)
             pin_center = _bbox_center(bbox)
-            patch = _patch_for_point(canonical_grid.get("patches", []), pin_center)
+            lookup = _patch_grid_lookup(canonical_grid)
+            patch = _grid_patch_for_point(lookup, pin_center)
+            if patch is None:
+                patch = _patch_for_point(canonical_grid.get("patches", []), pin_center)
             return {
                 "geometry_status": "exact",
                 "anchor_source": "lef_pin_shape",
@@ -3847,7 +4115,7 @@ def _pin_geometry(
                 "local_shapes": [{**{k: v for k, v in shape.items() if k != "source"}, "rect": _scale_lef_rect(shape["rect"], units)} for shape in shapes if isinstance(shape.get("rect"), dict)],
                 "absolute_shapes": absolute_shapes,
                 "patch_id": int(patch["patch_id"]) if patch else None,
-                "overlap_patch_ids": _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
+                "overlap_patch_ids": _grid_overlap_patch_ids(lookup, bbox) or _overlap_patch_ids(canonical_grid.get("patches", []), bbox),
             }
     if isinstance(center, dict):
         null_reason["geometry_bbox"] = "missing_lef_pin_shape" if not shapes else null_reason.get("geometry_bbox", "missing_instance_origin")
@@ -3880,11 +4148,16 @@ def _pin_patch_anchor(
     center = geometry.get("center")
     bbox = geometry.get("bbox")
     patches = canonical_grid.get("patches", []) if isinstance(canonical_grid, dict) else []
-    primary_patch = _patch_for_point(patches, center) if isinstance(center, dict) else None
+    lookup = _patch_grid_lookup(canonical_grid)
+    primary_patch = _grid_patch_for_point(lookup, center) if isinstance(center, dict) else None
+    if primary_patch is None and isinstance(center, dict):
+        primary_patch = _patch_for_point(patches, center)
     patch_id = int(primary_patch["patch_id"]) if primary_patch is not None else geometry.get("patch_id")
     row = int(primary_patch["row"]) if primary_patch is not None else None
     col = int(primary_patch["col"]) if primary_patch is not None else None
-    overlap_patch_ids = _overlap_patch_ids(patches, bbox) if isinstance(bbox, dict) else list(geometry.get("overlap_patch_ids") or [])
+    overlap_patch_ids = _grid_overlap_patch_ids(lookup, bbox) if isinstance(bbox, dict) else list(geometry.get("overlap_patch_ids") or [])
+    if not overlap_patch_ids and isinstance(bbox, dict):
+        overlap_patch_ids = _overlap_patch_ids(patches, bbox)
     if patch_id is not None and patch_id not in overlap_patch_ids and isinstance(bbox, dict):
         overlap_patch_ids = [int(patch_id), *overlap_patch_ids]
     return {
@@ -3968,10 +4241,13 @@ def _pin_route_context(
     canonical_grid: dict,
     route_label_demand_capacity_by_patch: dict[int, float],
     drc_report: dict[str, Any] | None,
+    wires_by_net: dict[str, list[DefWire]] | None = None,
 ) -> dict[str, Any] | None:
     if stage_name != "route":
         return None
-    net_wires = [wire for def_net in parsed_def.nets if def_net.name == net for wire in def_net.wires]
+    net_wires = (wires_by_net or {}).get(net)
+    if net_wires is None:
+        net_wires = [wire for def_net in parsed_def.nets if def_net.name == net for wire in def_net.wires]
     patch_id = geometry.get("patch_id")
     local_final_overflow = None
     if patch_id is not None:
@@ -4184,6 +4460,45 @@ def _attach_pin_progressive_metadata(stages: list[StageInfo], pins_dir: Path) ->
         write_jsonl(pins_dir / f"{stage.name}.jsonl", [_ordered_pin_record(record, idx) for idx, record in enumerate(current)], sort_keys=False)
 
 
+def _attach_pin_progressive_metadata_in_memory(stages: list[StageInfo], records_by_stage: dict[str, list[dict[str, Any]]]) -> None:
+    first_seen: dict[str, str] = {}
+    for stage in stages:
+        for record in records_by_stage.get(stage.name, []):
+            first_seen.setdefault(str(record.get("pin_key")), stage.name)
+    place_keys = {str(record.get("pin_key")) for record in records_by_stage.get("place", [])}
+    previous_by_key: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        current = records_by_stage.get(stage.name, [])
+        current_by_key = {str(record.get("pin_key")): record for record in current}
+        for key, record in current_by_key.items():
+            previous = previous_by_key.get(key)
+            center = record.get("geometry", {}).get("center")
+            previous_center = previous.get("geometry", {}).get("center") if previous else None
+            dx = dy = moved = None
+            if isinstance(center, dict) and isinstance(previous_center, dict):
+                dx = float(center["x"]) - float(previous_center["x"])
+                dy = float(center["y"]) - float(previous_center["y"])
+                moved = dx != 0.0 or dy != 0.0
+            first_stage = first_seen.get(key, stage.name)
+            created_stage = "Synthesis" if first_stage in {"Floorplan", "place"} else first_stage
+            record["progressive_metadata"] = {
+                "available_from": first_stage,
+                "created_stage": created_stage,
+                "created_stage_source": "def_connection" if created_stage == "Synthesis" else "first_observed",
+                "exists_in_prev_stage": previous is not None,
+                "exists_in_place": key in place_keys,
+                "introduced_by_cts": first_stage == "CTS",
+                "prev_net": previous.get("identity", {}).get("net") if previous else None,
+                "net_changed_from_prev_stage": (previous.get("identity", {}).get("net") != record.get("identity", {}).get("net")) if previous else None,
+                "moved_from_prev_stage": moved,
+                "dx_from_prev_stage": dx,
+                "dy_from_prev_stage": dy,
+                "geometry_changed_from_prev_stage": (_pin_geometry_signature(record) != _pin_geometry_signature(previous)) if previous else None,
+                "route_only_oracle": isinstance(record.get("route_context"), dict) and bool(record["route_context"].get("route_only_oracle")),
+            }
+        previous_by_key = current_by_key
+
+
 def _attach_patch_progressive_metadata(stages: list[StageInfo], patches_dir: Path) -> None:
     previous_by_patch_id: dict[int, dict[str, Any]] = {}
     for stage in stages:
@@ -4223,6 +4538,27 @@ def _attach_patch_progressive_metadata(stages: list[StageInfo], patches_dir: Pat
         else:
             previous_by_patch_id = {}
         write_jsonl(path, records, sort_keys=False)
+
+
+def _attach_patch_progressive_metadata_in_memory(stages: list[StageInfo], records_by_stage: dict[str, list[dict[str, Any]]]) -> None:
+    previous_by_patch_id: dict[int, dict[str, Any]] = {}
+    for stage in stages:
+        records = records_by_stage.get(stage.name, [])
+        for record in records:
+            patch_id = record.get("identity", {}).get("patch_id")
+            if patch_id is None:
+                continue
+            previous = previous_by_patch_id.get(int(patch_id))
+            metadata = record.setdefault("progressive_metadata", {})
+            metadata["density_delta_from_prev_stage"] = _delta(record.get("local_density", {}).get("cell_density"), previous.get("local_density", {}).get("cell_density") if previous else None)
+            metadata["pin_count_delta_from_prev_stage"] = _delta(record.get("local_density", {}).get("pin_count_anchor"), previous.get("local_density", {}).get("pin_count_anchor") if previous else None)
+            metadata["rudy_delta_from_prev_stage"] = _delta(record.get("pre_route_estimators", {}).get("rudy_union"), previous.get("pre_route_estimators", {}).get("rudy_union") if previous else None)
+            metadata["egr_overflow_delta_from_prev_stage"] = _delta(record.get("pre_route_estimators", {}).get("egr_overflow_union"), previous.get("pre_route_estimators", {}).get("egr_overflow_union") if previous else None)
+        previous_by_patch_id = {
+            int(record["identity"]["patch_id"]): record
+            for record in records
+            if record.get("identity", {}).get("patch_id") is not None
+        } if records else {}
 
 
 def _attach_net_progressive_metadata(stages: list[StageInfo], nets_dir: Path) -> None:
@@ -4269,6 +4605,42 @@ def _attach_net_progressive_metadata(stages: list[StageInfo], nets_dir: Path) ->
         write_jsonl(nets_dir / f"{stage.name}.jsonl", [_ordered_net_record(record, idx) for idx, record in enumerate(current)], sort_keys=False)
 
 
+def _attach_net_progressive_metadata_in_memory(stages: list[StageInfo], records_by_stage: dict[str, list[dict[str, Any]]]) -> None:
+    first_seen: dict[str, str] = {}
+    for stage in stages:
+        for record in records_by_stage.get(stage.name, []):
+            first_seen.setdefault(str(record.get("net_key")), stage.name)
+    place_keys = {str(record.get("net_key")) for record in records_by_stage.get("place", [])}
+    previous_by_key: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        current = records_by_stage.get(stage.name, [])
+        current_by_key = {str(record.get("net_key")): record for record in current}
+        for key, record in current_by_key.items():
+            previous = previous_by_key.get(key)
+            first = first_seen.get(key, stage.name)
+            current_summary = record.get("connectivity_summary", {}) if isinstance(record.get("connectivity_summary"), dict) else {}
+            prev_summary = previous.get("connectivity_summary", {}) if isinstance(previous, dict) and isinstance(previous.get("connectivity_summary"), dict) else {}
+            current_geom = record.get("geometry_proxy", {}) if isinstance(record.get("geometry_proxy"), dict) else {}
+            prev_geom = previous.get("geometry_proxy", {}) if isinstance(previous, dict) and isinstance(previous.get("geometry_proxy"), dict) else {}
+            introduced_by_cts = first in {"CTS", "legalization", "route", "drc", "filler"} and bool(record.get("identity", {}).get("is_clock") or _is_clock_like(key))
+            record["progressive_metadata"] = {
+                "available_from": first,
+                "created_stage": "Synthesis" if first in {"Floorplan", "fixFanout", "place"} else first,
+                "created_stage_source": "def_net" if first in {"Floorplan", "fixFanout", "place"} else "first_observed",
+                "exists_in_prev_stage": previous is not None,
+                "exists_in_place": key in place_keys,
+                "introduced_by_cts": introduced_by_cts,
+                "prev_net_key": key if previous is not None else None,
+                "renamed_from_prev_stage": False,
+                "terminal_count_changed_from_prev_stage": _delta(current_summary.get("terminal_count"), prev_summary.get("terminal_count")) if previous else None,
+                "hpwl_delta_from_prev_stage": _delta(current_geom.get("hpwl"), prev_geom.get("hpwl")) if previous else None,
+                "patch_span_delta_from_prev_stage": _delta(current_geom.get("patch_span_count"), prev_geom.get("patch_span_count")) if previous else None,
+                "route_only_oracle": isinstance(record.get("route_analysis"), dict) and bool(record["route_analysis"].get("route_only_oracle")),
+            }
+        if current_by_key:
+            previous_by_key = current_by_key
+
+
 
 
 def _wire_geometry_signature(record: dict[str, Any] | None) -> tuple[Any, ...] | None:
@@ -4313,6 +4685,35 @@ def _attach_wire_progressive_metadata(stages: list[StageInfo], wires_dir: Path) 
             previous_signatures = {sig for sig in current_signatures if sig is not None}
             previous_net_keys = current_net_keys
         write_jsonl(wires_dir / f"{stage.name}.jsonl", [_ordered_wire_record(record) for record in records], sort_keys=False)
+
+
+def _attach_wire_progressive_metadata_in_memory(stages: list[StageInfo], records_by_stage: dict[str, list[dict[str, Any]]]) -> None:
+    first_seen: dict[tuple[Any, ...], str] = {}
+    for stage in stages:
+        for record in records_by_stage.get(stage.name, []):
+            sig = _wire_geometry_signature(record)
+            if sig is not None:
+                first_seen.setdefault(sig, stage.name)
+    previous_signatures: set[tuple[Any, ...]] = set()
+    previous_net_keys: set[str] = set()
+    for stage in stages:
+        records = records_by_stage.get(stage.name, [])
+        current_signatures = {_wire_geometry_signature(record) for record in records}
+        current_signatures.discard(None)
+        current_net_keys = {str(record.get("identity", {}).get("net_key")) for record in records if record.get("identity", {}).get("net_key") is not None}
+        for record in records:
+            sig = _wire_geometry_signature(record)
+            net_key = str(record.get("identity", {}).get("net_key")) if record.get("identity", {}).get("net_key") is not None else None
+            metadata = record.setdefault("progressive_metadata", {})
+            metadata["available_from_stage"] = first_seen.get(sig, stage.name) if sig is not None else stage.name
+            metadata["exists_same_geometry_in_prev_stage"] = (sig in previous_signatures) if sig is not None else None
+            metadata["is_new_routed_geometry"] = not metadata["exists_same_geometry_in_prev_stage"] if sig is not None else None
+            metadata["net_exists_in_prev_stage"] = (net_key in previous_net_keys) if net_key is not None else None
+            metadata["route_only_oracle"] = isinstance(record.get("route_context"), dict) and bool(record["route_context"].get("route_only_oracle"))
+            metadata["tracking_scope"] = "stage_local_wire_geometry"
+        if records:
+            previous_signatures = {sig for sig in current_signatures if sig is not None}
+            previous_net_keys = current_net_keys
 
 def _ordered_pin_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
     return {
@@ -4380,8 +4781,13 @@ def _attach_patch_anchor(record: dict[str, Any], canonical_grid: dict, stage_map
     center = physical_state.get("center") if isinstance(physical_state, dict) else None
     bbox = physical_state.get("bbox") if isinstance(physical_state, dict) else None
     patches = canonical_grid.get("patches", []) if isinstance(canonical_grid, dict) else []
-    primary_patch = _patch_for_point(patches, center) if isinstance(center, dict) else None
-    overlap_patch_ids = _overlap_patch_ids(patches, bbox) if isinstance(bbox, dict) else []
+    lookup = _patch_grid_lookup(canonical_grid)
+    primary_patch = _grid_patch_for_point(lookup, center) if isinstance(center, dict) else None
+    if primary_patch is None and isinstance(center, dict):
+        primary_patch = _patch_for_point(patches, center)
+    overlap_patch_ids = _grid_overlap_patch_ids(lookup, bbox) if isinstance(bbox, dict) else []
+    if not overlap_patch_ids and isinstance(bbox, dict):
+        overlap_patch_ids = _overlap_patch_ids(patches, bbox)
     if primary_patch is not None and int(primary_patch["patch_id"]) not in overlap_patch_ids:
         overlap_patch_ids = [int(primary_patch["patch_id"]), *overlap_patch_ids]
     patch_id = int(primary_patch["patch_id"]) if primary_patch is not None else None
@@ -4397,6 +4803,165 @@ def _attach_patch_anchor(record: dict[str, Any], canonical_grid: dict, stage_map
         "local_rudy": _matrix_value(stage_maps.get("rudy", {}).get("rudy_union"), row, col) if row is not None and col is not None else None,
         "local_egr_overflow": _matrix_value(stage_maps.get("congestion", {}).get("union"), row, col) if row is not None and col is not None else None,
     }
+
+
+def _patch_grid_lookup(canonical_grid: dict[str, Any] | None) -> _PatchGridLookup | None:
+    if not isinstance(canonical_grid, dict):
+        return None
+    patches = canonical_grid.get("patches")
+    if not isinstance(patches, list) or not patches:
+        return None
+    cache_key = (id(canonical_grid), len(patches))
+    if cache_key in _PATCH_GRID_LOOKUP_CACHE:
+        return _PATCH_GRID_LOOKUP_CACHE[cache_key]
+
+    rows = int(canonical_grid.get("rows") or 0)
+    cols = int(canonical_grid.get("cols") or 0)
+    if rows <= 0 or cols <= 0:
+        _PATCH_GRID_LOOKUP_CACHE[cache_key] = None
+        return None
+
+    patches_by_coord: dict[tuple[int, int], dict[str, Any]] = {}
+    patches_by_id: dict[int, dict[str, Any]] = {}
+    row_bounds_by_row: dict[int, tuple[float, float]] = {}
+    col_bounds_by_col: dict[int, tuple[float, float]] = {}
+    rectangular = True
+    for patch in patches:
+        if not isinstance(patch, dict) or not isinstance(patch.get("bbox"), dict):
+            rectangular = False
+            continue
+        row = int(patch.get("row", -1))
+        col = int(patch.get("col", -1))
+        if row < 0 or col < 0:
+            rectangular = False
+            continue
+        bbox = patch["bbox"]
+        row_bounds = (float(bbox["lly"]), float(bbox["ury"]))
+        col_bounds = (float(bbox["llx"]), float(bbox["urx"]))
+        if row in row_bounds_by_row and row_bounds_by_row[row] != row_bounds:
+            rectangular = False
+        if col in col_bounds_by_col and col_bounds_by_col[col] != col_bounds:
+            rectangular = False
+        row_bounds_by_row.setdefault(row, row_bounds)
+        col_bounds_by_col.setdefault(col, col_bounds)
+        patches_by_coord[(row, col)] = patch
+        patches_by_id[int(patch["patch_id"])] = patch
+
+    if len(row_bounds_by_row) != rows or len(col_bounds_by_col) != cols:
+        rectangular = False
+    row_bounds = [row_bounds_by_row[row] for row in range(rows) if row in row_bounds_by_row]
+    col_bounds = [col_bounds_by_col[col] for col in range(cols) if col in col_bounds_by_col]
+    lookup = _PatchGridLookup(
+        patches_by_coord=patches_by_coord,
+        patches_by_id=patches_by_id,
+        row_bounds=row_bounds,
+        col_bounds=col_bounds,
+        rectangular=rectangular,
+        uniform=_uniform_bounds(row_bounds) and _uniform_bounds(col_bounds),
+        row_origin=row_bounds[0][0] if row_bounds else None,
+        col_origin=col_bounds[0][0] if col_bounds else None,
+        row_step=(row_bounds[0][1] - row_bounds[0][0]) if row_bounds else None,
+        col_step=(col_bounds[0][1] - col_bounds[0][0]) if col_bounds else None,
+    )
+    _PATCH_GRID_LOOKUP_CACHE[cache_key] = lookup
+    return lookup
+
+
+def _grid_patch_for_point(lookup: _PatchGridLookup | None, point: dict[str, Any]) -> dict[str, Any] | None:
+    if lookup is None or not lookup.rectangular or point.get("x") is None or point.get("y") is None:
+        return None
+    col = _uniform_bound_index_for_point(lookup, "col", float(point["x"])) if lookup.uniform else None
+    row = _uniform_bound_index_for_point(lookup, "row", float(point["y"])) if lookup.uniform else None
+    if col is None:
+        col = _bound_index_for_point(lookup.col_bounds, float(point["x"]))
+    if row is None:
+        row = _bound_index_for_point(lookup.row_bounds, float(point["y"]))
+    if row is None or col is None:
+        return None
+    return lookup.patches_by_coord.get((row, col))
+
+
+def _grid_overlap_patch_ids(lookup: _PatchGridLookup | None, bbox: dict[str, Any]) -> list[int]:
+    if lookup is None or not lookup.rectangular:
+        return []
+    col_indexes = _uniform_bound_indexes_for_range(lookup, "col", float(bbox["llx"]), float(bbox["urx"])) if lookup.uniform else []
+    row_indexes = _uniform_bound_indexes_for_range(lookup, "row", float(bbox["lly"]), float(bbox["ury"])) if lookup.uniform else []
+    if not col_indexes:
+        col_indexes = _bound_indexes_for_range(lookup.col_bounds, float(bbox["llx"]), float(bbox["urx"]))
+    if not row_indexes:
+        row_indexes = _bound_indexes_for_range(lookup.row_bounds, float(bbox["lly"]), float(bbox["ury"]))
+    ids: list[int] = []
+    for row in row_indexes:
+        for col in col_indexes:
+            patch = lookup.patches_by_coord.get((row, col))
+            if patch is not None and _bbox_overlap_area(bbox, patch["bbox"]) > 0:
+                ids.append(int(patch["patch_id"]))
+    return ids
+
+
+def _uniform_bounds(bounds: list[tuple[float, float]]) -> bool:
+    if not bounds:
+        return False
+    step = bounds[0][1] - bounds[0][0]
+    if step <= 0:
+        return False
+    tolerance = max(abs(step) * 1e-9, 1e-6)
+    return all(abs((upper - lower) - step) <= tolerance and (index == 0 or abs(lower - bounds[index - 1][1]) <= tolerance) for index, (lower, upper) in enumerate(bounds))
+
+
+def _uniform_bound_index_for_point(lookup: _PatchGridLookup, axis: str, value: float) -> int | None:
+    origin = lookup.col_origin if axis == "col" else lookup.row_origin
+    step = lookup.col_step if axis == "col" else lookup.row_step
+    count = len(lookup.col_bounds if axis == "col" else lookup.row_bounds)
+    if origin is None or step is None or step <= 0 or count <= 0:
+        return None
+    index = int((value - origin) // step)
+    if 0 <= index < count:
+        return index
+    upper = origin + step * count
+    if value == upper:
+        return count - 1
+    return None
+
+
+def _uniform_bound_indexes_for_range(lookup: _PatchGridLookup, axis: str, start: float, end: float) -> list[int]:
+    origin = lookup.col_origin if axis == "col" else lookup.row_origin
+    step = lookup.col_step if axis == "col" else lookup.row_step
+    count = len(lookup.col_bounds if axis == "col" else lookup.row_bounds)
+    if origin is None or step is None or step <= 0 or count <= 0:
+        return []
+    lower = min(start, end)
+    upper = max(start, end)
+    if lower == upper:
+        index = _uniform_bound_index_for_point(lookup, axis, lower)
+        return [index] if index is not None else []
+    first = max(0, int((lower - origin) // step))
+    last = min(count - 1, int(((upper - origin) - 1e-9) // step))
+    if last < first:
+        return []
+    return list(range(first, last + 1))
+
+
+def _bound_index_for_point(bounds: list[tuple[float, float]], value: float) -> int | None:
+    for index, (lower, upper) in enumerate(bounds):
+        if lower <= value < upper:
+            return index
+    if bounds and value == bounds[-1][1]:
+        return len(bounds) - 1
+    return None
+
+
+def _bound_indexes_for_range(bounds: list[tuple[float, float]], start: float, end: float) -> list[int]:
+    lower = min(start, end)
+    upper = max(start, end)
+    if lower == upper:
+        index = _bound_index_for_point(bounds, lower)
+        return [index] if index is not None else []
+    return [
+        index
+        for index, (bound_lower, bound_upper) in enumerate(bounds)
+        if max(lower, bound_lower) < min(upper, bound_upper)
+    ]
 
 
 def _patch_for_point(patches: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any] | None:
@@ -6093,15 +6658,11 @@ def _net_patch_anchor(
     }
     primary_patch_id = None
     if patch_ids:
-        terminal_center = geometry_proxy.get("terminal_center")
-        primary_patch_id = sorted(
-            patch_ids,
-            key=lambda patch_id: (
-                -terminal_count_by_patch.get(str(patch_id), 0),
-                _patch_center_distance(canonical_grid, patch_id, terminal_center),
-                patch_id,
-            ),
-        )[0]
+        max_terminal_count = max(terminal_count_by_patch.values(), default=0)
+        primary_patch_id = min(
+            (patch_id for patch_id in patch_ids if terminal_count_by_patch.get(str(patch_id), 0) == max_terminal_count),
+            default=patch_ids[0],
+        )
     cell_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "density", "allcell_density")
     pin_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "density", "allcell_pin_density")
     rudy_values = _map_values_for_patches(canonical_grid, stage_maps, patch_ids, "rudy", "rudy_union")
@@ -6220,6 +6781,29 @@ def _route_analysis_for_net(
 ) -> dict[str, Any] | None:
     if stage.name != "route":
         return None
+    if len(route_wires) > 100:
+        wire_geometries = [_wire_geometry(wire) for wire in route_wires[:1000]]
+        wire_bboxes = [geometry["bbox"] for geometry in wire_geometries if isinstance(geometry.get("bbox"), dict)]
+        routed_wire_length = sum(wire.length for wire in route_wires)
+        return {
+            "route_only_oracle": True,
+            "routed_wire_count": sum(1 for wire in route_wires if not wire.via),
+            "routed_wire_length": routed_wire_length,
+            "routed_bbox": _bbox_union(wire_bboxes) if wire_bboxes else None,
+            "covered_layers": sorted({wire.layer for wire in route_wires}),
+            "via_count": sum(1 for wire in route_wires if wire.via),
+            "detour_ratio": routed_wire_length / terminal_hpwl if terminal_hpwl and terminal_hpwl > 0 else None,
+            "routed_patch_ids": [],
+            "routed_patch_count": None,
+            "overlapped_congested_patch_count": None,
+            "final_overflow_sum": None,
+            "final_overflow_max": None,
+            "patch_attribution_refs": [],
+            "patch_attribution_ref_count_total": None,
+            "patch_attribution_refs_truncated": True,
+            "source": _workspace_relative_from_parsed_def(parsed_def),
+            "summary_mode": "large_net_skip_patch_attribution",
+        }
     wire_geometries = [_wire_geometry(wire) for wire in route_wires]
     wire_bboxes = [geometry["bbox"] for geometry in wire_geometries if isinstance(geometry.get("bbox"), dict)]
     routed_bbox = _bbox_union(wire_bboxes) if wire_bboxes else None
@@ -6509,6 +7093,11 @@ def _wire_geometry(wire: DefWire) -> dict[str, Any]:
 def _patch_row_col(canonical_grid: dict, patch_id: int | None) -> tuple[int, int] | None:
     if patch_id is None:
         return None
+    lookup = _patch_grid_lookup(canonical_grid)
+    if lookup is not None:
+        patch = lookup.patches_by_id.get(int(patch_id))
+        if patch is not None:
+            return int(patch["row"]), int(patch["col"])
     for patch in canonical_grid.get("patches", []):
         if int(patch.get("patch_id")) == int(patch_id):
             return int(patch["row"]), int(patch["col"])
@@ -6521,7 +7110,9 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
         return []
     total_length = float(geometry.get("length") or 0.0)
     intersections: list[dict[str, Any]] = []
-    for patch in canonical_grid.get("patches", []):
+    lookup = _patch_grid_lookup(canonical_grid)
+    candidate_patches = _grid_overlap_patches_for_wire(lookup, bbox) or canonical_grid.get("patches", [])
+    for patch in candidate_patches:
         patch_bbox = patch.get("bbox", {})
         if not isinstance(patch_bbox, dict) or not _wire_bbox_intersects_patch(bbox, patch_bbox):
             continue
@@ -6541,7 +7132,10 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
             }
         )
     if not intersections:
-        primary = _patch_for_point(canonical_grid.get("patches", []), geometry.get("center", {}))
+        center = geometry.get("center", {})
+        primary = _grid_patch_for_point(lookup, center) if isinstance(center, dict) else None
+        if primary is None:
+            primary = _patch_for_point(canonical_grid.get("patches", []), center)
         if primary:
             intersections.append({"patch_id": int(primary["patch_id"]), "row": int(primary["row"]), "col": int(primary["col"]), "length": total_length, "length_fraction": 1.0 if total_length > 0 else None, "area_proxy": None, "is_primary_patch": True, "intersection_bbox": bbox})
     if intersections:
@@ -6549,6 +7143,37 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
         for item in intersections:
             item["is_primary_patch"] = item["patch_id"] == primary_patch_id
     return intersections
+
+
+def _grid_overlap_patches_for_wire(lookup: _PatchGridLookup | None, bbox: dict[str, Any]) -> list[dict[str, Any]]:
+    if lookup is None or not lookup.rectangular:
+        return []
+    col_indexes = _uniform_bound_indexes_for_range(lookup, "col", float(bbox["llx"]), float(bbox["urx"])) if lookup.uniform else []
+    row_indexes = _uniform_bound_indexes_for_range(lookup, "row", float(bbox["lly"]), float(bbox["ury"])) if lookup.uniform else []
+    if not col_indexes:
+        col_indexes = _bound_indexes_for_wire_range(lookup.col_bounds, float(bbox["llx"]), float(bbox["urx"]))
+    if not row_indexes:
+        row_indexes = _bound_indexes_for_wire_range(lookup.row_bounds, float(bbox["lly"]), float(bbox["ury"]))
+    patches: list[dict[str, Any]] = []
+    for row in row_indexes:
+        for col in col_indexes:
+            patch = lookup.patches_by_coord.get((row, col))
+            if patch is not None:
+                patches.append(patch)
+    return patches
+
+
+def _bound_indexes_for_wire_range(bounds: list[tuple[float, float]], start: float, end: float) -> list[int]:
+    lower = min(start, end)
+    upper = max(start, end)
+    if lower == upper:
+        index = _bound_index_for_point(bounds, lower)
+        return [index] if index is not None else []
+    return [
+        index
+        for index, (bound_lower, bound_upper) in enumerate(bounds)
+        if _range_overlaps_half_open(lower, upper, bound_lower, bound_upper)
+    ]
 
 
 def _wire_bbox_intersects_patch(a: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -6609,14 +7234,20 @@ def _build_wire_record(
     drc_report: dict[str, Any] | None = None,
     tech_layers: dict[str, dict[str, Any]] | None = None,
     tech_vias: dict[str, dict[str, Any]] | None = None,
+    net_context: dict[str, Any] | None = None,
+    large_design_route: bool = False,
 ) -> dict[str, Any]:
     source_section = "SPECIALNETS" if wire.special or net.special else "NETS"
     segment_kind = "via" if wire.via else "wire_segment"
     wire_key = f"{stage.name}:{source_section}:{net.name}:{segment_index}"
     identity_base = _net_identity(net)
     geometry = _wire_geometry(wire)
+    lookup = _patch_grid_lookup(canonical_grid)
     intersections = _wire_patch_intersections(geometry, canonical_grid)
-    center_patch = _patch_for_point(canonical_grid.get("patches", []), geometry.get("center", {}))
+    center = geometry.get("center", {})
+    center_patch = _grid_patch_for_point(lookup, center) if isinstance(center, dict) else None
+    if center_patch is None:
+        center_patch = _patch_for_point(canonical_grid.get("patches", []), center)
     primary_patch_id = int(center_patch["patch_id"]) if center_patch else (intersections[0]["patch_id"] if intersections else None)
     if intersections and primary_patch_id is not None:
         for item in intersections:
@@ -6637,16 +7268,17 @@ def _build_wire_record(
     route_context = None
     if stage.name == "route":
         local_overflow = _route_wire_local_overflow(primary_patch_id, native_demand_capacity_by_patch or {}, stage_maps, row_col)
+        nearby_counts_enabled = len(net.wires) <= 100 and not large_design_route
         route_context = {
             "route_only_oracle": True,
             "local_final_overflow": local_overflow,
             "layer_demand_capacity_ratio": capacity_context.get("layer_demand_capacity_ratio"),
             "patch_layer_usage": capacity_context.get("patch_layer_demand"),
-            "nearby_wire_count": _nearby_wire_count(parsed_def, net.name, geometry, include_vias=False),
-            "nearby_via_count": _nearby_wire_count(parsed_def, net.name, geometry, include_vias=True),
+            "nearby_wire_count": _nearby_wire_count(parsed_def, net.name, geometry, include_vias=False) if nearby_counts_enabled else None,
+            "nearby_via_count": _nearby_wire_count(parsed_def, net.name, geometry, include_vias=True) if nearby_counts_enabled else None,
             "nearby_drc_count": _drc_count_near_geometry(drc_report, geometry),
             "contributes_to_overflow_patch": bool(local_overflow and local_overflow > 0),
-            "source": "routed_def_reconstruction",
+            "source": "routed_def_reconstruction" if nearby_counts_enabled else "routed_def_reconstruction_large_design_summary",
         }
         if local_overflow is None:
             null_reason["route_context"] = "missing_route_overflow_artifact"
@@ -6704,7 +7336,7 @@ def _build_wire_record(
         "capacity_context": capacity_context,
         "patch_anchor": patch_anchor,
         "patch_intersections": intersections,
-        "net_context": _wire_net_context(net, net_record),
+        "net_context": net_context or _wire_net_context(net, net_record),
         "endpoint_context": endpoint_context,
         "timing_context": timing_context,
         "route_context": route_context,
