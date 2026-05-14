@@ -451,7 +451,6 @@ def test_read_numeric_csv_ignores_trailing_empty_columns(tmp_path: Path):
 
 def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(tmp_path: Path):
     ws = _make_workspace(tmp_path)
-
     result = FoundationExtractor(ws, profile="iccd_full_v1").extract()
 
     foundation_dir = result.foundation_dir
@@ -662,6 +661,36 @@ def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_
     assert "route" not in progressive["allowed_input_stages"]["P3"]
     assert "run_patch_route_label_layers" in progressive["forbidden_input_tables"]
 
+def test_stage_table_preserves_runtime_and_peak_memory_from_flow(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    flow_path = ws / "home" / "flow.json"
+    flow = json.loads(flow_path.read_text(encoding="utf-8"))
+    flow["steps"][0].update({"runtime": "0:0:7", "peak memory (mb)": 101.5})
+    flow["steps"][1].update({"runtime": "1:02:03", "peak memory (mb)": "202.25"})
+    flow["steps"][2].update({"runtime": 4.5, "peak memory (mb)": 303})
+    flow["steps"][3].update({"runtime": "bad", "peak memory (mb)": None})
+    flow_path.write_text(json.dumps(flow), encoding="utf-8")
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    schema = json.loads((result.foundation_dir / "schema.json").read_text(encoding="utf-8"))
+    rows = pq.read_table(
+        result.foundation_dir / schema["tables"]["stages"]["path"],
+        columns=["stage_name", "runtime_s", "peak_memory_mb"],
+    ).to_pylist()
+    by_stage = {row["stage_name"]: row for row in rows}
+
+    assert by_stage["Floorplan"]["runtime_s"] == 7.0
+    assert by_stage["Floorplan"]["peak_memory_mb"] == 101.5
+    assert by_stage["place"]["runtime_s"] == 3723.0
+    assert by_stage["place"]["peak_memory_mb"] == 202.25
+    assert by_stage["CTS"]["runtime_s"] == 4.5
+    assert by_stage["CTS"]["peak_memory_mb"] == 303.0
+    assert by_stage["route"]["runtime_s"] is None
+    assert by_stage["route"]["peak_memory_mb"] is None
+
+
 def test_write_tables_passes_iterables_without_eager_list_materialization(tmp_path: Path, monkeypatch):
     import chipcompiler.data.foundation.table_contract as table_contract_module
 
@@ -753,6 +782,20 @@ def test_write_parquet_writes_in_batches_when_batch_size_is_set(tmp_path: Path, 
     assert write_sizes == [2, 2, 1]
 
 
+def test_write_parquet_same_schema_batches_do_not_read_existing_table(tmp_path: Path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    def fail_read_table(*args, **kwargs):
+        raise AssertionError("same-schema batched writes should not read existing parquet data")
+
+    monkeypatch.setattr(pq, "read_table", fail_read_table)
+
+    rows = ({"a": idx, "b": f"row-{idx}"} for idx in range(6))
+    row_count = write_parquet(tmp_path / "same-schema.parquet", rows, batch_size=2)
+
+    assert row_count == 6
+
+
 def test_write_parquet_handles_nullable_columns_when_later_batches_introduce_values(tmp_path: Path):
     import pyarrow.parquet as pq
 
@@ -809,6 +852,25 @@ def test_write_parquet_handles_nullable_columns_when_later_batches_introduce_val
     assert written[2]["artifact_id"] == "artifact:2"
 
 
+def test_write_parquet_prescans_initial_batches_to_avoid_common_schema_widening_readback(tmp_path: Path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def fail_read_table(*args, **kwargs):
+        raise AssertionError("initial prescan should avoid readback for common early schema widening")
+
+    monkeypatch.setattr(pq, "read_table", fail_read_table)
+
+    path = tmp_path / "prescan-widening.parquet"
+    rows = [{"a": 1}, {"a": 2}, {"a": 1.5}, {"a": "late"}]
+    row_count = write_parquet(path, rows, batch_size=2)
+
+    assert row_count == 4
+    table = pq.ParquetDataset(path).read()
+    assert table.schema.field("a").type == pa.string()
+    assert table.to_pylist() == [{"a": "1"}, {"a": "2"}, {"a": "1.5"}, {"a": "late"}]
+
+
 def test_write_parquet_preserves_float_values_when_later_batches_widen_int_columns(tmp_path: Path):
     import pyarrow.parquet as pq
 
@@ -857,6 +919,10 @@ def test_large_table_builders_return_lazy_iterables(tmp_path: Path):
     lazy_tables = {
         "semantic_blocks": extractor._semantic_block_rows("design:gcd", "run:gcd", stages),
         "run_stage_patch_maps": extractor._patch_map_rows("design:gcd", "run:gcd", stage_ids, canonical_grid, canonical_maps),
+        "run_stage_patch_features": extractor._patch_feature_rows("design:gcd", "run:gcd", stage_ids, stages),
+        "routing_vertices": extractor._routing_vertex_rows("design:gcd", "run:gcd", stages),
+        "routing_edges": extractor._routing_edge_rows("design:gcd", "run:gcd", stages),
+        "timing_paths": extractor._timing_path_rows("design:gcd", "run:gcd", stages),
         "patch_entity_refs": extractor._patch_entity_ref_rows("design:gcd", "run:gcd", stages),
         "wire_segments": extractor._wire_segment_rows("design:gcd", "run:gcd", stages),
         "wire_patch_intersections": extractor._wire_patch_intersection_rows("design:gcd", "run:gcd", stages),
@@ -943,6 +1009,66 @@ def test_provenance_rows_do_not_materialize_large_table_iterables(tmp_path: Path
         "prov:delta",
     }
     assert all(not isinstance(rows, list) for rows in tables.values())
+
+
+def test_route_native_demand_capacity_jsonl_is_read_streaming(tmp_path: Path, monkeypatch):
+    from chipcompiler.data.foundation.parsers import route_native_demand_capacity as parser
+
+    ws = _make_workspace(tmp_path)
+    path = ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.jsonl"
+
+    original_read_text = Path.read_text
+    original_iter_jsonl_records = parser._iter_jsonl_records
+    consumed = {"count": 0}
+
+    def fail_target_read_text(self, *args, **kwargs):
+        if self == path:
+            raise AssertionError("JSONL route demand/capacity input should be streamed line by line")
+        return original_read_text(self, *args, **kwargs)
+
+    def one_shot_records(jsonl_path):
+        assert jsonl_path == path
+        for record in original_iter_jsonl_records(jsonl_path):
+            consumed["count"] += 1
+            yield record
+
+    monkeypatch.setattr(Path, "read_text", fail_target_read_text)
+    monkeypatch.setattr(parser, "_iter_jsonl_records", one_shot_records)
+
+    canonical_grid = {
+        "patches": [
+            {"patch_id": 0, "row": 0, "col": 0, "bbox": {"llx": 0, "lly": 0, "urx": 100, "ury": 100}},
+            {"patch_id": 1, "row": 0, "col": 1, "bbox": {"llx": 100, "lly": 0, "urx": 200, "ury": 100}},
+            {"patch_id": 2, "row": 1, "col": 0, "bbox": {"llx": 0, "lly": 100, "urx": 100, "ury": 200}},
+            {"patch_id": 3, "row": 1, "col": 1, "bbox": {"llx": 100, "lly": 100, "urx": 200, "ury": 200}},
+        ]
+    }
+
+    records = parser._iter_records(path)
+    assert not isinstance(records, list)
+    labels = parser._labels_from_records(records, canonical_grid, path)
+
+    assert consumed["count"] == 4
+    assert labels[0]["horizontal_demand_capacity"] == 3.0
+    assert labels[0]["vertical_demand_capacity"] == 2.0
+    assert labels[0]["union_demand_capacity"] == 3.0
+
+
+def test_extractor_jsonl_helper_streams_records(tmp_path: Path, monkeypatch):
+    path = tmp_path / "records.jsonl"
+    _write_text(path, json.dumps({"a": 1}) + "\n" + json.dumps({"a": 2}) + "\n")
+
+    original_read_text = Path.read_text
+
+    def fail_target_read_text(self, *args, **kwargs):
+        if self == path:
+            raise AssertionError("extractor JSONL helper should stream line by line")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_target_read_text)
+
+    assert list(extractor_module._iter_jsonl_records(path)) == [{"a": 1}, {"a": 2}]
+    assert extractor_module._read_jsonl_records(path) == [{"a": 1}, {"a": 2}]
 
 
 def test_default_contract_tech_tables_do_not_depend_on_legacy_vector_json(tmp_path: Path, monkeypatch):

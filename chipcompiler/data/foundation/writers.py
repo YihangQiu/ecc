@@ -50,7 +50,7 @@ def write_parquet(
     writer = None
     active_schema = None
     batch: list[dict[str, Any]] = []
-    next_schema_check_size = normalized_batch_size
+    initial_schema_scan_limit = max(normalized_batch_size, normalized_batch_size * 4)
 
     def normalize(record: Mapping[str, Any]) -> dict[str, Any]:
         if column_names:
@@ -152,31 +152,55 @@ def write_parquet(
         )
         return pa.Table.from_pylist(rows, schema=schema)
 
+    def initial_schema_for_rows(rows: list[dict[str, Any]]):
+        names = list(column_names or dict.fromkeys(key for row in rows for key in row))
+        fields = []
+        for name in names:
+            values = [row.get(name) for row in rows if row.get(name) is not None]
+            if not values:
+                field_type = pa.string()
+            elif any(isinstance(value, str) or isinstance(value, (dict, list, tuple)) for value in values):
+                field_type = pa.string()
+            elif any(isinstance(value, float) for value in values):
+                field_type = pa.float64()
+            elif all(isinstance(value, bool) for value in values):
+                field_type = pa.bool_()
+            elif all(isinstance(value, int | bool) for value in values):
+                field_type = pa.int64()
+            else:
+                field_type = pa.string()
+            fields.append(pa.field(name, field_type))
+        return pa.schema(fields)
+
+    def open_writer_with_initial_rows(rows: list[dict[str, Any]]) -> None:
+        nonlocal writer, active_schema, row_count
+        active_schema = initial_schema_for_rows(rows)
+        writer = pq.ParquetWriter(path, active_schema)
+        start = 0
+        while start < len(rows):
+            chunk = rows[start:start + normalized_batch_size]
+            table = pa.Table.from_pylist(
+                coerce_rows_to_schema(chunk, active_schema),
+                schema=active_schema,
+            )
+            writer.write_table(table)
+            row_count += len(chunk)
+            start += normalized_batch_size
+
     try:
         for record in records:
             batch.append(normalize(record))
             if writer is None:
-                if len(batch) < next_schema_check_size:
+                if len(batch) < initial_schema_scan_limit:
                     continue
-                if has_null_typed_fields(batch):
-                    next_schema_check_size += normalized_batch_size
-                    continue
-                flush(batch)
+                open_writer_with_initial_rows(batch)
                 batch = []
-                next_schema_check_size = normalized_batch_size
             elif len(batch) >= normalized_batch_size:
                 flush(batch)
                 batch = []
         if writer is None:
             if batch:
-                if has_null_typed_fields(batch):
-                    table = coerce_null_schema_rows(batch)
-                    active_schema = table.schema
-                    writer = pq.ParquetWriter(path, table.schema)
-                    writer.write_table(table)
-                    row_count += len(batch)
-                else:
-                    flush(batch)
+                open_writer_with_initial_rows(batch)
             else:
                 empty_schema = pa.schema([(column, pa.string()) for column in column_names]) if column_names else pa.schema([])
                 writer = pq.ParquetWriter(path, empty_schema)

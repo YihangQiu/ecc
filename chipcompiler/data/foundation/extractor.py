@@ -1993,6 +1993,7 @@ class FoundationExtractor:
         design_id = _stable_id("design", pdk, design_name, top_module, logical_source_hash)
         run_id = _stable_id("run", design_id, parameters, self._source_signature())
         stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
+        flow_steps = _stage_flow_step_by_name(flow)
         tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]] = {
             "designs": [
                 {
@@ -2027,8 +2028,10 @@ class FoundationExtractor:
                     "tool": stage.tool,
                     "state": stage.state,
                     "stage_dir": _relative_or_string(stage.directory, self.workspace_dir),
-                    "runtime_s": None,
-                    "peak_memory_mb": None,
+                    "runtime_s": _runtime_to_seconds(flow_steps.get(stage.name, {}).get("runtime")),
+                    "peak_memory_mb": _to_float(
+                        flow_steps.get(stage.name, {}).get("peak memory (mb)")
+                    ),
                 }
                 for index, stage in enumerate(stages)
             ],
@@ -2065,7 +2068,7 @@ class FoundationExtractor:
         tables["provenance"] = self._provenance_rows(
             {
                 "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
-                "run_stage_patch_features": tables["run_stage_patch_features"],
+                "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
                 "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
                 "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
             }
@@ -2503,8 +2506,7 @@ class FoundationExtractor:
 
     def _patch_feature_rows(
         self, design_id: str, run_id: str, stage_ids: dict[str, str], stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("patches", stage.name):
                 density = record.get("local_density") or {}
@@ -2513,51 +2515,48 @@ class FoundationExtractor:
                 timing = record.get("timing_context") or {}
                 drc = record.get("drc_context") or {}
                 oracle = record.get("route_oracle") or {}
-                out.append(
-                    {
-                        "design_id": design_id,
-                        "run_id": run_id,
-                        "stage_id": stage_ids.get(stage.name),
-                        "stage_name": stage.name,
-                        "patch_id": _patch_id_from_record(record),
-                        "cell_density": density.get("cell_density"),
-                        "macro_density": density.get("macro_density"),
-                        "pin_density": density.get("pin_density"),
-                        "net_density": density.get("net_density"),
-                        "instance_count_center": density.get("instance_count_center"),
-                        "instance_count_overlap": density.get("instance_count_overlap"),
-                        "stdcell_count": density.get("stdcell_count_center") or density.get("stdcell_count_overlap"),
-                        "macro_count": density.get("macro_count_overlap") or density.get("macro_count_center"),
-                        "physical_only_count": density.get("physical_only_count_overlap"),
-                        "net_count_anchor": connectivity.get("net_count_anchor"),
-                        "net_count_overlap": connectivity.get("net_count_overlap"),
-                        "cross_patch_net_count": connectivity.get("cross_patch_net_count"),
-                        "high_fanout_net_count": connectivity.get("high_fanout_net_count"),
-                        "clock_net_count": connectivity.get("clock_net_count"),
-                        "reset_net_count": connectivity.get("reset_net_count"),
-                        "local_hpwl_sum": connectivity.get("local_hpwl_sum"),
-                        "local_hpwl_max": connectivity.get("local_hpwl_max"),
-                        "local_hpwl_mean": connectivity.get("local_hpwl_mean"),
-                        "rudy_horizontal": estimators.get("rudy_horizontal"),
-                        "rudy_vertical": estimators.get("rudy_vertical"),
-                        "rudy_union": estimators.get("rudy_union"),
-                        "margin_horizontal": estimators.get("margin_horizontal"),
-                        "margin_vertical": estimators.get("margin_vertical"),
-                        "egr_overflow_horizontal": estimators.get("egr_overflow_horizontal"),
-                        "egr_overflow_vertical": estimators.get("egr_overflow_vertical"),
-                        "egr_overflow_union": estimators.get("egr_overflow_union"),
-                        "wire_length": density.get("wire_length") or oracle.get("wire_length"),
-                        "via_count": density.get("via_count") or oracle.get("via_count"),
-                        "critical_path_count": timing.get("critical_path_count"),
-                        "worst_slack_min": timing.get("worst_slack_min"),
-                        "max_slew": timing.get("max_slew"),
-                        "max_cap": timing.get("max_cap"),
-                        "drc_count": drc.get("count"),
-                        "feature_availability_code": "available",
-                        "provenance_id": _stable_id("patch_features", stage.name, record.get("patch_key")),
-                    }
-                )
-        return out
+                yield {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_id": stage_ids.get(stage.name),
+                    "stage_name": stage.name,
+                    "patch_id": _patch_id_from_record(record),
+                    "cell_density": density.get("cell_density"),
+                    "macro_density": density.get("macro_density"),
+                    "pin_density": density.get("pin_density"),
+                    "net_density": density.get("net_density"),
+                    "instance_count_center": density.get("instance_count_center"),
+                    "instance_count_overlap": density.get("instance_count_overlap"),
+                    "stdcell_count": density.get("stdcell_count_center") or density.get("stdcell_count_overlap"),
+                    "macro_count": density.get("macro_count_overlap") or density.get("macro_count_center"),
+                    "physical_only_count": density.get("physical_only_count_overlap"),
+                    "net_count_anchor": connectivity.get("net_count_anchor"),
+                    "net_count_overlap": connectivity.get("net_count_overlap"),
+                    "cross_patch_net_count": connectivity.get("cross_patch_net_count"),
+                    "high_fanout_net_count": connectivity.get("high_fanout_net_count"),
+                    "clock_net_count": connectivity.get("clock_net_count"),
+                    "reset_net_count": connectivity.get("reset_net_count"),
+                    "local_hpwl_sum": connectivity.get("local_hpwl_sum"),
+                    "local_hpwl_max": connectivity.get("local_hpwl_max"),
+                    "local_hpwl_mean": connectivity.get("local_hpwl_mean"),
+                    "rudy_horizontal": estimators.get("rudy_horizontal"),
+                    "rudy_vertical": estimators.get("rudy_vertical"),
+                    "rudy_union": estimators.get("rudy_union"),
+                    "margin_horizontal": estimators.get("margin_horizontal"),
+                    "margin_vertical": estimators.get("margin_vertical"),
+                    "egr_overflow_horizontal": estimators.get("egr_overflow_horizontal"),
+                    "egr_overflow_vertical": estimators.get("egr_overflow_vertical"),
+                    "egr_overflow_union": estimators.get("egr_overflow_union"),
+                    "wire_length": density.get("wire_length") or oracle.get("wire_length"),
+                    "via_count": density.get("via_count") or oracle.get("via_count"),
+                    "critical_path_count": timing.get("critical_path_count"),
+                    "worst_slack_min": timing.get("worst_slack_min"),
+                    "max_slew": timing.get("max_slew"),
+                    "max_cap": timing.get("max_cap"),
+                    "drc_count": drc.get("count"),
+                    "feature_availability_code": "available",
+                    "provenance_id": _stable_id("patch_features", stage.name, record.get("patch_key")),
+                }
 
     @staticmethod
     def _route_label_rows(design_id: str, run_id: str, labels: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2916,80 +2915,68 @@ class FoundationExtractor:
 
     def _routing_vertex_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for graph in self._records_for_stage("routing_graphs", stage.name):
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for vertex in graph.get("vertices") or []:
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "net_key": net_key,
-                            "vertex_id": int(vertex.get("vertex_id") or vertex.get("id") or 0),
-                            "x": vertex.get("x") or (vertex.get("point") or {}).get("x"),
-                            "y": vertex.get("y") or (vertex.get("point") or {}).get("y"),
-                            "layer": vertex.get("layer"),
-                            "vertex_kind": vertex.get("vertex_kind") or vertex.get("kind"),
-                            "patch_id": vertex.get("patch_id"),
-                            "terminal_pin_key": vertex.get("terminal_pin_key") or vertex.get("pin_key"),
-                            "match_status": vertex.get("match_status"),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "net_key": net_key,
+                        "vertex_id": int(vertex.get("vertex_id") or vertex.get("id") or 0),
+                        "x": vertex.get("x") or (vertex.get("point") or {}).get("x"),
+                        "y": vertex.get("y") or (vertex.get("point") or {}).get("y"),
+                        "layer": vertex.get("layer"),
+                        "vertex_kind": vertex.get("vertex_kind") or vertex.get("kind"),
+                        "patch_id": vertex.get("patch_id"),
+                        "terminal_pin_key": vertex.get("terminal_pin_key") or vertex.get("pin_key"),
+                        "match_status": vertex.get("match_status"),
+                    }
 
-    def _routing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
-        out = []
+    def _routing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for graph in self._records_for_stage("routing_graphs", stage.name):
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for edge in graph.get("edges") or []:
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "net_key": net_key,
-                            "edge_id": int(edge.get("edge_id") or edge.get("id") or 0),
-                            "source_vertex_id": edge.get("source_vertex_id") or edge.get("src") or edge.get("source"),
-                            "target_vertex_id": edge.get("target_vertex_id") or edge.get("dst") or edge.get("target"),
-                            "edge_kind": edge.get("edge_kind") or edge.get("kind"),
-                            "geometry_json": json_value(edge.get("geometry") or {}),
-                            "layer": edge.get("layer"),
-                            "length": edge.get("length"),
-                            "wire_segment_refs": json_value(edge.get("wire_segment_refs") or []),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "net_key": net_key,
+                        "edge_id": int(edge.get("edge_id") or edge.get("id") or 0),
+                        "source_vertex_id": edge.get("source_vertex_id") or edge.get("src") or edge.get("source"),
+                        "target_vertex_id": edge.get("target_vertex_id") or edge.get("dst") or edge.get("target"),
+                        "edge_kind": edge.get("edge_kind") or edge.get("kind"),
+                        "geometry_json": json_value(edge.get("geometry") or {}),
+                        "layer": edge.get("layer"),
+                        "length": edge.get("length"),
+                        "wire_segment_refs": json_value(edge.get("wire_segment_refs") or []),
+                    }
 
     def _timing_path_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("timing_paths", stage.name):
                 timing = record.get("path_timing") or {}
                 endpoints = record.get("endpoints") or {}
-                out.append(
-                    {
-                        "design_id": design_id,
-                        "run_id": run_id,
-                        "stage_name": stage.name,
-                        "path_id": str(record.get("path_key") or record.get("id")),
-                        "startpoint": json_value(endpoints.get("startpoint") or {}),
-                        "endpoint": json_value(endpoints.get("endpoint") or {}),
-                        "delay_type": (record.get("analysis_context") or {}).get("delay_type") or (record.get("identity") or {}).get("delay_type"),
-                        "slack": timing.get("slack"),
-                        "arrival": timing.get("arrival"),
-                        "required": timing.get("path_required"),
-                        "path_group": (record.get("identity") or {}).get("clock_group"),
-                        "path_length_summary": json_value(record.get("path_spatial") or {}),
-                        "criticality": timing.get("normalized_criticality"),
-                    }
-                )
-        return out
+                yield {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_name": stage.name,
+                    "path_id": str(record.get("path_key") or record.get("id")),
+                    "startpoint": json_value(endpoints.get("startpoint") or {}),
+                    "endpoint": json_value(endpoints.get("endpoint") or {}),
+                    "delay_type": (record.get("analysis_context") or {}).get("delay_type") or (record.get("identity") or {}).get("delay_type"),
+                    "slack": timing.get("slack"),
+                    "arrival": timing.get("arrival"),
+                    "required": timing.get("path_required"),
+                    "path_group": (record.get("identity") or {}).get("clock_group"),
+                    "path_length_summary": json_value(record.get("path_spatial") or {}),
+                    "criticality": timing.get("normalized_criticality"),
+                }
 
     def _timing_path_point_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
@@ -5711,13 +5698,16 @@ def _value_from_named_map(maps: dict[str, list[list[float]]], token: str, row: i
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    return list(_iter_jsonl_records(path))
+
+
+def _iter_jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
     if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
 
 
 
@@ -6216,6 +6206,37 @@ def _to_float(value: Any) -> float | None:
     return float(match.group(0)) if match else None
 
 
+def _runtime_to_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if ":" not in text:
+        return _to_float(text)
+    parts = text.split(":")
+    if len(parts) > 3:
+        return None
+    try:
+        values = [float(part) for part in parts]
+    except ValueError:
+        return None
+    seconds = 0.0
+    for part in values:
+        seconds = seconds * 60 + part
+    return seconds
+
+
+def _stage_flow_step_by_name(flow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("name")): item
+        for item in flow.get("steps", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+
+
 def _point_in_bbox(x: Any, y: Any, bbox: dict[str, Any]) -> bool:
     if x is None or y is None:
         return False
@@ -6471,12 +6492,10 @@ def _attach_timing_progressive_metadata(stage_name: str, records: list[dict[str,
                 break
     prev_by_endpoint: dict[str, dict[str, Any]] = {}
     if previous_stage:
-        for line in (timing_dir / f"{previous_stage}.jsonl").read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                item = json.loads(line)
-                endpoint = item.get("identity", {}).get("endpoint_key")
-                if endpoint and endpoint not in prev_by_endpoint:
-                    prev_by_endpoint[endpoint] = item
+        for item in _iter_jsonl_records(timing_dir / f"{previous_stage}.jsonl"):
+            endpoint = item.get("identity", {}).get("endpoint_key")
+            if endpoint and endpoint not in prev_by_endpoint:
+                prev_by_endpoint[endpoint] = item
     for record in records:
         endpoint = record.get("identity", {}).get("endpoint_key")
         prev = prev_by_endpoint.get(endpoint) if endpoint else None

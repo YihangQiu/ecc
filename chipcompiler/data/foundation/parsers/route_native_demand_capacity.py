@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 def parse_route_native_demand_capacity_artifacts(
@@ -10,10 +10,7 @@ def parse_route_native_demand_capacity_artifacts(
 ) -> dict[str, Any]:
     """Parse iRT SpaceRouter-native per-gcell demand/capacity artifacts."""
     for path in _candidate_paths(stage_dir):
-        records = _read_records(path)
-        if not records:
-            continue
-        labels = _labels_from_records(records, canonical_grid, path)
+        labels = _labels_from_records(_iter_records(path), canonical_grid, path)
         if labels:
             return {"available": True, "source": str(path), "labels": labels}
     return {"available": False, "source": None, "labels": []}
@@ -35,29 +32,34 @@ def _candidate_paths(stage_dir: Path) -> list[Path]:
     return [root / name for root in roots for name in names if (root / name).exists()]
 
 
-def _read_records(path: Path) -> list[dict[str, Any]]:
+def _iter_records(path: Path) -> Iterable[dict[str, Any]]:
     try:
         if path.suffix == ".jsonl":
-            return [
-                json.loads(line)
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            yield from _iter_jsonl_records(path)
+            return
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return []
+        return
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        yield from (item for item in payload if isinstance(item, dict))
+        return
     if isinstance(payload, dict):
         for key in ("patches", "gcells", "records", "demand_capacity"):
             value = payload.get(key)
             if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-    return []
+                yield from (item for item in value if isinstance(item, dict))
+                return
+
+
+def _iter_jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
 
 
 def _labels_from_records(
-    records: list[dict[str, Any]], canonical_grid: dict[str, Any], path: Path
+    records: Iterable[dict[str, Any]], canonical_grid: dict[str, Any], path: Path
 ) -> list[dict[str, Any]]:
     patch_totals = {
         int(patch["patch_id"]): {
