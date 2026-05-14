@@ -808,6 +808,29 @@ def test_write_parquet_handles_nullable_columns_when_later_batches_introduce_val
     assert written[2]["artifact_id"] == "artifact:2"
 
 
+def test_write_parquet_preserves_float_values_when_later_batches_widen_int_columns(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "schema-widening.parquet"
+    row_count = write_parquet(path, [{"a": 1}, {"a": 2}, {"a": 1.5}], batch_size=2)
+
+    assert row_count == 3
+    assert pq.read_table(path).to_pylist() == [{"a": 1.0}, {"a": 2.0}, {"a": 1.5}]
+
+
+def test_write_parquet_preserves_values_when_later_batches_widen_to_string(tmp_path: Path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "schema-string-widening.parquet"
+    row_count = write_parquet(path, [{"a": 1}, {"a": 2}, {"a": "late"}], batch_size=2)
+    table = pq.read_table(path)
+
+    assert row_count == 3
+    assert table.schema.field("a").type == pa.string()
+    assert table.to_pylist() == [{"a": "1"}, {"a": "2"}, {"a": "late"}]
+
+
 def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     import pyarrow.parquet as pq
 

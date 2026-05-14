@@ -61,12 +61,80 @@ def write_parquet(
         nonlocal writer, row_count, active_schema
         if not current_batch:
             return
-        table = pa.Table.from_pylist(current_batch, schema=active_schema)
+        current_schema = pa.Table.from_pylist(current_batch).schema
         if writer is None:
-            active_schema = table.schema
-            writer = pq.ParquetWriter(path, table.schema)
+            active_schema = current_schema
+            writer = pq.ParquetWriter(path, active_schema)
+        else:
+            merged_schema = merge_schemas(active_schema, current_schema)
+            if merged_schema != active_schema:
+                reopen_writer_with_schema(merged_schema)
+        table = pa.Table.from_pylist(
+            coerce_rows_to_schema(current_batch, active_schema),
+            schema=active_schema,
+        )
         writer.write_table(table)
         row_count += len(current_batch)
+
+    def merge_types(left, right):
+        if left == right:
+            return left
+        if pa.types.is_null(left):
+            return right
+        if pa.types.is_null(right):
+            return left
+        if pa.types.is_integer(left) and pa.types.is_integer(right):
+            return pa.int64()
+        if (pa.types.is_integer(left) or pa.types.is_floating(left)) and (
+            pa.types.is_integer(right) or pa.types.is_floating(right)
+        ):
+            return pa.float64()
+        return pa.string()
+
+    def merge_schemas(left, right):
+        fields = []
+        right_names = set(right.names)
+        for field in left:
+            if field.name in right_names:
+                fields.append(pa.field(field.name, merge_types(field.type, right.field(field.name).type)))
+            else:
+                fields.append(field)
+        left_names = set(left.names)
+        for field in right:
+            if field.name not in left_names:
+                fields.append(field)
+        return pa.schema(fields)
+
+    def coerce_rows_to_schema(rows: list[dict[str, Any]], schema) -> list[dict[str, Any]]:
+        string_fields = {field.name for field in schema if pa.types.is_string(field.type)}
+        if not string_fields:
+            return rows
+        coerced = []
+        for row in rows:
+            normalized = {}
+            for field in schema:
+                value = row.get(field.name)
+                if value is not None and field.name in string_fields and not isinstance(value, str):
+                    value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                normalized[field.name] = value
+            coerced.append(normalized)
+        return coerced
+
+    def reopen_writer_with_schema(schema) -> None:
+        nonlocal writer, active_schema
+        if writer is not None:
+            writer.close()
+            writer = None
+        existing_rows = pq.read_table(path).to_pylist() if row_count else []
+        active_schema = schema
+        writer = pq.ParquetWriter(path, active_schema)
+        if existing_rows:
+            writer.write_table(
+                pa.Table.from_pylist(
+                    coerce_rows_to_schema(existing_rows, active_schema),
+                    schema=active_schema,
+                )
+            )
 
     def has_null_typed_fields(rows: list[dict[str, Any]]) -> bool:
         if not rows:
