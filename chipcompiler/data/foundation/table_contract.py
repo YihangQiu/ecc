@@ -19,6 +19,176 @@ class TableSpec:
     columns: tuple[str, ...]
     partition_fields: tuple[str, ...] = ()
 
+    def arrow_schema(self):
+        import pyarrow as pa
+
+        return pa.schema([pa.field(column, _arrow_type_for_column(column)) for column in self.columns])
+
+
+_STRING_COLUMNS = {
+    "design_id",
+    "pdk",
+    "design_name",
+    "top_module",
+    "logical_source_hash",
+    "tech_profile",
+    "created_from_workspace",
+    "run_id",
+    "parameter_hash",
+    "flow_hash",
+    "tool_version_hash",
+    "workspace_path",
+    "status",
+    "created_at",
+    "stage_id",
+    "stage_name",
+    "tool",
+    "state",
+    "stage_dir",
+    "artifact_id",
+    "artifact_type",
+    "relative_path",
+    "sha256",
+    "parser",
+    "parser_version",
+    "availability",
+    "provenance_id",
+    "target_table",
+    "target_key",
+    "target_field",
+    "derived_from_artifact_ids",
+    "source_section",
+    "availability_code",
+    "null_reason",
+    "notes",
+    "entity_type",
+    "entity_key",
+    "block_name",
+    "block_payload",
+    "source_schema_version",
+    "source_doc",
+    "source_field_path",
+    "preserved_reason",
+    "normalized_status",
+    "future_normalization_plan",
+    "layer_name",
+    "routing_direction",
+    "metadata",
+    "via_name",
+    "cut_layer",
+    "lower_layer",
+    "upper_layer",
+    "master",
+    "cell_class",
+    "physical_class",
+    "grid_id",
+    "edge_position",
+    "relation",
+    "category",
+    "channel",
+    "tightness_class",
+    "direction",
+    "instance_key",
+    "placement_status",
+    "orientation",
+    "overlap_patch_ids",
+    "summary_json",
+    "pin_key",
+    "pin_kind",
+    "pin_name",
+    "full_name",
+    "parent_master",
+    "geometry_status",
+    "electrical_json",
+    "timing_json",
+    "route_json",
+    "net_key",
+    "name",
+    "use",
+    "net_class",
+    "terminal_role",
+    "wire_segment_key",
+    "bbox_json",
+    "layer",
+    "vertex_kind",
+    "terminal_pin_key",
+    "match_status",
+    "edge_kind",
+    "geometry_json",
+    "wire_segment_refs",
+    "path_id",
+    "startpoint",
+    "endpoint",
+    "delay_type",
+    "path_group",
+    "path_length_summary",
+    "from_pin_key",
+    "to_pin_key",
+    "transition",
+    "edge_kind_source",
+    "point",
+    "payload_json",
+    "metric_name",
+    "metric_value",
+    "source_artifact_id",
+    "feature_availability_code",
+    "label_source_artifact_id",
+    "from_stage",
+    "to_stage",
+    "change_type",
+    "old_value",
+    "new_value",
+}
+
+_BOOL_COLUMNS = {
+    "is_default",
+    "is_sequential",
+    "is_physical_only",
+    "is_macro",
+    "is_clock_related",
+    "is_io",
+    "is_macro_pin",
+    "is_clock",
+    "is_reset",
+    "is_power_ground",
+    "is_signal",
+    "is_driver",
+    "is_sink",
+    "critical_path_flag",
+    "is_primary",
+}
+
+_INT_COLUMNS = {
+    "stage_order",
+    "size_bytes",
+    "source_index",
+    "layer_index",
+    "pin_count",
+    "row",
+    "col",
+    "patch_id",
+    "neighbor_patch_id",
+    "segment_index",
+    "vertex_id",
+    "edge_id",
+    "source_vertex_id",
+    "target_vertex_id",
+    "point_index",
+    "node_id",
+}
+
+
+def _arrow_type_for_column(column: str):
+    import pyarrow as pa
+
+    if column in _STRING_COLUMNS:
+        return pa.string()
+    if column in _BOOL_COLUMNS:
+        return pa.bool_()
+    if column in _INT_COLUMNS or column.endswith("_count") or column.endswith("_id") and column != "grid_id":
+        return pa.int64()
+    return pa.float64()
+
 
 TABLE_SPECS: dict[str, TableSpec] = {
     "designs": TableSpec(
@@ -271,6 +441,10 @@ def schema_document() -> dict[str, Any]:
                 "primary_key": list(spec.primary_key),
                 "columns": list(spec.columns),
                 "partition_fields": list(spec.partition_fields),
+                "arrow_schema": [
+                    {"name": field.name, "type": str(field.type)}
+                    for field in spec.arrow_schema()
+                ],
             }
             for name, spec in TABLE_SPECS.items()
         },
@@ -281,7 +455,7 @@ def write_tables(foundation_dir: Path, tables: Mapping[str, Iterable[Mapping[str
     registry: dict[str, Any] = {}
     for name, spec in TABLE_SPECS.items():
         table_path = foundation_dir / "tables" / f"{name}.parquet"
-        row_count = write_parquet(table_path, tables.get(name, ()), columns=spec.columns)
+        row_count = write_parquet(table_path, tables.get(name, ()), columns=spec.columns, schema=spec.arrow_schema())
         registry[name] = {
             "path": f"tables/{name}.parquet",
             "format": "parquet",

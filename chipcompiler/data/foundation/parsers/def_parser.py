@@ -83,30 +83,245 @@ _POINT_RE = re.compile(r"\(\s*(-?\d+(?:\.\d+)?|\*)\s+(-?\d+(?:\.\d+)?|\*)\s+\)")
 
 
 def parse_def(path: Path) -> DefData:
-    text = _read_text(path)
-    lines = [line.rstrip() for line in text.splitlines()]
-    units = _parse_units(lines)
-    diearea = _parse_diearea(lines)
+    parsed = _parse_def_lines(_iter_def_lines(path))
     return DefData(
         path=path,
-        units=units,
-        diearea=diearea,
-        gcell_x=_parse_gcell_axis(lines, "X"),
-        gcell_y=_parse_gcell_axis(lines, "Y"),
-        rows=_parse_rows(lines),
-        tracks=_parse_tracks(lines),
-        vias=_parse_vias(lines),
-        components=_parse_components(lines),
-        pins=_parse_pins(lines),
-        nets=[*_parse_nets(lines, "NETS", special=False), *_parse_nets(lines, "SPECIALNETS", special=True)],
+        units=parsed["units"],
+        diearea=parsed["diearea"],
+        gcell_x=parsed["gcell_x"],
+        gcell_y=parsed["gcell_y"],
+        rows=parsed["rows"],
+        tracks=parsed["tracks"],
+        vias=parsed["vias"],
+        components=parsed["components"],
+        pins=parsed["pins"],
+        nets=parsed["nets"],
     )
 
 
-def _read_text(path: Path) -> str:
+def _iter_def_lines(path: Path):
     if path.suffix == ".gz":
         with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-            return handle.read()
-    return path.read_text(encoding="utf-8", errors="replace")
+            for line in handle:
+                yield line.rstrip()
+        return
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            yield line.rstrip()
+
+
+def _parse_def_lines(lines) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "units": None,
+        "diearea": None,
+        "gcell_x": [],
+        "gcell_y": [],
+        "rows": [],
+        "tracks": [],
+        "vias": [],
+        "components": [],
+        "pins": [],
+        "nets": [],
+    }
+    section: str | None = None
+    current_via: dict[str, Any] | None = None
+    current_via_layer: str | None = None
+    current_pin: dict[str, Any] | None = None
+    current_net_name = ""
+    current_net_chunks: list[str] = []
+    current_net_special = False
+
+    def flush_via() -> None:
+        nonlocal current_via, current_via_layer
+        if current_via:
+            result["vias"].append(current_via)
+        current_via = None
+        current_via_layer = None
+
+    def flush_pin() -> None:
+        nonlocal current_pin
+        if current_pin:
+            result["pins"].append(current_pin)
+        current_pin = None
+
+    def flush_net() -> None:
+        nonlocal current_net_name, current_net_chunks
+        if current_net_name:
+            result["nets"].append(_net_from_chunks(current_net_name, current_net_chunks, special=current_net_special))
+        current_net_name = ""
+        current_net_chunks = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if section is None:
+            units_match = re.search(r"UNITS\s+DISTANCE\s+MICRONS\s+(\d+)", stripped)
+            if units_match:
+                result["units"] = int(units_match.group(1))
+            diearea_match = re.search(
+                r"DIEAREA\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)",
+                stripped,
+            )
+            if diearea_match:
+                llx, lly, urx, ury = (float(diearea_match.group(i)) for i in range(1, 5))
+                result["diearea"] = {"llx": llx, "lly": lly, "urx": urx, "ury": ury}
+            gcell_match = re.search(r"GCELLGRID\s+([XY])\s+(-?\d+(?:\.\d+)?)\s+DO\s+(\d+)\s+STEP\s+(-?\d+(?:\.\d+)?)", stripped)
+            if gcell_match:
+                axis = gcell_match.group(1)
+                values = result["gcell_x"] if axis == "X" else result["gcell_y"]
+                start = float(gcell_match.group(2))
+                count = int(gcell_match.group(3))
+                step = float(gcell_match.group(4))
+                for idx in range(count):
+                    value = start + idx * step
+                    if not values or value > values[-1]:
+                        values.append(value)
+            track_match = re.search(r"TRACKS\s+([XY])\s+(-?\d+(?:\.\d+)?)\s+DO\s+(\d+)\s+STEP\s+(-?\d+(?:\.\d+)?)\s+LAYER\s+(\S+)", stripped)
+            if track_match:
+                result["tracks"].append(
+                    DefTrack(
+                        axis=track_match.group(1),
+                        start=float(track_match.group(2)),
+                        count=int(track_match.group(3)),
+                        step=float(track_match.group(4)),
+                        layer=track_match.group(5),
+                    )
+                )
+            row_match = re.search(
+                r"ROW\s+(\S+)\s+(\S+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s+DO\s+(\d+)\s+BY\s+(\d+)\s+STEP\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)",
+                stripped,
+            )
+            if row_match:
+                result["rows"].append(
+                    DefRow(
+                        name=row_match.group(1),
+                        site=row_match.group(2),
+                        x=float(row_match.group(3)),
+                        y=float(row_match.group(4)),
+                        orient=row_match.group(5),
+                        count_x=int(row_match.group(6)),
+                        count_y=int(row_match.group(7)),
+                        step_x=float(row_match.group(8)),
+                        step_y=float(row_match.group(9)),
+                    )
+                )
+            for candidate in ("VIAS", "COMPONENTS", "PINS", "NETS", "SPECIALNETS"):
+                if stripped.startswith(f"{candidate} "):
+                    section = candidate
+                    current_net_special = candidate == "SPECIALNETS"
+                    break
+            continue
+
+        if section == "VIAS":
+            if stripped.startswith("END VIAS"):
+                flush_via()
+                section = None
+                continue
+            if stripped.startswith("- "):
+                flush_via()
+                tokens = stripped.split()
+                layers = []
+                if "+ LAYERS" in stripped:
+                    layers = stripped.split("+ LAYERS", 1)[1].replace(";", "").split()[:3]
+                current_via = {"name": tokens[1], "layers": layers, "rects_by_layer": {}, "source": "def_vias"}
+                current_via_layer = None
+                continue
+            if current_via is None:
+                continue
+            layer_match = re.search(r"\+\s+LAYER\s+(\S+)", stripped) or re.match(r"LAYER\s+(\S+)", stripped)
+            if layer_match:
+                current_via_layer = layer_match.group(1)
+                current_via.setdefault("rects_by_layer", {}).setdefault(current_via_layer, [])
+                if current_via_layer not in current_via.setdefault("layers", []):
+                    current_via["layers"].append(current_via_layer)
+            rect_match = re.search(r"RECT\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", stripped)
+            if rect_match and current_via_layer:
+                llx, lly, urx, ury = (float(rect_match.group(i)) for i in range(1, 5))
+                current_via.setdefault("rects_by_layer", {}).setdefault(current_via_layer, []).append({"llx": llx, "lly": lly, "urx": urx, "ury": ury})
+            continue
+
+        if section == "COMPONENTS":
+            if stripped.startswith("END COMPONENTS"):
+                section = None
+                continue
+            match = _COMPONENT_RE.match(line)
+            if match:
+                name, master, rest = match.groups()
+                placed = _PLACED_RE.search(rest)
+                result["components"].append(
+                    {
+                        "name": name,
+                        "master": master,
+                        "origin": {"x": float(placed.group(1)), "y": float(placed.group(2))} if placed else None,
+                        "orientation": placed.group(3) if placed else None,
+                        "source": "def_components",
+                    }
+                )
+            continue
+
+        if section == "PINS":
+            if stripped.startswith("END PINS"):
+                flush_pin()
+                section = None
+                continue
+            if stripped.startswith("- "):
+                flush_pin()
+                tokens = stripped.split()
+                current_pin = {
+                    "pin_name": tokens[1],
+                    "instance": "PIN",
+                    "source": "def_pins",
+                    "def_index": len(result["pins"]),
+                    "shapes": [],
+                }
+            if current_pin is None:
+                continue
+            net_match = re.search(r"\+\s+NET\s+(\S+)", stripped)
+            if net_match:
+                current_pin["net"] = net_match.group(1)
+            direction_match = re.search(r"\+\s+DIRECTION\s+(\S+)", stripped)
+            if direction_match:
+                current_pin["direction"] = direction_match.group(1)
+            use_match = re.search(r"\+\s+USE\s+(\S+)", stripped)
+            if use_match:
+                current_pin["use"] = use_match.group(1)
+            layer_match = re.search(
+                r"\+\s+LAYER\s+(\S+)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)\s+\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)",
+                stripped,
+            )
+            if layer_match:
+                llx, lly, urx, ury = (float(layer_match.group(i)) for i in range(2, 6))
+                current_pin.setdefault("shapes", []).append(
+                    {
+                        "layer": layer_match.group(1),
+                        "rect": {"llx": llx, "lly": lly, "urx": urx, "ury": ury},
+                        "source": "def_pin_layer_rect",
+                    }
+                )
+            placed = _PLACED_RE.search(stripped)
+            if placed:
+                current_pin["origin"] = {"x": float(placed.group(1)), "y": float(placed.group(2))}
+                current_pin["orientation"] = placed.group(3)
+            continue
+
+        if section in {"NETS", "SPECIALNETS"}:
+            if stripped.startswith(f"END {section}"):
+                flush_net()
+                section = None
+                continue
+            if stripped.startswith("- "):
+                flush_net()
+                parts = stripped.split(maxsplit=2)
+                current_net_name = parts[1]
+                current_net_chunks = [parts[2] if len(parts) > 2 else ""]
+            elif current_net_name:
+                current_net_chunks.append(stripped)
+
+    flush_via()
+    flush_pin()
+    flush_net()
+    return result
 
 
 def _parse_units(lines: list[str]) -> int | None:

@@ -1089,6 +1089,12 @@ class FoundationExtractor:
                     status = "optional_post_route_snapshot" if stage.name in {"drc", "filler"} else "not_available_before_route"
                     self._quality.setdefault("availability", {}).setdefault(entity, {})[stage.name] = status
                     self._quality.setdefault("null_reason", {}).setdefault(entity, {})[stage.name] = status
+                elif (
+                    entity == "routing_graphs"
+                    and self._quality.get("availability", {}).get(entity, {}).get(stage.name)
+                    == "direct_table_stream_from_wire_segments"
+                ):
+                    continue
                 else:
                     self._mark(entity, stage.name, "available" if records else "missing", "" if records else f"missing_{entity}_source")
             patches = self._patch_records(
@@ -1391,29 +1397,11 @@ class FoundationExtractor:
         total_wire_count = sum(len(item.wires) for item in parsed_def.nets)
         large_design_route = stage.name == "route" and total_wire_count > 1000
         if large_design_route:
-            self._large_design_mode = True
-            self._quality["large_design_mode"] = {
+            self._quality["large_design_observed"] = {
                 "enabled": True,
-                "reason": "route_wire_count_exceeds_in_memory_table_threshold",
                 "route_wire_count": total_wire_count,
-                "degraded_tables": [
-                    "semantic_blocks",
-                    "patch_entity_refs",
-                    "instance_stage_state",
-                    "pin_stage_state",
-                    "wire_segments",
-                    "wire_patch_intersections",
-                    "timing_path_points",
-                    "timing_edges",
-                    "timing_wire_path_nodes",
-                    "stage_deltas",
-                ],
-                "preserved_tables": ["run_patch_route_labels", "run_stage_patch_features", "nets", "pins", "instances"],
+                "policy": "source_backed_tables_preserved",
             }
-            self._quality.setdefault("warnings", []).append(
-                "large_design_mode: detailed wire/timing delta tables are intentionally degraded; "
-                "core progressive patch features and route labels are preserved"
-            )
         tech_layers = {str(item.get("name")): item for item in self._tech_records.get("layers", []) if item.get("name") is not None}
         tech_vias = {str(item.get("name")): item for item in self._tech_records.get("vias", []) if item.get("name") is not None}
         net_segment_index: dict[str, int] = {}
@@ -1459,10 +1447,12 @@ class FoundationExtractor:
             self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = "not_available_before_route"
             return []
         if sum(len(net.wires) for net in parsed_def.nets) > 1000:
-            status = "skipped_large_route_design"
-            self._quality.setdefault("availability", {}).setdefault("routing_graphs", {})[stage.name] = status
-            self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = status
-            self._large_design_mode = True
+            self._quality.setdefault("routing_graph_observed", {})[stage.name] = {
+                "route_wire_count": sum(len(net.wires) for net in parsed_def.nets),
+                "policy": "direct_table_stream_from_wire_segments",
+            }
+            self._quality.setdefault("availability", {}).setdefault("routing_graphs", {})[stage.name] = "direct_table_stream_from_wire_segments"
+            self._quality.setdefault("null_reason", {}).setdefault("routing_graphs", {})[stage.name] = "legacy_nested_graph_skipped_large_route"
             return []
         net_records = {str(record.get("net_key")): record for record in nets}
         pins_by_net: dict[str, list[dict[str, Any]]] = {}
@@ -2917,7 +2907,11 @@ class FoundationExtractor:
         self, design_id: str, run_id: str, stages: list[StageInfo]
     ) -> Iterable[dict[str, Any]]:
         for stage in stages:
-            for graph in self._records_for_stage("routing_graphs", stage.name):
+            graphs = self._records_for_stage("routing_graphs", stage.name)
+            if not graphs and self._uses_direct_routing_graph_tables(stage.name):
+                yield from self._routing_vertex_rows_from_wires(design_id, run_id, stage)
+                continue
+            for graph in graphs:
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for vertex in graph.get("vertices") or []:
                     yield {
@@ -2937,7 +2931,11 @@ class FoundationExtractor:
 
     def _routing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> Iterable[dict[str, Any]]:
         for stage in stages:
-            for graph in self._records_for_stage("routing_graphs", stage.name):
+            graphs = self._records_for_stage("routing_graphs", stage.name)
+            if not graphs and self._uses_direct_routing_graph_tables(stage.name):
+                yield from self._routing_edge_rows_from_wires(design_id, run_id, stage)
+                continue
+            for graph in graphs:
                 net_key = str(graph.get("net_key") or (graph.get("identity") or {}).get("net_key"))
                 for edge in graph.get("edges") or []:
                     yield {
@@ -2954,6 +2952,61 @@ class FoundationExtractor:
                         "length": edge.get("length"),
                         "wire_segment_refs": json_value(edge.get("wire_segment_refs") or []),
                     }
+
+    def _uses_direct_routing_graph_tables(self, stage_name: str) -> bool:
+        return (
+            self._quality.get("availability", {})
+            .get("routing_graphs", {})
+            .get(stage_name)
+            == "direct_table_stream_from_wire_segments"
+        )
+
+    def _routing_vertex_rows_from_wires(
+        self, design_id: str, run_id: str, stage: StageInfo
+    ) -> Iterable[dict[str, Any]]:
+        for index, record in enumerate(self._records_for_stage("wires", stage.name)):
+            identity = record.get("identity") or {}
+            geometry = record.get("geometry") or {}
+            patch_anchor = record.get("patch_anchor") or {}
+            net_key = str(identity.get("net_key") or "")
+            for offset, endpoint_name in enumerate(("start", "end")):
+                point = geometry.get(endpoint_name) or {}
+                yield {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_name": stage.name,
+                    "net_key": net_key,
+                    "vertex_id": index * 2 + offset,
+                    "x": point.get("x"),
+                    "y": point.get("y"),
+                    "layer": geometry.get("layer"),
+                    "vertex_kind": "wire_endpoint",
+                    "patch_id": patch_anchor.get("primary_patch_id"),
+                    "terminal_pin_key": None,
+                    "match_status": "direct_from_wire_segment",
+                }
+
+    def _routing_edge_rows_from_wires(
+        self, design_id: str, run_id: str, stage: StageInfo
+    ) -> Iterable[dict[str, Any]]:
+        for index, record in enumerate(self._records_for_stage("wires", stage.name)):
+            identity = record.get("identity") or {}
+            geometry = record.get("geometry") or {}
+            wire_key = str(record.get("wire_key") or identity.get("wire_key") or f"wire:{index}")
+            yield {
+                "design_id": design_id,
+                "run_id": run_id,
+                "stage_name": stage.name,
+                "net_key": str(identity.get("net_key") or ""),
+                "edge_id": index,
+                "source_vertex_id": index * 2,
+                "target_vertex_id": index * 2 + 1,
+                "edge_kind": "via_transition" if identity.get("segment_kind") == "via" else "wire_segment",
+                "geometry_json": json_value(geometry),
+                "layer": geometry.get("layer"),
+                "length": geometry.get("length"),
+                "wire_segment_refs": json_value([wire_key]),
+            }
 
     def _timing_path_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
@@ -7126,6 +7179,32 @@ def _wire_patch_intersections(geometry: dict[str, Any], canonical_grid: dict) ->
     return intersections
 
 
+def _primary_wire_patch_intersection(
+    geometry: dict[str, Any], patch: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if patch is None:
+        return []
+    patch_bbox = patch.get("bbox") or {}
+    length = _clipped_segment_length(geometry, patch_bbox) if patch_bbox else 0.0
+    if length <= 0 and geometry.get("segment_kind") != "via":
+        length = float(geometry.get("length") or 0.0)
+    return [
+        {
+            "patch_id": int(patch["patch_id"]),
+            "row": int(patch.get("row") or 0),
+            "col": int(patch.get("col") or 0),
+            "length": length,
+            "intersect_length": length,
+            "area_proxy": None,
+            "direction": geometry.get("direction"),
+            "layer": geometry.get("layer"),
+            "is_primary": True,
+            "is_primary_patch": True,
+            "capacity_contribution": None,
+        }
+    ]
+
+
 def _grid_overlap_patches_for_wire(lookup: _PatchGridLookup | None, bbox: dict[str, Any]) -> list[dict[str, Any]]:
     if lookup is None or not lookup.rectangular:
         return []
@@ -7224,12 +7303,17 @@ def _build_wire_record(
     identity_base = _net_identity(net)
     geometry = _wire_geometry(wire)
     lookup = _patch_grid_lookup(canonical_grid)
-    intersections = _wire_patch_intersections(geometry, canonical_grid)
     center = geometry.get("center", {})
     center_patch = _grid_patch_for_point(lookup, center) if isinstance(center, dict) else None
     if center_patch is None:
         center_patch = _patch_for_point(canonical_grid.get("patches", []), center)
-    primary_patch_id = int(center_patch["patch_id"]) if center_patch else (intersections[0]["patch_id"] if intersections else None)
+    primary_patch_id = int(center_patch["patch_id"]) if center_patch else None
+    if large_design_route:
+        intersections = _primary_wire_patch_intersection(geometry, center_patch)
+    else:
+        intersections = _wire_patch_intersections(geometry, canonical_grid)
+        if primary_patch_id is None:
+            primary_patch_id = intersections[0]["patch_id"] if intersections else None
     if intersections and primary_patch_id is not None:
         for item in intersections:
             item["is_primary_patch"] = int(item["patch_id"]) == int(primary_patch_id)
@@ -7246,6 +7330,66 @@ def _build_wire_record(
     if not capacity_context.get("available"):
         null_reason["capacity_context"] = "missing_track_capacity" if stage.name == "route" else "not_implemented"
     patch_anchor = _wire_patch_anchor(stage_maps, canonical_grid, geometry, primary_patch_id, intersections)
+    if large_design_route:
+        source_rel = _workspace_relative_from_parsed_def(parsed_def)
+        return {
+            "id": idx,
+            "stage": stage.name,
+            "wire_key": wire_key,
+            "source": source_rel,
+            "identity": {
+                "wire_key": wire_key,
+                "net": net.name,
+                "net_key": net.name,
+                "source_section": source_section,
+                "segment_index": segment_index,
+                "wire_class": _wire_class(net),
+                "segment_kind": segment_kind,
+                "is_signal": identity_base["is_signal"],
+                "is_clock": identity_base["is_clock"],
+                "is_power_ground": identity_base["is_power_ground"],
+                "is_special": identity_base["is_special"],
+                "classification_source": "def_net_use_and_name_rule",
+            },
+            "geometry": geometry,
+            "layer_context": layer_context,
+            "track_context": track_context,
+            "capacity_context": capacity_context,
+            "patch_anchor": patch_anchor,
+            "patch_intersections": intersections,
+            "net_context": {
+                "net": net.name,
+                "net_key": net.name,
+                "terminal_count": len(net.pins),
+                "source": "large_design_lightweight",
+            },
+            "endpoint_context": {"available": False, "classification_source": "large_design_lightweight"},
+            "timing_context": {"available": False, "source": "large_design_lightweight"},
+            "route_context": {
+                "route_only_oracle": True,
+                "local_final_overflow": _route_wire_local_overflow(primary_patch_id, native_demand_capacity_by_patch or {}, stage_maps, row_col),
+                "layer_demand_capacity_ratio": capacity_context.get("layer_demand_capacity_ratio"),
+                "patch_layer_usage": capacity_context.get("patch_layer_demand"),
+                "nearby_wire_count": None,
+                "nearby_via_count": None,
+                "nearby_drc_count": None,
+                "contributes_to_overflow_patch": None,
+                "source": "routed_def_reconstruction_large_design_lightweight",
+            },
+            "via_context": {"via_name": wire.via} if wire.via else None,
+            "progressive_metadata": {
+                "available_from_stage": stage.name,
+                "route_only_oracle": True,
+                "tracking_scope": "stage_local_wire_geometry",
+            },
+            "source_refs": {
+                "def": source_rel,
+                "def_section": source_section,
+                "segment_index": segment_index,
+                "route": "routed_def_reconstruction_large_design_lightweight",
+            },
+            "null_reason": null_reason,
+        }
     route_context = None
     if stage.name == "route":
         local_overflow = _route_wire_local_overflow(primary_patch_id, native_demand_capacity_by_patch or {}, stage_maps, row_col)

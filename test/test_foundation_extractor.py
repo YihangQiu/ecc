@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from pathlib import Path
 from typing import Iterable
 
+import pytest
+
 from chipcompiler.data.foundation import FoundationExtractor
 import chipcompiler.data.foundation.extractor as extractor_module
+from chipcompiler.data.foundation.parsers.def_parser import parse_def
 from chipcompiler.data.foundation.grid.canonical_grid import build_patch_grid
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
 from chipcompiler.data.foundation.writers import write_parquet
@@ -696,11 +700,12 @@ def test_write_tables_passes_iterables_without_eager_list_materialization(tmp_pa
 
     captured = {}
 
-    def fake_write_parquet(path: Path, records, *, columns=None, batch_size=2048):
+    def fake_write_parquet(path: Path, records, *, columns=None, schema=None, batch_size=2048):
         if path.name == "timing_paths.parquet":
             captured['records_type'] = type(records)
             captured['records_is_list'] = isinstance(records, list)
             captured['columns'] = tuple(columns or ())
+            captured['schema'] = schema
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'PAR1')
         for _ in records:
@@ -732,6 +737,7 @@ def test_write_tables_passes_iterables_without_eager_list_materialization(tmp_pa
     assert captured['records_is_list'] is False
     assert captured['records_type'] is not list
     assert captured['columns'] == TABLE_SPECS['timing_paths'].columns
+    assert captured['schema'] == TABLE_SPECS['timing_paths'].arrow_schema()
     assert registry['timing_paths']['row_count'] == 1
 
 
@@ -794,6 +800,56 @@ def test_write_parquet_same_schema_batches_do_not_read_existing_table(tmp_path: 
     row_count = write_parquet(tmp_path / "same-schema.parquet", rows, batch_size=2)
 
     assert row_count == 6
+
+
+def test_write_parquet_contract_schema_does_not_read_back_existing_table(tmp_path: Path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    def fail_read_table(*args, **kwargs):
+        raise AssertionError("fixed contract schema writes must not read back existing parquet data")
+
+    monkeypatch.setattr(pq, "read_table", fail_read_table)
+
+    rows = [
+        {
+            "provenance_id": "p0",
+            "target_table": "wire_segments",
+            "target_key": "wire:0",
+            "target_field": "*",
+            "artifact_id": None,
+            "derived_from_artifact_ids": [],
+            "source_section": "foundation_extractor",
+            "source_index": None,
+            "availability_code": "available",
+            "null_reason": None,
+            "confidence": 1,
+            "notes": {"kind": "dict_payload_should_be_stringified"},
+        },
+        {
+            "provenance_id": "p1",
+            "target_table": "wire_segments",
+            "target_key": "wire:1",
+            "target_field": "*",
+            "artifact_id": "artifact:route_def",
+            "derived_from_artifact_ids": ["artifact:route_def"],
+            "source_section": "foundation_extractor",
+            "source_index": 1,
+            "availability_code": "available",
+            "null_reason": None,
+            "confidence": 0.5,
+            "notes": "already string",
+        },
+    ]
+
+    row_count = write_parquet(
+        tmp_path / "contract-schema.parquet",
+        rows,
+        columns=TABLE_SPECS["provenance"].columns,
+        schema=TABLE_SPECS["provenance"].arrow_schema(),
+        batch_size=1,
+    )
+
+    assert row_count == 2
 
 
 def test_write_parquet_handles_nullable_columns_when_later_batches_introduce_values(tmp_path: Path):
@@ -1052,6 +1108,82 @@ def test_route_native_demand_capacity_jsonl_is_read_streaming(tmp_path: Path, mo
     assert labels[0]["horizontal_demand_capacity"] == 3.0
     assert labels[0]["vertical_demand_capacity"] == 2.0
     assert labels[0]["union_demand_capacity"] == 3.0
+
+
+def test_def_parser_streams_large_def_without_read_text_splitlines(tmp_path: Path, monkeypatch):
+    path = tmp_path / "large.def.gz"
+    net_lines = []
+    for idx in range(1005):
+        y = idx % 200
+        net_lines.append(f"- n{idx} ( U1 A ) ( PIN OUT )")
+        net_lines.append(f"  + ROUTED MET2 ( 0 {y} ) ( 200 * )")
+        net_lines.append("  ;")
+    payload = "\n".join(
+        [
+            "VERSION 5.8 ;",
+            "DIVIDERCHAR \"/\" ;",
+            "BUSBITCHARS \"[]\" ;",
+            "DESIGN gcd ;",
+            "UNITS DISTANCE MICRONS 1000 ;",
+            "DIEAREA ( 0 0 ) ( 200 200 ) ;",
+            "TRACKS Y 50 DO 1 STEP 100 LAYER MET2 ;",
+            "GCELLGRID X 0 DO 3 STEP 100 ;",
+            "GCELLGRID Y 0 DO 3 STEP 100 ;",
+            "COMPONENTS 1 ;",
+            "- U1 NAND2 + PLACED ( 10 20 ) N ;",
+            "END COMPONENTS",
+            "PINS 1 ;",
+            "- OUT + NET n0 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;",
+            "END PINS",
+            "NETS 1005 ;",
+            *net_lines,
+            "END NETS",
+            "END DESIGN",
+        ]
+    )
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write(payload)
+
+    original_read_text = Path.read_text
+    original_gzip_open = gzip.open
+
+    def fail_target_read_text(self, *args, **kwargs):
+        if self == path:
+            raise AssertionError("DEF parser should not use Path.read_text for target DEF")
+        return original_read_text(self, *args, **kwargs)
+
+    class NoReadAll:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def __iter__(self):
+            return iter(self._handle)
+
+        def read(self, *args, **kwargs):
+            raise AssertionError("DEF parser should stream gzip lines instead of read() all")
+
+    def guarded_gzip_open(*args, **kwargs):
+        handle = original_gzip_open(*args, **kwargs)
+        if args and Path(args[0]) == path:
+            return NoReadAll(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "read_text", fail_target_read_text)
+    monkeypatch.setattr(gzip, "open", guarded_gzip_open)
+
+    parsed = parse_def(path)
+
+    assert len(parsed.components) == 1
+    assert len(parsed.pins) == 1
+    assert len(parsed.nets) == 1005
+    assert sum(len(net.wires) for net in parsed.nets) == 1005
 
 
 def test_extractor_jsonl_helper_streams_records(tmp_path: Path, monkeypatch):
@@ -3209,6 +3341,111 @@ def test_routing_graph_records_follow_vec_routing_graph_schema(tmp_path: Path):
     assert via_edge["via_ref"]["from_layer"] == "MET2"
     assert via_edge["via_ref"]["to_layer"] == "MET3"
     assert all(len(vertex["incident_edge_ids"]) == len(set(vertex["incident_edge_ids"])) for vertex in graph["vertices"])
+
+
+def _append_large_route_nets(ws: Path, *, count: int = 1005) -> None:
+    shutil_target = ws / "route_ecc" / "data" / "sta"
+    if shutil_target.exists():
+        import shutil
+
+        shutil.rmtree(shutil_target)
+    net_lines = []
+    for idx in range(count):
+        y = idx % 200
+        net_lines.append(f"- n_large_{idx} ( U1 A ) ( PIN OUT )")
+        net_lines.append(f"  + ROUTED MET2 ( 0 {y} ) ( 200 * )")
+        net_lines.append("  ;")
+    _write_text(
+        ws / "route_ecc" / "output" / "gcd_route.def",
+        "\n".join(
+            [
+                "VERSION 5.8 ;",
+                "DIVIDERCHAR \"/\" ;",
+                "BUSBITCHARS \"[]\" ;",
+                "DESIGN gcd ;",
+                "UNITS DISTANCE MICRONS 1000 ;",
+                "DIEAREA ( 0 0 ) ( 200 200 ) ;",
+                "TRACKS Y 50 DO 1 STEP 100 LAYER MET2 ;",
+                "TRACKS X 50 DO 1 STEP 100 LAYER MET3 ;",
+                "GCELLGRID X 0 DO 3 STEP 100 ;",
+                "GCELLGRID Y 0 DO 3 STEP 100 ;",
+                "VIAS 1 ;",
+                "- VIA23 + LAYERS MET2 VIA2 MET3 ;",
+                "END VIAS",
+                "COMPONENTS 1 ;",
+                "- U1 NAND2 + PLACED ( 10 20 ) N ;",
+                "END COMPONENTS",
+                "PINS 1 ;",
+                "- OUT + NET n_large_0 + DIRECTION OUTPUT + PLACED ( 180 50 ) N ;",
+                "END PINS",
+                f"NETS {count} ;",
+                *net_lines,
+                "END NETS",
+                "END DESIGN",
+            ]
+        )
+        + "\n",
+    )
+
+
+def test_large_route_design_does_not_degrade_source_backed_tables(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    _append_large_route_nets(ws)
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+    foundation_dir = result.foundation_dir
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert "route_wire_count_exceeds_in_memory_table_threshold" not in json.dumps(quality)
+    assert not quality.get("large_design_mode", {}).get("degraded_tables")
+    for table_name in ["wire_segments", "wire_patch_intersections", "patch_entity_refs", "routing_vertices", "routing_edges"]:
+        table = pq.read_table(foundation_dir / manifest["tables"][table_name]["path"])
+        assert table.num_rows > 0, table_name
+
+
+def test_large_design_quality_distinguishes_missing_source_from_perf_degrade(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    _append_large_route_nets(ws)
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(stages=["route"])
+    foundation_dir = result.foundation_dir
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    timing_paths = pq.read_table(foundation_dir / manifest["tables"]["timing_paths"]["path"])
+    assert timing_paths.num_rows == 0
+    assert quality["availability"]["timing_paths"]["route"] in {
+        "missing",
+        "missing_source",
+        "missing_timing_source",
+        "missing_timing_paths_source",
+        "sta_report_missing_or_empty",
+    }
+    assert quality["null_reason"]["timing_paths"]["route"] in {
+        "missing",
+        "missing_source",
+        "missing_timing_source",
+        "missing_timing_paths_source",
+        "sta_report_missing_or_empty",
+    }
+    assert "route_wire_count_exceeds_in_memory_table_threshold" not in json.dumps(quality)
+    source_backed = [
+        "instance_stage_state",
+        "pin_stage_state",
+        "wire_segments",
+        "wire_patch_intersections",
+        "patch_entity_refs",
+        "routing_vertices",
+        "routing_edges",
+    ]
+    for table_name in source_backed:
+        table = pq.read_table(foundation_dir / manifest["tables"][table_name]["path"])
+        assert table.num_rows > 0, table_name
 
 
 def test_routing_graph_strict_blockers_are_enforced(tmp_path: Path):

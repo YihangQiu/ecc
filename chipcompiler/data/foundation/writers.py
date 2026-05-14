@@ -27,6 +27,7 @@ def write_parquet(
     records: Iterable[Mapping[str, Any]],
     *,
     columns: Iterable[str] | None = None,
+    schema: Any | None = None,
     batch_size: int = 2048,
 ) -> int:
     """Write records as a Parquet table and return the number of rows.
@@ -48,7 +49,7 @@ def write_parquet(
     path.parent.mkdir(parents=True, exist_ok=True)
     row_count = 0
     writer = None
-    active_schema = None
+    active_schema = schema
     batch: list[dict[str, Any]] = []
     initial_schema_scan_limit = max(normalized_batch_size, normalized_batch_size * 4)
 
@@ -57,9 +58,41 @@ def write_parquet(
             return {column: record.get(column) for column in column_names}
         return dict(record)
 
+    def coerce_value_for_type(value: Any, field_type) -> Any:
+        if value is None:
+            return None
+        if pa.types.is_string(field_type):
+            if isinstance(value, str):
+                return value
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if pa.types.is_integer(field_type) and isinstance(value, bool):
+            return int(value)
+        if pa.types.is_floating(field_type) and isinstance(value, bool):
+            return float(value)
+        return value
+
+    def coerce_rows_to_schema(rows: list[dict[str, Any]], target_schema) -> list[dict[str, Any]]:
+        coerced = []
+        for row in rows:
+            normalized = {}
+            for field in target_schema:
+                normalized[field.name] = coerce_value_for_type(row.get(field.name), field.type)
+            coerced.append(normalized)
+        return coerced
+
     def flush(current_batch: list[dict[str, Any]]) -> None:
         nonlocal writer, row_count, active_schema
         if not current_batch:
+            return
+        if active_schema is not None and writer is None:
+            writer = pq.ParquetWriter(path, active_schema)
+        if active_schema is not None:
+            table = pa.Table.from_pylist(
+                coerce_rows_to_schema(current_batch, active_schema),
+                schema=active_schema,
+            )
+            writer.write_table(table)
+            row_count += len(current_batch)
             return
         current_schema = pa.Table.from_pylist(current_batch).schema
         if writer is None:
@@ -105,21 +138,6 @@ def write_parquet(
                 fields.append(field)
         return pa.schema(fields)
 
-    def coerce_rows_to_schema(rows: list[dict[str, Any]], schema) -> list[dict[str, Any]]:
-        string_fields = {field.name for field in schema if pa.types.is_string(field.type)}
-        if not string_fields:
-            return rows
-        coerced = []
-        for row in rows:
-            normalized = {}
-            for field in schema:
-                value = row.get(field.name)
-                if value is not None and field.name in string_fields and not isinstance(value, str):
-                    value = json.dumps(value, ensure_ascii=False, sort_keys=True)
-                normalized[field.name] = value
-            coerced.append(normalized)
-        return coerced
-
     def reopen_writer_with_schema(schema) -> None:
         nonlocal writer, active_schema
         if writer is not None:
@@ -153,6 +171,8 @@ def write_parquet(
         return pa.Table.from_pylist(rows, schema=schema)
 
     def initial_schema_for_rows(rows: list[dict[str, Any]]):
+        if schema is not None:
+            return schema
         names = list(column_names or dict.fromkeys(key for row in rows for key in row))
         fields = []
         for name in names:
@@ -190,7 +210,11 @@ def write_parquet(
     try:
         for record in records:
             batch.append(normalize(record))
-            if writer is None:
+            if schema is not None:
+                if len(batch) >= normalized_batch_size:
+                    flush(batch)
+                    batch = []
+            elif writer is None:
                 if len(batch) < initial_schema_scan_limit:
                     continue
                 open_writer_with_initial_rows(batch)
@@ -202,7 +226,7 @@ def write_parquet(
             if batch:
                 open_writer_with_initial_rows(batch)
             else:
-                empty_schema = pa.schema([(column, pa.string()) for column in column_names]) if column_names else pa.schema([])
+                empty_schema = schema or (pa.schema([(column, pa.string()) for column in column_names]) if column_names else pa.schema([]))
                 writer = pq.ParquetWriter(path, empty_schema)
         elif batch:
             flush(batch)
