@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from typing import Iterable
 
 from chipcompiler.data.foundation import FoundationExtractor
 import chipcompiler.data.foundation.extractor as extractor_module
@@ -840,6 +841,108 @@ def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     table = pq.read_table(tmp_path / registry["timing_paths"]["path"])
     assert table.num_rows == 0
     assert table.schema.names == list(TABLE_SPECS["timing_paths"].columns)
+
+
+def test_large_table_builders_return_lazy_iterables(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    extractor = FoundationExtractor(ws, profile="iccd_full_v1")
+    extractor.extract(export_legacy_debug=True)
+    flow = extractor._read_json(ws / "home" / "flow.json")
+    parameters = extractor._read_json(ws / "home" / "parameters.json")
+    stages = extractor._stage_infos(flow)
+    stage_ids = {stage.name: f"stage:{index}" for index, stage in enumerate(stages)}
+    canonical_grid = json.loads((extractor.foundation_dir / "canonical_grid.json").read_text(encoding="utf-8"))
+    canonical_maps = extractor._write_maps(extractor._collect_raw_maps(stages), canonical_grid, stages, extractor._collect_def_data(stages))
+
+    lazy_tables = {
+        "semantic_blocks": extractor._semantic_block_rows("design:gcd", "run:gcd", stages),
+        "run_stage_patch_maps": extractor._patch_map_rows("design:gcd", "run:gcd", stage_ids, canonical_grid, canonical_maps),
+        "patch_entity_refs": extractor._patch_entity_ref_rows("design:gcd", "run:gcd", stages),
+        "wire_segments": extractor._wire_segment_rows("design:gcd", "run:gcd", stages),
+        "wire_patch_intersections": extractor._wire_patch_intersection_rows("design:gcd", "run:gcd", stages),
+        "timing_path_points": extractor._timing_path_point_rows("design:gcd", "run:gcd", stages),
+        "timing_edges": extractor._timing_edge_rows("design:gcd", "run:gcd", stages),
+        "timing_wire_path_nodes": extractor._timing_wire_path_node_rows("design:gcd", "run:gcd", stages),
+        "stage_deltas": extractor._stage_delta_rows("design:gcd", "run:gcd", stages),
+    }
+
+    for table_name, rows in lazy_tables.items():
+        assert not isinstance(rows, list), table_name
+        assert isinstance(rows, Iterable), table_name
+        assert next(iter(rows)), table_name
+
+
+def test_provenance_rows_do_not_materialize_large_table_iterables(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    extractor = FoundationExtractor(ws, profile="iccd_full_v1")
+
+    class OneShotRows:
+        def __init__(self, rows):
+            self.rows = rows
+            self.iterated = False
+
+        def __iter__(self):
+            if self.iterated:
+                raise AssertionError("large table iterable was consumed more than once")
+            self.iterated = True
+            yield from self.rows
+
+    tables = {
+        "run_stage_patch_maps": OneShotRows(
+            [
+                {
+                    "stage_name": "place",
+                    "patch_id": 0,
+                    "category": "density",
+                    "channel": "cell_density",
+                    "provenance_id": "prov:map",
+                }
+            ]
+        ),
+        "run_stage_patch_features": OneShotRows(
+            [
+                {
+                    "stage_name": "place",
+                    "patch_id": 0,
+                    "feature_availability_code": "available",
+                    "provenance_id": "prov:feature",
+                }
+            ]
+        ),
+        "stage_deltas": OneShotRows(
+            [
+                {
+                    "to_stage": "place",
+                    "entity_type": "patch",
+                    "entity_key": "patch:0",
+                    "metric_name": "available_from",
+                    "provenance_id": "prov:delta",
+                }
+            ]
+        ),
+        "semantic_blocks": OneShotRows(
+            [
+                {
+                    "stage_name": "place",
+                    "entity_type": "patch",
+                    "entity_key": "patch:0",
+                    "block_name": "source_refs",
+                    "source_doc": "vec_patches.md",
+                    "preserved_reason": "test",
+                }
+            ]
+        ),
+    }
+
+    provenance = extractor._provenance_rows(tables)
+
+    assert {row["provenance_id"] for row in provenance} >= {
+        "foundation_contract",
+        "prov:map",
+        "prov:feature",
+        "prov:delta",
+    }
+    assert all(not isinstance(rows, list) for rows in tables.values())
 
 
 def test_default_contract_tech_tables_do_not_depend_on_legacy_vector_json(tmp_path: Path, monkeypatch):

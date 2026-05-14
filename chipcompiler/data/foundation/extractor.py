@@ -2062,7 +2062,14 @@ class FoundationExtractor:
             "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
             "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
         }
-        tables["provenance"] = self._provenance_rows(tables)
+        tables["provenance"] = self._provenance_rows(
+            {
+                "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
+                "run_stage_patch_features": tables["run_stage_patch_features"],
+                "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
+                "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
+            }
+        )
         return tables
 
     def _artifact_table_rows(
@@ -2215,7 +2222,7 @@ class FoundationExtractor:
             )
 
         for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas"):
-            for row in self._iter_table_rows_once(tables, table_name):
+            for row in tables.get(table_name, ()):
                 artifact_ids = self._row_artifact_ids_for_provenance(table_name, row)
                 add(
                     row.get("provenance_id"),
@@ -2228,7 +2235,7 @@ class FoundationExtractor:
                     availability_code=str(row.get("feature_availability_code") or "available"),
                     notes="Generated from normalized table row provenance.",
                 )
-        for row in self._iter_table_rows_once(tables, "semantic_blocks"):
+        for row in tables.get("semantic_blocks", ()):
             add(
                 _stable_id("semantic_block", row.get("stage_name"), row.get("entity_type"), row.get("entity_key"), row.get("block_name")),
                 target_table="semantic_blocks",
@@ -2239,18 +2246,6 @@ class FoundationExtractor:
                 notes=str(row.get("preserved_reason") or "Preserved semantic block."),
             )
         return list(rows.values())
-
-    def _iter_table_rows_once(
-        self,
-        tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]],
-        table_name: str,
-    ) -> list[dict[str, Any]]:
-        rows = tables.get(table_name, [])
-        if isinstance(rows, list):
-            return rows
-        materialized = list(rows)
-        tables[table_name] = materialized
-        return materialized
 
     def _row_artifact_ids_for_provenance(self, table_name: str, row: dict[str, Any]) -> list[str]:
         if table_name == "run_stage_patch_maps":
@@ -2336,8 +2331,7 @@ class FoundationExtractor:
 
     def _semantic_block_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        rows = []
+    ) -> Iterable[dict[str, Any]]:
         block_names = ("source_refs", "null_reason", "progressive_metadata")
         for stage in stages:
             for entity_type, key_field, records in self._semantic_block_sources(stage.name):
@@ -2348,26 +2342,23 @@ class FoundationExtractor:
                         if payload is None:
                             continue
                         landing = _semantic_block_landing(entity_type, block_name)
-                        rows.append(
-                            {
-                                "design_id": design_id,
-                                "run_id": run_id,
-                                "stage_name": stage.name,
-                                "entity_type": entity_type,
-                                "entity_key": entity_key,
-                                "block_name": block_name,
-                                "block_payload": json_value(_semantic_block_payload(payload, entity_type, block_name, stage.name)),
-                                "source_schema_version": "legacy_jsonl_iccd_full_v1",
-                                "source_doc": _semantic_block_source_doc(entity_type),
-                                "source_field_path": f"{_semantic_block_source_doc(entity_type)}:{block_name}",
-                                "preserved_reason": "Preserved legacy nested semantics during parquet normalization.",
-                                "normalized_status": landing["normalized_status"],
-                                "future_normalization_plan": landing["future_normalization_plan"],
-                                "target_table": landing["target_table"],
-                                "target_key": landing["target_key"],
-                            }
-                        )
-        return rows
+                        yield {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "entity_type": entity_type,
+                            "entity_key": entity_key,
+                            "block_name": block_name,
+                            "block_payload": json_value(_semantic_block_payload(payload, entity_type, block_name, stage.name)),
+                            "source_schema_version": "legacy_jsonl_iccd_full_v1",
+                            "source_doc": _semantic_block_source_doc(entity_type),
+                            "source_field_path": f"{_semantic_block_source_doc(entity_type)}:{block_name}",
+                            "preserved_reason": "Preserved legacy nested semantics during parquet normalization.",
+                            "normalized_status": landing["normalized_status"],
+                            "future_normalization_plan": landing["future_normalization_plan"],
+                            "target_table": landing["target_table"],
+                            "target_key": landing["target_key"],
+                        }
 
     @staticmethod
     def _build_migration_report() -> dict[str, Any]:
@@ -2488,8 +2479,7 @@ class FoundationExtractor:
         stage_ids: dict[str, str],
         canonical_grid: dict[str, Any],
         canonical_maps: CanonicalMaps,
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage_name, stage_maps in canonical_maps.items():
             for category, channels in stage_maps.items():
                 for channel, matrix in channels.items():
@@ -2499,20 +2489,17 @@ class FoundationExtractor:
                         value = _matrix_value(matrix, row, col)
                         if value is None:
                             continue
-                        out.append(
-                            {
-                                "design_id": design_id,
-                                "run_id": run_id,
-                                "stage_id": stage_ids.get(stage_name),
-                                "stage_name": stage_name,
-                                "patch_id": int(patch.get("patch_id") or 0),
-                                "category": category,
-                                "channel": channel,
-                                "value": value,
-                                "provenance_id": _stable_id("map", stage_name, category, channel),
-                            }
-                        )
-        return out
+                        yield {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_id": stage_ids.get(stage_name),
+                            "stage_name": stage_name,
+                            "patch_id": int(patch.get("patch_id") or 0),
+                            "category": category,
+                            "channel": channel,
+                            "value": value,
+                            "provenance_id": _stable_id("map", stage_name, category, channel),
+                        }
 
     def _patch_feature_rows(
         self, design_id: str, run_id: str, stage_ids: dict[str, str], stages: list[StageInfo]
