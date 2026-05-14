@@ -8,6 +8,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,7 @@ class FoundationExtractor:
         self._lef_macros: dict[str, LefMacro] = {}
         self._lef_layers: dict[str, LefLayer] = {}
         self._lef_vias: dict[str, LefVia] = {}
+        self._tech_records: dict[str, list[dict[str, Any]]] = {"layers": [], "vias": [], "cells": []}
 
     def extract(
         self,
@@ -717,33 +719,38 @@ class FoundationExtractor:
             "lef": bool(self._lef_macros or self._lef_layers or self._lef_vias),
             "liberty": False,
         }
-        write_json(self.foundation_dir / "vectors" / "tech" / "layers.json", layer_records)
-        write_json(self.foundation_dir / "vectors" / "tech" / "cells.json", cell_records)
-        write_json(self.foundation_dir / "vectors" / "tech" / "vias.json", via_records)
-        write_json(
-            self.foundation_dir / "vectors" / "tech" / "tech_summary.json",
-            {
-                "schema_version": "iccd_full_v1.tech.v1",
-                "profile": self.profile,
-                "source_coverage": source_coverage,
-                "counts": {
-                    "layer_count": len(layer_records),
-                    "routing_layer_count": routing_layer_count,
-                    "cut_layer_count": cut_layer_count,
-                    "cell_count": len(cell_records),
-                    "via_count": len(via_records),
-                    "stage_count": len(stages),
-                },
-                "canonical_grid_ref": "foundation_data/ecc/canonical_grid.json",
-                "milestones": {
-                    "m1": "available" if any(source_coverage[key] for key in ("def_tracks", "rt_log_layers", "def_components", "def_vias")) else "missing",
-                    "m2": "available" if source_coverage["lef"] else "planned",
-                    "liberty": "reserved_not_parsed",
-                },
-                "quality_flags": [],
-                "source_refs": {"lef": None, "liberty": None},
+        self._tech_records = {
+            "layers": layer_records,
+            "cells": cell_records,
+            "vias": via_records,
+        }
+        tech_summary = {
+            "schema_version": "iccd_full_v1.tech.v1",
+            "profile": self.profile,
+            "source_coverage": source_coverage,
+            "counts": {
+                "layer_count": len(layer_records),
+                "routing_layer_count": routing_layer_count,
+                "cut_layer_count": cut_layer_count,
+                "cell_count": len(cell_records),
+                "via_count": len(via_records),
+                "stage_count": len(stages),
             },
-        )
+            "canonical_grid_ref": "foundation_data/ecc/canonical_grid.json",
+            "milestones": {
+                "m1": "available" if any(source_coverage[key] for key in ("def_tracks", "rt_log_layers", "def_components", "def_vias")) else "missing",
+                "m2": "available" if source_coverage["lef"] else "planned",
+                "liberty": "reserved_not_parsed",
+            },
+            "quality_flags": [],
+            "source_refs": {"lef": None, "liberty": None},
+        }
+        write_json(self.foundation_dir / "tech_summary.json", tech_summary)
+        if self._legacy_debug_enabled:
+            write_json(self.foundation_dir / "vectors" / "tech" / "layers.json", layer_records)
+            write_json(self.foundation_dir / "vectors" / "tech" / "cells.json", cell_records)
+            write_json(self.foundation_dir / "vectors" / "tech" / "vias.json", via_records)
+            write_json(self.foundation_dir / "vectors" / "tech" / "tech_summary.json", tech_summary)
         self._mark("tech", "layers", "available" if layer_records else "missing", "" if layer_records else "missing_def_or_rt_layers")
         self._mark("tech", "cells", "available" if cell_records else "missing", "" if cell_records else "missing_def_components")
         self._mark("tech", "vias", "available" if via_records else "missing", "" if via_records else "missing_def_vias")
@@ -1407,8 +1414,8 @@ class FoundationExtractor:
                 "large_design_mode: detailed wire/timing delta tables are intentionally degraded; "
                 "core progressive patch features and route labels are preserved"
             )
-        tech_layers = _records_by_name(self.foundation_dir / "vectors" / "tech" / "layers.json")
-        tech_vias = _records_by_name(self.foundation_dir / "vectors" / "tech" / "vias.json")
+        tech_layers = {str(item.get("name")): item for item in self._tech_records.get("layers", []) if item.get("name") is not None}
+        tech_vias = {str(item.get("name")): item for item in self._tech_records.get("vias", []) if item.get("name") is not None}
         net_segment_index: dict[str, int] = {}
         for net in parsed_def.nets:
             for wire in net.wires:
@@ -1978,7 +1985,7 @@ class FoundationExtractor:
         canonical_maps: CanonicalMaps,
         labels: dict[str, Any],
         metrics: dict[str, Any],
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]]:
         design_name = str(parameters.get("Design") or parameters.get("design") or "unknown")
         top_module = str(parameters.get("Top module") or parameters.get("top_module") or design_name)
         pdk = str(parameters.get("PDK") or parameters.get("pdk") or "unknown")
@@ -1986,9 +1993,7 @@ class FoundationExtractor:
         design_id = _stable_id("design", pdk, design_name, top_module, logical_source_hash)
         run_id = _stable_id("run", design_id, parameters, self._source_signature())
         stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
-        large_design_mode = bool(getattr(self, "_large_design_mode", False))
-
-        tables: dict[str, list[dict[str, Any]]] = {
+        tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]] = {
             "designs": [
                 {
                     "design_id": design_id,
@@ -2029,7 +2034,7 @@ class FoundationExtractor:
             ],
             "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids, labels, metrics),
             "provenance": [],
-            "semantic_blocks": [] if large_design_mode else self._semantic_block_rows(design_id, run_id, stages),
+            "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
             "patches": self._patch_table_rows(design_id, canonical_grid),
             "patch_neighbors": self._patch_neighbor_rows(design_id, canonical_grid),
             "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
@@ -2039,23 +2044,23 @@ class FoundationExtractor:
             "tech_layers": self._tech_layer_rows(design_id),
             "tech_vias": self._tech_via_rows(design_id),
             "library_cells": self._library_cell_rows(design_id),
-            "patch_entity_refs": [] if large_design_mode else self._patch_entity_ref_rows(design_id, run_id, stages),
+            "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
             "instances": self._instance_rows(design_id, stages),
-            "instance_stage_state": [] if large_design_mode else self._instance_stage_state_rows(design_id, run_id, stages),
+            "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
             "pins": self._pin_rows(design_id, stages),
-            "pin_stage_state": [] if large_design_mode else self._pin_stage_state_rows(design_id, run_id, stages),
+            "pin_stage_state": self._pin_stage_state_rows(design_id, run_id, stages),
             "nets": self._net_rows(design_id, stages),
             "net_terminals": self._net_terminal_rows(design_id, run_id, stages),
-            "wire_segments": [] if large_design_mode else self._wire_segment_rows(design_id, run_id, stages),
-            "wire_patch_intersections": [] if large_design_mode else self._wire_patch_intersection_rows(design_id, run_id, stages),
+            "wire_segments": self._wire_segment_rows(design_id, run_id, stages),
+            "wire_patch_intersections": self._wire_patch_intersection_rows(design_id, run_id, stages),
             "routing_vertices": self._routing_vertex_rows(design_id, run_id, stages),
             "routing_edges": self._routing_edge_rows(design_id, run_id, stages),
             "timing_paths": self._timing_path_rows(design_id, run_id, stages),
-            "timing_path_points": [] if large_design_mode else self._timing_path_point_rows(design_id, run_id, stages),
-            "timing_edges": [] if large_design_mode else self._timing_edge_rows(design_id, run_id, stages),
-            "timing_wire_path_nodes": [] if large_design_mode else self._timing_wire_path_node_rows(design_id, run_id, stages),
+            "timing_path_points": self._timing_path_point_rows(design_id, run_id, stages),
+            "timing_edges": self._timing_edge_rows(design_id, run_id, stages),
+            "timing_wire_path_nodes": self._timing_wire_path_node_rows(design_id, run_id, stages),
             "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
-            "stage_deltas": [] if large_design_mode else self._stage_delta_rows(design_id, run_id, stages),
+            "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
         }
         tables["provenance"] = self._provenance_rows(tables)
         return tables
@@ -2156,7 +2161,7 @@ class FoundationExtractor:
                 )
         return rows
 
-    def _provenance_rows(self, tables: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    def _provenance_rows(self, tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]]) -> list[dict[str, Any]]:
         rows: dict[str, dict[str, Any]] = {
             "foundation_contract": {
                 "provenance_id": "foundation_contract",
@@ -2210,7 +2215,7 @@ class FoundationExtractor:
             )
 
         for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas"):
-            for row in tables.get(table_name, []):
+            for row in self._iter_table_rows_once(tables, table_name):
                 artifact_ids = self._row_artifact_ids_for_provenance(table_name, row)
                 add(
                     row.get("provenance_id"),
@@ -2223,7 +2228,7 @@ class FoundationExtractor:
                     availability_code=str(row.get("feature_availability_code") or "available"),
                     notes="Generated from normalized table row provenance.",
                 )
-        for row in tables.get("semantic_blocks", []):
+        for row in self._iter_table_rows_once(tables, "semantic_blocks"):
             add(
                 _stable_id("semantic_block", row.get("stage_name"), row.get("entity_type"), row.get("entity_key"), row.get("block_name")),
                 target_table="semantic_blocks",
@@ -2234,6 +2239,18 @@ class FoundationExtractor:
                 notes=str(row.get("preserved_reason") or "Preserved semantic block."),
             )
         return list(rows.values())
+
+    def _iter_table_rows_once(
+        self,
+        tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]],
+        table_name: str,
+    ) -> list[dict[str, Any]]:
+        rows = tables.get(table_name, [])
+        if isinstance(rows, list):
+            return rows
+        materialized = list(rows)
+        tables[table_name] = materialized
+        return materialized
 
     def _row_artifact_ids_for_provenance(self, table_name: str, row: dict[str, Any]) -> list[str]:
         if table_name == "run_stage_patch_maps":
@@ -2635,68 +2652,55 @@ class FoundationExtractor:
                 )
         return out
 
-    def _tech_layer_rows(self, design_id: str) -> list[dict[str, Any]]:
-        out = []
-        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "layers.json"):
+    def _tech_layer_rows(self, design_id: str) -> Iterable[dict[str, Any]]:
+        for record in self._tech_records.get("layers", []):
             identity = record.get("identity") or {}
             routing = record.get("routing_properties") or {}
-            out.append(
-                {
-                    "design_id": design_id,
-                    "layer_name": str(record.get("name") or identity.get("name")),
-                    "layer_index": identity.get("order"),
-                    "routing_direction": routing.get("preferred_direction"),
-                    "pitch": routing.get("pitch"),
-                    "default_width": routing.get("width"),
-                    "metadata": json_value(record),
-                }
-            )
-        return out
+            yield {
+                "design_id": design_id,
+                "layer_name": str(record.get("name") or identity.get("name")),
+                "layer_index": identity.get("order"),
+                "routing_direction": routing.get("preferred_direction"),
+                "pitch": routing.get("pitch"),
+                "default_width": routing.get("width"),
+                "metadata": json_value(record),
+            }
 
-    def _tech_via_rows(self, design_id: str) -> list[dict[str, Any]]:
-        out = []
-        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "vias.json"):
+    def _tech_via_rows(self, design_id: str) -> Iterable[dict[str, Any]]:
+        for record in self._tech_records.get("vias", []):
             stack = record.get("layer_stack") or {}
-            out.append(
-                {
-                    "design_id": design_id,
-                    "via_name": str(record.get("name") or (record.get("identity") or {}).get("via_key")),
-                    "cut_layer": stack.get("cut_layer"),
-                    "lower_layer": stack.get("bottom_layer"),
-                    "upper_layer": stack.get("top_layer"),
-                    "is_default": (record.get("identity") or {}).get("via_type") == "default",
-                    "metadata": json_value(record),
-                }
-            )
-        return out
+            yield {
+                "design_id": design_id,
+                "via_name": str(record.get("name") or (record.get("identity") or {}).get("via_key")),
+                "cut_layer": stack.get("cut_layer"),
+                "lower_layer": stack.get("bottom_layer"),
+                "upper_layer": stack.get("top_layer"),
+                "is_default": (record.get("identity") or {}).get("via_type") == "default",
+                "metadata": json_value(record),
+            }
 
-    def _library_cell_rows(self, design_id: str) -> list[dict[str, Any]]:
-        out = []
-        for record in _read_json_records(self.foundation_dir / "vectors" / "tech" / "cells.json"):
+    def _library_cell_rows(self, design_id: str) -> Iterable[dict[str, Any]]:
+        for record in self._tech_records.get("cells", []):
             classification = record.get("classification") or {}
             physical = record.get("physical_properties") or {}
             pins = record.get("pin_summary") or {}
-            out.append(
-                {
-                    "design_id": design_id,
-                    "master": str(record.get("name") or (record.get("identity") or {}).get("cell_key")),
-                    "cell_class": classification.get("cell_class"),
-                    "physical_class": classification.get("physical_class"),
-                    "width": physical.get("width"),
-                    "height": physical.get("height"),
-                    "area": physical.get("area"),
-                    "pin_count": pins.get("pin_count"),
-                    "is_sequential": classification.get("cell_class") == "sequential",
-                    "is_physical_only": (record.get("identity") or {}).get("is_physical_only"),
-                    "metadata": json_value(record),
-                }
-            )
-        return out
+            yield {
+                "design_id": design_id,
+                "master": str(record.get("name") or (record.get("identity") or {}).get("cell_key")),
+                "cell_class": classification.get("cell_class"),
+                "physical_class": classification.get("physical_class"),
+                "width": physical.get("width"),
+                "height": physical.get("height"),
+                "area": physical.get("area"),
+                "pin_count": pins.get("pin_count"),
+                "is_sequential": classification.get("cell_class") == "sequential",
+                "is_physical_only": (record.get("identity") or {}).get("is_physical_only"),
+                "metadata": json_value(record),
+            }
 
     def _patch_entity_ref_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for entity, key_field, records in (
                 ("instance", "name", self._records_for_stage("instances", stage.name)),
@@ -2713,20 +2717,17 @@ class FoundationExtractor:
                     if primary is not None and primary not in patch_ids:
                         patch_ids = [primary, *patch_ids]
                     for patch_id in patch_ids:
-                        out.append(
-                            {
-                                "design_id": design_id,
-                                "run_id": run_id,
-                                "stage_name": stage.name,
-                                "patch_id": int(patch_id),
-                                "entity_type": entity,
-                                "entity_key": str(record.get(key_field) or record.get("id")),
-                                "relation": "primary" if patch_id == primary else "overlap",
-                                "weight": None,
-                                "is_primary": patch_id == primary,
-                            }
-                        )
-        return out
+                        yield {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "stage_name": stage.name,
+                            "patch_id": int(patch_id),
+                            "entity_type": entity,
+                            "entity_key": str(record.get(key_field) or record.get("id")),
+                            "relation": "primary" if patch_id == primary else "overlap",
+                            "weight": None,
+                            "is_primary": patch_id == primary,
+                        }
 
     def _instance_rows(self, design_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
         by_key = {}
@@ -2878,61 +2879,53 @@ class FoundationExtractor:
 
     def _wire_segment_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("wires", stage.name):
                 identity = record.get("identity") or {}
                 geometry = record.get("geometry") or {}
                 start = geometry.get("start") or {}
                 end = geometry.get("end") or {}
-                out.append(
-                    {
-                        "design_id": design_id,
-                        "run_id": run_id,
-                        "stage_name": stage.name,
-                        "wire_segment_key": str(record.get("wire_key") or identity.get("wire_key")),
-                        "net_key": identity.get("net_key"),
-                        "source_section": identity.get("source_section"),
-                        "segment_index": identity.get("segment_index"),
-                        "layer": geometry.get("layer"),
-                        "start_x": start.get("x"),
-                        "start_y": start.get("y"),
-                        "end_x": end.get("x"),
-                        "end_y": end.get("y"),
-                        "bbox_json": json_value(geometry.get("bbox") or {}),
-                        "length": geometry.get("length"),
-                        "direction": geometry.get("direction"),
-                        "via_name": (record.get("via_context") or {}).get("via_name"),
-                        "summary_json": json_value(_wire_segment_summary(record)),
-                    }
-                )
-        return out
+                yield {
+                    "design_id": design_id,
+                    "run_id": run_id,
+                    "stage_name": stage.name,
+                    "wire_segment_key": str(record.get("wire_key") or identity.get("wire_key")),
+                    "net_key": identity.get("net_key"),
+                    "source_section": identity.get("source_section"),
+                    "segment_index": identity.get("segment_index"),
+                    "layer": geometry.get("layer"),
+                    "start_x": start.get("x"),
+                    "start_y": start.get("y"),
+                    "end_x": end.get("x"),
+                    "end_y": end.get("y"),
+                    "bbox_json": json_value(geometry.get("bbox") or {}),
+                    "length": geometry.get("length"),
+                    "direction": geometry.get("direction"),
+                    "via_name": (record.get("via_context") or {}).get("via_name"),
+                    "summary_json": json_value(_wire_segment_summary(record)),
+                }
 
     def _wire_patch_intersection_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("wires", stage.name):
                 key = str(record.get("wire_key") or (record.get("identity") or {}).get("wire_key"))
                 for item in record.get("patch_intersections") or []:
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "wire_segment_key": key,
-                            "patch_id": int(item.get("patch_id") or 0),
-                            "intersect_length": item.get("intersect_length") or item.get("length"),
-                            "area_proxy": item.get("area_proxy"),
-                            "layer": item.get("layer") or (record.get("geometry") or {}).get("layer"),
-                            "direction": item.get("direction") or (record.get("geometry") or {}).get("direction"),
-                            "is_primary": item.get("is_primary"),
-                            "capacity_contribution": item.get("capacity_contribution"),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "wire_segment_key": key,
+                        "patch_id": int(item.get("patch_id") or 0),
+                        "intersect_length": item.get("intersect_length") or item.get("length"),
+                        "area_proxy": item.get("area_proxy"),
+                        "layer": item.get("layer") or (record.get("geometry") or {}).get("layer"),
+                        "direction": item.get("direction") or (record.get("geometry") or {}).get("direction"),
+                        "is_primary": item.get("is_primary"),
+                        "capacity_contribution": item.get("capacity_contribution"),
+                    }
 
     def _routing_vertex_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
@@ -3013,84 +3006,71 @@ class FoundationExtractor:
 
     def _timing_path_point_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, point in enumerate(record.get("path_points") or []):
                     center = point.get("center") or {}
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "path_id": path_id,
-                            "point_index": int(point.get("point_index") or index),
-                            "pin_key": point.get("pin_key"),
-                            "instance_key": point.get("instance_key"),
-                            "net_key": point.get("net_key"),
-                            "x": center.get("x") or point.get("x"),
-                            "y": center.get("y") or point.get("y"),
-                            "patch_id": point.get("patch_id"),
-                            "arrival": point.get("arrival"),
-                            "slew": point.get("slew"),
-                            "cap": point.get("cap"),
-                            "incr_delay": point.get("incr_delay"),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "path_id": path_id,
+                        "point_index": int(point.get("point_index") or index),
+                        "pin_key": point.get("pin_key"),
+                        "instance_key": point.get("instance_key"),
+                        "net_key": point.get("net_key"),
+                        "x": center.get("x") or point.get("x"),
+                        "y": center.get("y") or point.get("y"),
+                        "patch_id": point.get("patch_id"),
+                        "arrival": point.get("arrival"),
+                        "slew": point.get("slew"),
+                        "cap": point.get("cap"),
+                        "incr_delay": point.get("incr_delay"),
+                    }
 
-    def _timing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
-        out = []
+    def _timing_edge_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, edge in enumerate(record.get("timing_edges") or []):
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "path_id": path_id,
-                            "edge_id": int(edge.get("edge_id") or index),
-                            "from_pin_key": edge.get("from_pin_key"),
-                            "to_pin_key": edge.get("to_pin_key"),
-                            "edge_delay": edge.get("edge_delay"),
-                            "transition": edge.get("transition"),
-                            "net_key": edge.get("net_key"),
-                            "edge_kind_source": edge.get("edge_kind_source") or edge.get("source"),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "path_id": path_id,
+                        "edge_id": int(edge.get("edge_id") or index),
+                        "from_pin_key": edge.get("from_pin_key"),
+                        "to_pin_key": edge.get("to_pin_key"),
+                        "edge_delay": edge.get("edge_delay"),
+                        "transition": edge.get("transition"),
+                        "net_key": edge.get("net_key"),
+                        "edge_kind_source": edge.get("edge_kind_source") or edge.get("source"),
+                    }
 
     def _timing_wire_path_node_rows(
         self, design_id: str, run_id: str, stages: list[StageInfo]
-    ) -> list[dict[str, Any]]:
-        out = []
+    ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("timing_paths", stage.name):
                 path_id = str(record.get("path_key") or record.get("id"))
                 for index, node in enumerate(record.get("wire_path_nodes") or []):
-                    out.append(
-                        {
-                            "design_id": design_id,
-                            "run_id": run_id,
-                            "stage_name": stage.name,
-                            "path_id": path_id,
-                            "node_id": int(node.get("node_id") or index),
-                            "point": node.get("point") or node.get("Point"),
-                            "cap": node.get("cap") or node.get("Capacitance"),
-                            "slew": node.get("slew"),
-                            "incr_delay": node.get("incr_delay") or node.get("Incr"),
-                            "match_status": node.get("match_status"),
-                            "payload_json": json_value(node),
-                        }
-                    )
-        return out
+                    yield {
+                        "design_id": design_id,
+                        "run_id": run_id,
+                        "stage_name": stage.name,
+                        "path_id": path_id,
+                        "node_id": int(node.get("node_id") or index),
+                        "point": node.get("point") or node.get("Point"),
+                        "cap": node.get("cap") or node.get("Capacitance"),
+                        "slew": node.get("slew"),
+                        "incr_delay": node.get("incr_delay") or node.get("Incr"),
+                        "match_status": node.get("match_status"),
+                        "payload_json": json_value(node),
+                    }
 
-    def _stage_delta_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> list[dict[str, Any]]:
-        out = []
+    def _stage_delta_rows(self, design_id: str, run_id: str, stages: list[StageInfo]) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for entity, key_field, records in (
                 ("instance", "name", self._records_for_stage("instances", stage.name)),
@@ -3109,41 +3089,36 @@ class FoundationExtractor:
                     entity_key = str(record.get(key_field) or record.get("id"))
                     emitted = False
                     for metric_name, (change_type, value) in self._progressive_delta_metrics(progressive).items():
-                        out.append(
-                            {
-                                "design_id": design_id,
-                                "run_id": run_id,
-                                "from_stage": prev_stage,
-                                "to_stage": stage.name,
-                                "entity_type": entity,
-                                "entity_key": entity_key,
-                                "change_type": change_type,
-                                "metric_name": metric_name,
-                                "old_value": None,
-                                "new_value": None if value is None else str(value),
-                                "delta_value": value,
-                                "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, metric_name),
-                            }
-                        )
+                        yield {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "from_stage": prev_stage,
+                            "to_stage": stage.name,
+                            "entity_type": entity,
+                            "entity_key": entity_key,
+                            "change_type": change_type,
+                            "metric_name": metric_name,
+                            "old_value": None,
+                            "new_value": None if value is None else str(value),
+                            "delta_value": value,
+                            "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, metric_name),
+                        }
                         emitted = True
                     if not emitted:
-                        out.append(
-                            {
-                                "design_id": design_id,
-                                "run_id": run_id,
-                                "from_stage": prev_stage,
-                                "to_stage": stage.name,
-                                "entity_type": entity,
-                                "entity_key": entity_key,
-                                "change_type": "state_changed" if progressive.get("exists_in_prev_stage") is False else "metadata_changed",
-                                "metric_name": "available_from",
-                                "old_value": None,
-                                "new_value": str(progressive.get("available_from") or progressive.get("created_stage") or stage.name),
-                                "delta_value": None,
-                                "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, "available_from"),
-                            }
-                        )
-        return out
+                        yield {
+                            "design_id": design_id,
+                            "run_id": run_id,
+                            "from_stage": prev_stage,
+                            "to_stage": stage.name,
+                            "entity_type": entity,
+                            "entity_key": entity_key,
+                            "change_type": "state_changed" if progressive.get("exists_in_prev_stage") is False else "metadata_changed",
+                            "metric_name": "available_from",
+                            "old_value": None,
+                            "new_value": str(progressive.get("available_from") or progressive.get("created_stage") or stage.name),
+                            "delta_value": None,
+                            "provenance_id": _stable_id("stage_delta", stage.name, entity, entity_key, "available_from"),
+                        }
 
 
     @staticmethod
@@ -3439,8 +3414,8 @@ class FoundationExtractor:
             },
         )
         write_json(self.foundation_dir / "views" / "agent" / "qor_snapshot.json", {"metrics": metrics, "labels": labels})
-        top_patches = _top_patch_view_items(self.foundation_dir)
-        top_nets = _top_net_view_items(self.foundation_dir)
+        top_patches = _top_patch_view_items(self._vector_records)
+        top_nets = _top_net_view_items(self._vector_records)
         write_json(self.foundation_dir / "views" / "agent" / "top_patches.json", {"items": top_patches})
         write_json(self.foundation_dir / "views" / "agent" / "top_nets.json", {"items": top_nets})
         write_json(
@@ -6112,11 +6087,11 @@ def _summary_flow(flow: dict[str, Any], stages: list[StageInfo]) -> dict[str, An
 
 
 
-def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
-    rows = _read_jsonl_records(foundation_dir / "vectors" / "patches" / "route.jsonl")
+def _top_patch_view_items(vector_records: dict[str, dict[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    rows = list(vector_records.get("patches", {}).get("route") or [])
     if not rows:
-        for path in sorted((foundation_dir / "vectors" / "patches").glob("*.jsonl")):
-            rows = _read_jsonl_records(path)
+        for stage_name in sorted(vector_records.get("patches", {})):
+            rows = list(vector_records.get("patches", {}).get(stage_name) or [])
             if rows:
                 break
     items = []
@@ -6150,11 +6125,11 @@ def _top_patch_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: (item["score"] is not None, item["score"]), reverse=True)[:20]
 
 
-def _top_net_view_items(foundation_dir: Path) -> list[dict[str, Any]]:
-    rows = _read_jsonl_records(foundation_dir / "vectors" / "nets" / "route.jsonl")
+def _top_net_view_items(vector_records: dict[str, dict[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    rows = list(vector_records.get("nets", {}).get("route") or [])
     if not rows:
-        for path in sorted((foundation_dir / "vectors" / "nets").glob("*.jsonl")):
-            rows = _read_jsonl_records(path)
+        for stage_name in sorted(vector_records.get("nets", {})):
+            rows = list(vector_records.get("nets", {}).get(stage_name) or [])
             if rows:
                 break
     items = []

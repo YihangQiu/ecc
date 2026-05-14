@@ -8,6 +8,7 @@ from chipcompiler.data.foundation import FoundationExtractor
 import chipcompiler.data.foundation.extractor as extractor_module
 from chipcompiler.data.foundation.grid.canonical_grid import build_patch_grid
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
+from chipcompiler.data.foundation.writers import write_parquet
 
 
 
@@ -568,6 +569,13 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert not (foundation_dir / "maps").exists()
     assert not (foundation_dir / "labels" / "route_native_demand_capacity.jsonl").exists()
 
+    top_patches = json.loads((foundation_dir / "views" / "agent" / "top_patches.json").read_text(encoding="utf-8"))["items"]
+    top_nets = json.loads((foundation_dir / "views" / "agent" / "top_nets.json").read_text(encoding="utf-8"))["items"]
+    assert top_patches
+    assert top_nets
+    assert top_patches[0]["provenance"]["query"]["provenance_id"]
+    assert top_nets[0]["provenance"]["query"]["provenance_id"]
+
 
 def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_path: Path):
     import pyarrow.parquet as pq
@@ -653,6 +661,153 @@ def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_
     assert "route" not in progressive["allowed_input_stages"]["P3"]
     assert "run_patch_route_label_layers" in progressive["forbidden_input_tables"]
 
+def test_write_tables_passes_iterables_without_eager_list_materialization(tmp_path: Path, monkeypatch):
+    import chipcompiler.data.foundation.table_contract as table_contract_module
+
+    captured = {}
+
+    def fake_write_parquet(path: Path, records, *, columns=None, batch_size=2048):
+        if path.name == "timing_paths.parquet":
+            captured['records_type'] = type(records)
+            captured['records_is_list'] = isinstance(records, list)
+            captured['columns'] = tuple(columns or ())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'PAR1')
+        for _ in records:
+            return 1
+        return 0
+
+    monkeypatch.setattr(table_contract_module, 'write_parquet', fake_write_parquet)
+    monkeypatch.setattr(table_contract_module, 'file_sha256', lambda path: 'sha256')
+
+    def rows():
+        yield {
+            'design_id': 'design:gcd',
+            'run_id': 'run:gcd',
+            'stage_name': 'route',
+            'path_id': 'path:1',
+            'startpoint': '{}',
+            'endpoint': '{}',
+            'delay_type': 'max',
+            'slack': -0.2,
+            'arrival': 1.3,
+            'required': 1.1,
+            'path_group': 'clk',
+            'path_length_summary': '{}',
+            'criticality': 0.9,
+        }
+
+    registry = write_tables(tmp_path / 'registry', {'timing_paths': rows()})
+
+    assert captured['records_is_list'] is False
+    assert captured['records_type'] is not list
+    assert captured['columns'] == TABLE_SPECS['timing_paths'].columns
+    assert registry['timing_paths']['row_count'] == 1
+
+
+def test_write_parquet_writes_in_batches_when_batch_size_is_set(tmp_path: Path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    original_writer = pq.ParquetWriter
+    write_sizes: list[int] = []
+    close_calls: list[int] = []
+
+    class RecordingWriter:
+        def __init__(self, path, schema):
+            self._writer = original_writer(path, schema)
+
+        def write_table(self, table):
+            write_sizes.append(table.num_rows)
+            self._writer.write_table(table)
+
+        def close(self):
+            close_calls.append(1)
+            self._writer.close()
+
+    monkeypatch.setattr(pq, 'ParquetWriter', RecordingWriter)
+
+    rows = (
+        {
+            'design_id': 'design:gcd',
+            'run_id': 'run:gcd',
+            'stage_name': 'route',
+            'path_id': f'path:{idx}',
+            'startpoint': '{}',
+            'endpoint': '{}',
+            'delay_type': 'max',
+            'slack': float(-idx),
+            'arrival': float(idx),
+            'required': 1.1,
+            'path_group': 'clk',
+            'path_length_summary': '{}',
+            'criticality': 1.0,
+        }
+        for idx in range(5)
+    )
+
+    row_count = write_parquet(tmp_path / 'batched.parquet', rows, columns=TABLE_SPECS['timing_paths'].columns, batch_size=2)
+
+    assert row_count == 5
+    assert close_calls == [1]
+    assert write_sizes == [2, 2, 1]
+
+
+def test_write_parquet_handles_nullable_columns_when_later_batches_introduce_values(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    rows = [
+        {
+            "provenance_id": "p0",
+            "target_table": "run_stage_patch_features",
+            "target_key": "k0",
+            "target_field": "*",
+            "artifact_id": None,
+            "derived_from_artifact_ids": "[]",
+            "source_section": "foundation_extractor",
+            "source_index": None,
+            "availability_code": "available",
+            "null_reason": None,
+            "confidence": 1.0,
+            "notes": "first",
+        },
+        {
+            "provenance_id": "p1",
+            "target_table": "run_stage_patch_features",
+            "target_key": "k1",
+            "target_field": "*",
+            "artifact_id": None,
+            "derived_from_artifact_ids": "[]",
+            "source_section": "foundation_extractor",
+            "source_index": None,
+            "availability_code": "available",
+            "null_reason": None,
+            "confidence": 1.0,
+            "notes": "second",
+        },
+        {
+            "provenance_id": "p2",
+            "target_table": "run_stage_patch_features",
+            "target_key": "k2",
+            "target_field": "*",
+            "artifact_id": "artifact:2",
+            "derived_from_artifact_ids": "[\"artifact:2\"]",
+            "source_section": "foundation_extractor",
+            "source_index": None,
+            "availability_code": "available",
+            "null_reason": None,
+            "confidence": 1.0,
+            "notes": "third",
+        },
+    ]
+
+    path = tmp_path / "provenance-batched.parquet"
+    row_count = write_parquet(path, rows, columns=TABLE_SPECS["provenance"].columns, batch_size=2)
+
+    assert row_count == 3
+    written = pq.read_table(path).to_pylist()
+    assert written[2]["artifact_id"] == "artifact:2"
+
+
 def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     import pyarrow.parquet as pq
 
@@ -662,6 +817,34 @@ def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     table = pq.read_table(tmp_path / registry["timing_paths"]["path"])
     assert table.num_rows == 0
     assert table.schema.names == list(TABLE_SPECS["timing_paths"].columns)
+
+
+def test_default_contract_tech_tables_do_not_depend_on_legacy_vector_json(tmp_path: Path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    original_read_json_records = extractor_module._read_json_records
+
+    def fail_if_legacy_tech_json(path: Path):
+        normalized = path.as_posix()
+        if normalized.endswith('vectors/tech/layers.json') or normalized.endswith('vectors/tech/cells.json') or normalized.endswith('vectors/tech/vias.json'):
+            raise AssertionError(f'legacy tech json should not be read: {normalized}')
+        return original_read_json_records(path)
+
+    monkeypatch.setattr(extractor_module, '_read_json_records', fail_if_legacy_tech_json)
+
+    result = FoundationExtractor(ws, profile='iccd_full_v1').extract()
+    foundation_dir = result.foundation_dir
+    schema = json.loads((foundation_dir / 'schema.json').read_text(encoding='utf-8'))
+
+    assert not (foundation_dir / 'vectors').exists()
+
+    def read_rows(name: str) -> list[dict[str, object]]:
+        return pq.read_table(foundation_dir / schema['tables'][name]['path']).to_pylist()
+
+    assert read_rows('tech_layers')
+    assert read_rows('tech_vias')
+    assert read_rows('library_cells')
 
 
 def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):

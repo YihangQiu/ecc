@@ -280,9 +280,8 @@ def schema_document() -> dict[str, Any]:
 def write_tables(foundation_dir: Path, tables: Mapping[str, Iterable[Mapping[str, Any]]]) -> dict[str, Any]:
     registry: dict[str, Any] = {}
     for name, spec in TABLE_SPECS.items():
-        records = list(tables.get(name, []))
         table_path = foundation_dir / "tables" / f"{name}.parquet"
-        row_count = write_parquet(table_path, records, columns=spec.columns)
+        row_count = write_parquet(table_path, tables.get(name, ()), columns=spec.columns)
         registry[name] = {
             "path": f"tables/{name}.parquet",
             "format": "parquet",
