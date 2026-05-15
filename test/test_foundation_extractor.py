@@ -1363,6 +1363,7 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     }
 
     grid = json.loads((foundation_dir / "canonical_grid.json").read_text(encoding="utf-8"))
+
     assert grid["rows"] == 2
     assert grid["cols"] == 2
     assert grid["grid_source"] == "irt_gcell_info"
@@ -1537,6 +1538,47 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
     assert "route_reconstructed_demand_capacity_count" not in summary["labels"]
 
 
+
+
+def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path):
+    base_manifest = tmp_path / "design_base" / "bench" / "design" / "foundation_data" / "ecc" / "manifest.json"
+    base_manifest.parent.mkdir(parents=True)
+    static_tables = {"designs", "tech_layers", "tech_vias", "library_cells", "patches", "patch_neighbors"}
+    base_manifest.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    name: {
+                        "path": "tables/patches.parquet",
+                        "format": "parquet",
+                        "row_count": 4,
+                        "sha256": "0" * 64,
+                        "size_bytes": 123,
+                    }
+                    for name in static_tables
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws = _make_workspace(tmp_path)
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(
+        scope="variant_delta",
+        base_manifest_path=str(base_manifest),
+    )
+
+    manifest = json.loads((result.foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["storage_layout"] == "base_delta_v1"
+    assert manifest["base_manifest_path"] == str(base_manifest)
+    assert manifest["tables"]["patches"]["sources"] == [
+        {"root": "design_base", "path": "tables/patches.parquet"}
+    ]
+    assert manifest["tables"]["patches"]["sha256"] == "0" * 64
+    assert not (result.foundation_dir / "tables" / "patches.parquet").exists()
+    assert manifest["tables"]["run_patch_route_labels"]["sources"] == [
+        {"root": "variant_delta", "path": "tables/run_patch_route_labels.parquet"}
+    ]
 
 
 def test_iccd_full_v1_orders_instance_record_fields_like_documented_schema(tmp_path: Path):

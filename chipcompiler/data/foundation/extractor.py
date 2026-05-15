@@ -103,8 +103,15 @@ class FoundationExtractor:
         stages: Any = "all",
         include_raw_refs: bool = True,
         export_legacy_debug: bool = False,
+        scope: str = "full",
+        base_manifest_path: str | None = None,
     ) -> ExtractionResult:
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
+        scope = str(scope or "full").strip()
+        if scope not in {"full", "design_base", "variant_delta"}:
+            raise ValueError("scope must be one of: full, design_base, variant_delta")
+        if scope == "variant_delta" and not base_manifest_path:
+            raise ValueError("scope=variant_delta requires base_manifest_path")
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
         flow = self._read_json(self.workspace_dir / "home" / "flow.json")
@@ -116,6 +123,10 @@ class FoundationExtractor:
             "include_raw_refs": bool(include_raw_refs),
             "export_legacy_debug": bool(export_legacy_debug),
         }
+        if scope != "full":
+            options["scope"] = scope
+        if base_manifest_path:
+            options["base_manifest_path"] = str(base_manifest_path)
         self._legacy_debug_enabled = bool(export_legacy_debug)
         self._vector_records: dict[str, dict[str, list[dict[str, Any]]]] = {
             entity: {} for entity in _ENTITY_NAMES
@@ -155,6 +166,11 @@ class FoundationExtractor:
             metrics=metrics,
         )
         table_registry = write_tables(self.foundation_dir, table_rows)
+        table_registry = self._with_base_delta_sources(
+            table_registry,
+            scope=scope,
+            base_manifest_path=base_manifest_path,
+        )
         schema = schema_document()
         manifest = self._build_manifest(
             selected_stages,
@@ -199,6 +215,46 @@ class FoundationExtractor:
             manifest=manifest,
             summary=summary,
         )
+
+    def _with_base_delta_sources(
+        self, table_registry: dict[str, Any], *, scope: str, base_manifest_path: str | None
+    ) -> dict[str, Any]:
+        if scope == "full":
+            return table_registry
+        static_tables = {
+            "designs",
+            "tech_layers",
+            "tech_vias",
+            "library_cells",
+            "patches",
+            "patch_neighbors",
+        }
+        updated: dict[str, Any] = {}
+        base_tables: dict[str, Any] = {}
+        if scope == "variant_delta" and base_manifest_path:
+            try:
+                base_manifest = json.loads(Path(base_manifest_path).read_text(encoding="utf-8"))
+                raw_base_tables = base_manifest.get("tables") or {}
+                if isinstance(raw_base_tables, dict):
+                    base_tables = raw_base_tables
+            except FileNotFoundError:
+                base_tables = {}
+        for name, meta in table_registry.items():
+            source_root = "design_base" if scope == "design_base" or name in static_tables else "variant_delta"
+            if scope == "variant_delta" and source_root == "design_base" and not base_manifest_path:
+                source_root = "variant_delta"
+            if scope == "variant_delta" and source_root == "design_base" and name in base_tables:
+                local_path = self.foundation_dir / str(meta.get("path") or "")
+                if local_path.exists():
+                    local_path.unlink()
+                meta = dict(base_tables[name])
+            elif scope == "variant_delta" and source_root == "design_base":
+                raise ValueError(f"base manifest missing static foundation table: {name}")
+            updated[name] = {
+                **meta,
+                "sources": [{"root": source_root, "path": meta["path"]}],
+            }
+        return updated
 
     def _stage_infos(self, flow: dict[str, Any]) -> list[StageInfo]:
         stages = []
@@ -3235,6 +3291,14 @@ class FoundationExtractor:
             "schema_version": SCHEMA_VERSION,
             "contract_name": CONTRACT_NAME,
             "storage_format": STORAGE_FORMAT,
+            **(
+                {
+                    "storage_layout": "base_delta_v1",
+                    "base_manifest_path": options.get("base_manifest_path"),
+                }
+                if options.get("scope") in {"design_base", "variant_delta"}
+                else {}
+            ),
             "options": options,
             "workspace": str(self.workspace_dir),
             "source_workspace": str(self.workspace_dir),
