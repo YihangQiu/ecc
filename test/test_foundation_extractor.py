@@ -1203,6 +1203,43 @@ def test_extractor_jsonl_helper_streams_records(tmp_path: Path, monkeypatch):
     assert extractor_module._read_jsonl_records(path) == [{"a": 1}, {"a": 2}]
 
 
+
+def test_extractor_fails_when_available_tech_sources_materialize_empty_tables(tmp_path: Path, monkeypatch):
+    ws = _make_workspace(tmp_path)
+
+    monkeypatch.setattr(FoundationExtractor, "_tech_layer_rows", lambda self, design_id: iter(()))
+    monkeypatch.setattr(FoundationExtractor, "_tech_via_rows", lambda self, design_id: iter(()))
+    monkeypatch.setattr(FoundationExtractor, "_library_cell_rows", lambda self, design_id: iter(()))
+
+    with pytest.raises(RuntimeError, match="tech_layers.*source_available.*row_count=0"):
+        FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    quality = json.loads((ws / "foundation_data" / "ecc" / "quality.json").read_text(encoding="utf-8"))
+    assert quality["tech"]["materialization_counts"] == {
+        "tech_layers": 0,
+        "tech_vias": 0,
+        "library_cells": 0,
+    }
+    assert any("tech_layers" in warning for warning in quality["warnings"])
+    assert not (ws / "foundation_data" / "ecc" / "manifest.json").exists()
+
+
+def test_extractor_records_tech_materialization_counts(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract()
+    quality = json.loads((result.foundation_dir / "quality.json").read_text(encoding="utf-8"))
+
+    assert quality["tech"]["materialization_counts"] == {
+        "tech_layers": quality["tables"]["tech_layers"]["row_count"],
+        "tech_vias": quality["tables"]["tech_vias"]["row_count"],
+        "library_cells": quality["tables"]["library_cells"]["row_count"],
+    }
+    assert quality["tech"]["source_counts"]["record_layers"] > 0
+    assert quality["tech"]["source_counts"]["record_vias"] > 0
+    assert quality["tech"]["source_counts"]["record_cells"] > 0
+
+
 def test_default_contract_tech_tables_do_not_depend_on_legacy_vector_json(tmp_path: Path, monkeypatch):
     import pyarrow.parquet as pq
 

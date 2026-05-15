@@ -32,6 +32,7 @@ _STAGE_DIR_OVERRIDES = {
     ("legalization", "dreamplace"): "legalization_dreamplace",
 }
 _ENTITY_NAMES = ("instances", "nets", "pins", "wires", "routing_graphs", "timing_paths", "patches")
+_TECH_REQUIRED_TABLES = {"tech_layers": "layers", "tech_vias": "vias", "library_cells": "cells"}
 _DENSITY_MAP_KEY_ORDER = (
     "allcell_density",
     "macro_density",
@@ -170,6 +171,7 @@ class FoundationExtractor:
             name: {"row_count": meta["row_count"], "path": meta["path"]}
             for name, meta in table_registry.items()
         }
+        tech_materialization_errors = self._record_tech_materialization_quality(table_registry)
         self._quality["legacy_outputs"] = {
             "vectors_default_enabled": bool(export_legacy_debug),
             "maps_default_enabled": bool(export_legacy_debug),
@@ -184,6 +186,10 @@ class FoundationExtractor:
         if include_raw_refs:
             write_json(self.foundation_dir / "raw_refs" / "artifacts.json", {"artifacts": self._raw_refs})
         write_json(self.foundation_dir / "quality.json", self._quality)
+        if tech_materialization_errors:
+            raise RuntimeError(
+                "foundation tech materialization failed: " + "; ".join(tech_materialization_errors)
+            )
         write_json(self.foundation_dir / "manifest.json", manifest)
         self._write_views(summary, metrics, stage_index, public_labels, include_raw_refs=bool(include_raw_refs))
         if not export_legacy_debug:
@@ -2034,9 +2040,9 @@ class FoundationExtractor:
             "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
             "run_patch_route_labels": self._route_label_rows(design_id, run_id, labels),
             "run_patch_route_label_layers": self._route_label_layer_rows(design_id, run_id, labels),
-            "tech_layers": self._tech_layer_rows(design_id),
-            "tech_vias": self._tech_via_rows(design_id),
-            "library_cells": self._library_cell_rows(design_id),
+            "tech_layers": list(self._tech_layer_rows(design_id)),
+            "tech_vias": list(self._tech_via_rows(design_id)),
+            "library_cells": list(self._library_cell_rows(design_id)),
             "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
             "instances": self._instance_rows(design_id, stages),
             "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
@@ -3179,6 +3185,42 @@ class FoundationExtractor:
             path = self.foundation_dir / name
             if path.exists():
                 shutil.rmtree(path)
+
+    def _record_tech_materialization_quality(self, table_registry: dict[str, Any]) -> list[str]:
+        tech_quality = self._quality.setdefault("tech", {})
+        tech_quality["source_counts"] = {
+            "lef_layers": len(self._lef_layers),
+            "lef_vias": len(self._lef_vias),
+            "lef_macros": len(self._lef_macros),
+            "record_layers": len(self._tech_records.get("layers", [])),
+            "record_vias": len(self._tech_records.get("vias", [])),
+            "record_cells": len(self._tech_records.get("cells", [])),
+        }
+        tech_quality["materialization_counts"] = {
+            table_name: int((table_registry.get(table_name) or {}).get("row_count") or 0)
+            for table_name in _TECH_REQUIRED_TABLES
+        }
+        errors = self._tech_materialization_errors(tech_quality)
+        if errors:
+            self._quality.setdefault("warnings", []).extend(errors)
+        return errors
+
+    def _tech_materialization_errors(self, tech_quality: dict[str, Any]) -> list[str]:
+        availability = self._quality.get("availability", {}).get("tech", {})
+        source_counts = tech_quality.get("source_counts", {})
+        materialization_counts = tech_quality.get("materialization_counts", {})
+        errors = []
+        for table_name, record_key in _TECH_REQUIRED_TABLES.items():
+            row_count = int(materialization_counts.get(table_name) or 0)
+            source_key = f"record_{record_key}"
+            source_count = int(source_counts.get(source_key) or 0)
+            source_available = availability.get(record_key) == "available" or source_count > 0
+            if source_available and row_count == 0:
+                errors.append(
+                    f"{table_name}: source_available=True, {source_key}={source_count}, row_count=0"
+                )
+        return errors
+
 
     def _build_manifest(
         self,
