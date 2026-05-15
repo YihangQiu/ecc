@@ -5,10 +5,8 @@ import hashlib
 import json
 import re
 import shutil
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +120,6 @@ class FoundationExtractor:
         self._vector_records: dict[str, dict[str, list[dict[str, Any]]]] = {
             entity: {} for entity in _ENTITY_NAMES
         }
-        self._large_design_mode = False
         def_data = self._collect_def_data(selected_stages)
         rt_logs = self._collect_rt_logs(selected_stages)
         sta_reports = self._collect_sta_reports(selected_stages)
@@ -1751,19 +1748,6 @@ class FoundationExtractor:
             "route_native_demand_capacity_count": len(native_demand_capacity),
             "_route_native_demand_capacity_records": native_demand_capacity,
         }
-
-    @staticmethod
-    def _top_average_from_raw(route_maps: dict[str, list[list[float]]]) -> dict[str, float | None]:
-        def avg_top(matrix: list[list[float]] | None) -> float | None:
-            if not matrix:
-                return None
-            values = sorted((float(value) for row in matrix for value in row), reverse=True)
-            if not values:
-                return None
-            count = max(1, int(len(values) * 0.1))
-            return sum(values[:count]) / count
-
-        return {"horizontal": avg_top(route_maps.get("horizontal")), "vertical": avg_top(route_maps.get("vertical")), "union": avg_top(route_maps.get("union"))}
 
     def _build_stage_index(self, stages: list[StageInfo]) -> dict[str, Any]:
         index = {"stages": []}
@@ -3639,17 +3623,6 @@ def _is_clock_related(master: str, name: str) -> bool:
     return "clk" in lower or "clock" in lower or _cell_class(master, name) == "sequential"
 
 
-def _instance_center(instance: dict[str, Any]) -> dict[str, Any]:
-    center = instance.get("center")
-    if isinstance(center, dict):
-        return center
-    physical_state = instance.get("physical_state")
-    if isinstance(physical_state, dict) and isinstance(physical_state.get("center"), dict):
-        return physical_state["center"]
-    return {}
-
-
-
 def _attach_progressive_metadata(stages: list[StageInfo], instances_by_stage: dict[str, list[dict[str, Any]]]) -> None:
     first_seen: dict[str, str] = {}
     for stage in stages:
@@ -4314,17 +4287,6 @@ def _pin_route_context(
         "net_detour_ratio": None,
         "source": _workspace_relative_from_parsed_def(parsed_def),
     }
-
-
-def _grid_patches_from_stage_maps(stage_maps: dict[str, dict[str, MapMatrix]]) -> list[dict[str, int]]:
-    for category in ("density", "congestion", "rudy", "margin"):
-        for matrix in stage_maps.get(category, {}).values():
-            return [
-                {"patch_id": row * len(matrix[0]) + col, "row": row, "col": col}
-                for row in range(len(matrix))
-                for col in range(len(matrix[row]))
-            ]
-    return []
 
 
 def _attach_pin_connectivity_context(records: list[dict[str, Any]], net_by_name: dict[str, DefNet]) -> None:
@@ -5307,51 +5269,6 @@ def _read_text_maybe_gzip(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _computed_patch_maps_from_def(stage: str, canonical_grid: dict, parsed_def: DefData) -> StageMaps:
-    patches = canonical_grid.get("patches", [])
-    if not patches:
-        return {}
-    rows = int(canonical_grid.get("rows") or 0)
-    cols = int(canonical_grid.get("cols") or 0)
-    if rows <= 0 or cols <= 0:
-        return {}
-    components = _component_records_for_maps(parsed_def)
-    pins = _pin_points_for_maps(parsed_def)
-    nets = _net_bboxes_for_maps(parsed_def)
-    macros = [item for item in components if item["is_macro"]]
-    stdcells = [item for item in components if not item["is_macro"]]
-    density = {
-        "allcell_density": _patch_cell_density(patches, rows, cols, components),
-        "macro_density": _patch_cell_density(patches, rows, cols, macros),
-        "stdcell_density": _patch_cell_density(patches, rows, cols, stdcells),
-        "allcell_pin_density": _patch_pin_density(patches, rows, cols, pins),
-        "macro_pin_density": _patch_pin_density(
-            patches, rows, cols, [pin for pin in pins if pin.get("is_macro")]
-        ),
-        "stdcell_pin_density": _patch_pin_density(
-            patches, rows, cols, [pin for pin in pins if not pin.get("is_macro")]
-        ),
-        "allnet_density": _patch_net_density(patches, rows, cols, nets),
-        "local_net_density": _patch_net_density(
-            patches, rows, cols, [net for net in nets if net.get("overlap_count", 0) <= 1]
-        ),
-        "global_net_density": _patch_net_density(
-            patches, rows, cols, [net for net in nets if net.get("overlap_count", 0) > 1]
-        ),
-    }
-    rudy = {
-        "rudy_horizontal": _patch_rudy(patches, rows, cols, nets, "horizontal"),
-        "rudy_vertical": _patch_rudy(patches, rows, cols, nets, "vertical"),
-        "rudy_union": _patch_rudy(patches, rows, cols, nets, "union"),
-    }
-    margin = {
-        "horizontal": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "horizontal"),
-        "vertical": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "vertical"),
-        "union": _patch_margin(patches, rows, cols, macros, parsed_def.diearea, "union"),
-    }
-    return {"density": density, "rudy": rudy, "margin": margin}
-
-
 def _empty_matrix(rows: int, cols: int) -> list[list[float]]:
     return [[0.0 for _ in range(cols)] for _ in range(rows)]
 
@@ -5551,7 +5468,9 @@ def _patch_margin(
     return matrix
 
 
-def _bbox_area(bbox: dict[str, Any]) -> float:
+def _bbox_area(bbox: dict[str, Any] | None) -> float | None:
+    if not bbox:
+        return None
     return max(0.0, float(bbox["urx"]) - float(bbox["llx"])) * max(0.0, float(bbox["ury"]) - float(bbox["lly"]))
 
 
@@ -5820,18 +5739,6 @@ def _read_json_records(path: Path) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         return [payload]
     return []
-
-
-def _records_by_name(path: Path) -> dict[str, dict[str, Any]]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    if not isinstance(payload, list):
-        return {}
-    return {str(item.get("name")): item for item in payload if isinstance(item, dict) and item.get("name") is not None}
 
 
 def _null_reason_counts(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -6258,23 +6165,8 @@ def _scale_bbox(bbox: dict[str, float] | None, scale: float) -> dict[str, float]
     return {key: float(value) * scale for key, value in bbox.items()}
 
 
-def _layout_unit_scale(payload: dict[str, Any]) -> float:
-    raw_units = str(payload.get("units", "")).split()
-    if raw_units:
-        unit = _to_float(raw_units[0])
-        if unit is not None and unit > 0:
-            return unit
-    return 1.0
-
-
 def _def_unit_scale(parsed_def: DefData) -> float:
     return 1.0 / float(parsed_def.units) if parsed_def.units else 1.0
-
-
-def _bbox_area(bbox: dict[str, Any] | None) -> float | None:
-    if not bbox:
-        return None
-    return max(0.0, float(bbox["urx"]) - float(bbox["llx"])) * max(0.0, float(bbox["ury"]) - float(bbox["lly"]))
 
 
 def _get_nested(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
@@ -6338,21 +6230,6 @@ def _point_in_bbox(x: Any, y: Any, bbox: dict[str, Any]) -> bool:
     xf = float(x)
     yf = float(y)
     return float(bbox["llx"]) <= xf <= float(bbox["urx"]) and float(bbox["lly"]) <= yf <= float(bbox["ury"])
-
-
-def _segment_intersects_bbox(x1: Any, y1: Any, x2: Any, y2: Any, bbox: dict[str, Any]) -> bool:
-    if None in (x1, y1, x2, y2):
-        return False
-    sx1 = min(float(x1), float(x2))
-    sx2 = max(float(x1), float(x2))
-    sy1 = min(float(y1), float(y2))
-    sy2 = max(float(y1), float(y2))
-    return not (
-        sx2 < float(bbox["llx"])
-        or sx1 > float(bbox["urx"])
-        or sy2 < float(bbox["lly"])
-        or sy1 > float(bbox["ury"])
-    )
 
 
 def _ordered_timing_path_record(record: dict[str, Any], record_id: int) -> dict[str, Any]:
@@ -6758,16 +6635,6 @@ def _net_patch_anchor(
     }
 
 
-def _patch_center_distance(canonical_grid: dict, patch_id: int, point: Any) -> float:
-    if not isinstance(point, dict):
-        return 0.0
-    patch = next((item for item in canonical_grid.get("patches", []) if int(item.get("patch_id")) == int(patch_id)), None)
-    if not patch or not isinstance(patch.get("bbox"), dict):
-        return 0.0
-    center = _bbox_center(patch["bbox"])
-    return abs(float(center["x"]) - float(point["x"])) + abs(float(center["y"]) - float(point["y"]))
-
-
 def _net_timing_context(
     net_name: str,
     terminal_refs: list[dict[str, Any]],
@@ -6943,15 +6810,6 @@ def _route_analysis_for_net(
         "patch_attribution_refs_truncated": len(attribution_refs) > 64,
         "source": _workspace_relative_from_parsed_def(parsed_def),
     }
-
-
-def _route_label_union_demand_capacity(stage_dir: Path, canonical_grid: dict, patch_id: int) -> float | None:
-    labels = parse_route_native_demand_capacity_artifacts(stage_dir, canonical_grid).get("labels", [])
-    for label in labels:
-        if int(label.get("patch_id", -1)) == int(patch_id):
-            value = label.get("union_demand_capacity")
-            return float(value) if value is not None else None
-    return None
 
 
 def _route_label_demand_capacity_by_patch(stage_dir: Path, canonical_grid: dict) -> dict[int, float]:
