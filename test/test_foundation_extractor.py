@@ -1581,6 +1581,28 @@ def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path)
     ]
 
 
+def test_iccd_full_v1_design_id_is_stable_across_variant_parameters(tmp_path: Path):
+    ws_a = _make_workspace(tmp_path / "a")
+    ws_b = _make_workspace(tmp_path / "b")
+    params_b = json.loads((ws_b / "home" / "parameters.json").read_text(encoding="utf-8"))
+    params_b["Target density"] = 0.66
+    params_b["Target overflow"] = 0.06
+    params_b["Cell padding x"] = 800
+    (ws_b / "home" / "parameters.json").write_text(json.dumps(params_b), encoding="utf-8")
+    flow_b = json.loads((ws_b / "home" / "flow.json").read_text(encoding="utf-8"))
+    flow_b["steps"][1]["runtime"] = "0:0:42"
+    (ws_b / "home" / "flow.json").write_text(json.dumps(flow_b), encoding="utf-8")
+
+    result_a = FoundationExtractor(ws_a, profile="iccd_full_v1").extract()
+    result_b = FoundationExtractor(ws_b, profile="iccd_full_v1").extract()
+
+    manifest_a = json.loads((result_a.foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_b = json.loads((result_b.foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest_a["design_id"] == manifest_b["design_id"]
+    assert manifest_a["run_id"] != manifest_b["run_id"]
+
+
 def test_iccd_full_v1_orders_instance_record_fields_like_documented_schema(tmp_path: Path):
     ws = _make_workspace(tmp_path)
 

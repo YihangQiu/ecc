@@ -2025,7 +2025,7 @@ class FoundationExtractor:
         design_name = str(parameters.get("Design") or parameters.get("design") or "unknown")
         top_module = str(parameters.get("Top module") or parameters.get("top_module") or design_name)
         pdk = str(parameters.get("PDK") or parameters.get("pdk") or "unknown")
-        logical_source_hash = _stable_digest({"flow": flow.get("steps", []), "design": design_name, "top": top_module})
+        logical_source_hash = _stable_digest({"pdk": pdk, "design": design_name, "top": top_module})
         design_id = _stable_id("design", pdk, design_name, top_module, logical_source_hash)
         run_id = _stable_id("run", design_id, parameters, self._source_signature())
         stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
