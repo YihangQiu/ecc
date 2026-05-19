@@ -42,6 +42,14 @@ def _run_step_in_subprocess(workspace: Workspace, workspace_step: WorkspaceStep)
         traceback.print_exc()
 
 
+def _run_step_process_entry(step_runner, workspace: Workspace, workspace_step: WorkspaceStep) -> None:
+    try:
+        os.setsid()
+    except OSError:
+        traceback.print_exc()
+    step_runner(workspace, workspace_step)
+
+
 def _run_step_inline(workspace: Workspace, workspace_step: WorkspaceStep) -> None:
     """
     Execute a step in the current process so pdb/debugpy can attach normally.
@@ -173,7 +181,8 @@ class EngineFlow:
                  tool : str,
                  state : str | StateEnum,
                  runtime : str=None,
-                 peak_memory : float=None) -> bool:
+                 peak_memory : float=None,
+                 **info) -> bool:
         state_value = state.value if isinstance(state, StateEnum) else state
         for step in self.workspace.flow.data.get("steps", []):
             if step.get("name") == name and step.get("tool") == tool:
@@ -182,6 +191,9 @@ class EngineFlow:
                     step["runtime"] = runtime
                 if peak_memory is not None:
                     step["peak memory (mb)"] = peak_memory
+                for key, value in info.items():
+                    if value is not None:
+                        step[key] = value
 
                 self.save()
                 return True
@@ -325,10 +337,15 @@ class EngineFlow:
             
     def run_step(self,
                  workspace_step : WorkspaceStep | str,
-                 rerun : bool = False) -> StateEnum:
+                 rerun : bool = False,
+                 timeout_seconds : float | None = None) -> StateEnum:
         """
         run single step
         """
+        if timeout_seconds is not None:
+            timeout_seconds = float(timeout_seconds)
+            if timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive")
         if isinstance(workspace_step, str):
             workspace_step = self.get_workspace_step(workspace_step)
         if workspace_step is None:
@@ -349,8 +366,8 @@ class EngineFlow:
                        state=StateEnum.Ongoing)
 
         # run step in a subprocess
-        p = Process(target=_run_step_in_subprocess,
-                    args=(self.workspace, workspace_step))
+        p = Process(target=_run_step_process_entry,
+                    args=(_run_step_in_subprocess, self.workspace, workspace_step))
         p.start()
         step_log_file = workspace_step.log.get("file", "")
         logger.info("[DISPATCH] %s pid=%s log=%s", step_tag, p.pid,
@@ -363,7 +380,28 @@ class EngineFlow:
         tracker = Thread(target=_track_memory, daemon=True)
         tracker.start()
 
-        p.join()
+        timed_out = False
+        p.join(timeout=timeout_seconds)
+        if p.is_alive():
+            timed_out = True
+            self.workspace.logger.error(
+                "[TIMEOUT] %s exceeded timeout_seconds=%s; terminating pid=%s",
+                step_tag,
+                timeout_seconds,
+                p.pid,
+            )
+            try:
+                os.killpg(p.pid, 15)
+            except (OSError, ProcessLookupError):
+                p.terminate()
+            p.join(timeout=10.0)
+            if p.is_alive():
+                self.workspace.logger.error("[TIMEOUT] %s still alive; killing pid=%s", step_tag, p.pid)
+                try:
+                    os.killpg(p.pid, 9)
+                except (OSError, ProcessLookupError):
+                    p.kill()
+                p.join(timeout=5.0)
         tracker.join(timeout=1.0)
         
         # compute metrics
@@ -372,16 +410,21 @@ class EngineFlow:
         runtime = f"{int(elapsed // 3600)}:{int((elapsed % 3600) // 60)}:{int(elapsed % 60)}"
 
         # determine and save state
-        state = (StateEnum.Success
-                 if self.check_step_result(workspace_step=workspace_step)
-                 else StateEnum.Imcomplete)
+        state = (
+            StateEnum.Success
+            if not timed_out and self.check_step_result(workspace_step=workspace_step)
+            else StateEnum.Imcomplete
+        )
         self.set_state(name=workspace_step.name,
                        tool=workspace_step.tool,
                        state=state,
                        runtime=runtime,
-                       peak_memory=peak_memory_mb)
-        self.workspace.logger.info("[RESULT] %s state=%s runtime=%s mem=%sMB exitcode=%s",
-                    step_tag, state.value, runtime, peak_memory_mb, 0)
+                       peak_memory=peak_memory_mb,
+                       runtime_seconds=elapsed,
+                       timeout_seconds=timeout_seconds if timed_out else None,
+                       timed_out=timed_out if timed_out else None)
+        self.workspace.logger.info("[RESULT] %s state=%s runtime=%s mem=%sMB exitcode=%s timed_out=%s",
+                    step_tag, state.value, runtime, peak_memory_mb, p.exitcode, timed_out)
 
         # save layout snapshot on success
         if state == StateEnum.Success:

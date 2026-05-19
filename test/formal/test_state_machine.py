@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,7 @@ from chipcompiler.data import (
     WorkspaceStep,
 )
 from chipcompiler.data.workspace import Flow
+import chipcompiler.engine.flow as flow_module
 from chipcompiler.engine.flow import EngineFlow
 from chipcompiler.utility import Logger
 
@@ -319,3 +322,80 @@ def test_run_steps_stops_on_failure(tmp_path: Path, fail_index: int) -> None:
 
     for idx in executed:
         assert idx <= fail_index, f"Step {idx} was executed after failure at step {fail_index}"
+
+
+def test_run_step_timeout_terminates_child_process_and_marks_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws: Workspace = _make_workspace(tmp_path, num_steps=1)
+    flow: EngineFlow = EngineFlow(workspace=ws)
+    step_dir = os.path.join(ws.directory, "step_0_mock")
+    os.makedirs(os.path.join(step_dir, "output"), exist_ok=True)
+    ws_step = WorkspaceStep(
+        name="step_0",
+        tool="mock",
+        directory=step_dir,
+        output={"def": os.path.join(step_dir, "output", "design.def")},
+        log={"file": os.path.join(step_dir, "log.txt")},
+    )
+    flow.workspace_steps.append(ws_step)
+
+    def slow_step(_workspace, _workspace_step) -> None:
+        time.sleep(10)
+
+    monkeypatch.setattr(flow_module, "_run_step_in_subprocess", slow_step)
+
+    state = flow.run_step("step_0", rerun=True, timeout_seconds=0.1)
+
+    assert state == StateEnum.Imcomplete
+    step = flow.get_step(name="step_0", tool="mock")
+    assert step["state"] == StateEnum.Imcomplete.value
+    assert step.get("timeout_seconds") == 0.1
+    assert float(step.get("runtime_seconds", 0)) < 2.0
+
+
+def test_run_step_timeout_terminates_child_process_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws: Workspace = _make_workspace(tmp_path, num_steps=1)
+    flow: EngineFlow = EngineFlow(workspace=ws)
+    step_dir = os.path.join(ws.directory, "step_0_mock")
+    os.makedirs(os.path.join(step_dir, "output"), exist_ok=True)
+    child_pid_file = os.path.join(step_dir, "child.pid")
+    script = os.path.join(step_dir, "spawn_child.py")
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write(
+            "\n".join(
+                [
+                    "import pathlib, subprocess, sys, time",
+                    "pid_file = pathlib.Path(sys.argv[1])",
+                    "child = subprocess.Popen(['sleep', '10'])",
+                    "pid_file.write_text(str(child.pid), encoding='utf-8')",
+                    "time.sleep(10)",
+                ]
+            )
+        )
+    ws_step = WorkspaceStep(
+        name="step_0",
+        tool="mock",
+        directory=step_dir,
+        output={"def": os.path.join(step_dir, "output", "design.def")},
+        log={"file": os.path.join(step_dir, "log.txt")},
+        config={"script": script, "child_pid_file": child_pid_file},
+    )
+    flow.workspace_steps.append(ws_step)
+
+    def run_script(_workspace, workspace_step) -> None:
+        subprocess.run(
+            ["python3", workspace_step.config["script"], workspace_step.config["child_pid_file"]],
+            check=False,
+        )
+
+    monkeypatch.setattr(flow_module, "_run_step_in_subprocess", run_script)
+
+    state = flow.run_step("step_0", rerun=True, timeout_seconds=0.2)
+
+    assert state == StateEnum.Imcomplete
+    child_pid = int(Path(child_pid_file).read_text(encoding="utf-8"))
+    time.sleep(0.2)
+    assert subprocess.run(["ps", "-p", str(child_pid)], check=False, capture_output=True).returncode != 0
