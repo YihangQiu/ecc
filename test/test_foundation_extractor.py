@@ -13,6 +13,7 @@ import chipcompiler.data.foundation.extractor as extractor_module
 from chipcompiler.data.foundation.parsers.def_parser import parse_def
 from chipcompiler.data.foundation.grid.canonical_grid import build_patch_grid
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
+import chipcompiler.data.foundation.table_contract as table_contract_module
 from chipcompiler.data.foundation.writers import write_parquet
 
 
@@ -961,6 +962,48 @@ def test_parquet_registry_preserves_schema_for_empty_tables(tmp_path: Path):
     assert table.schema.names == list(TABLE_SPECS["timing_paths"].columns)
 
 
+
+def test_write_tables_can_skip_tables_with_registry_overrides(tmp_path: Path, monkeypatch):
+    written: list[str] = []
+
+    def fake_write_parquet(path: Path, records, *, columns=None, schema=None, batch_size=2048):
+        del records, columns, schema, batch_size
+        written.append(path.stem)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"PAR1")
+        return 0
+
+    monkeypatch.setattr(table_contract_module, "write_parquet", fake_write_parquet)
+    monkeypatch.setattr(table_contract_module, "file_sha256", lambda path: f"sha:{path.stem}")
+
+    override = {
+        "path": "../design_base/foundation_data/ecc/tables/patches.parquet",
+        "format": "parquet",
+        "row_count": 4,
+        "sha256": "0" * 64,
+        "size_bytes": 123,
+    }
+    registry = table_contract_module.write_tables(
+        tmp_path,
+        {},
+        skip_tables={"patches"},
+        registry_overrides={"patches": override},
+    )
+
+    assert "patches" not in written
+    assert not (tmp_path / "tables" / "patches.parquet").exists()
+    assert registry["patches"] == {
+        **override,
+        "primary_key": list(TABLE_SPECS["patches"].primary_key),
+        "partition_fields": list(TABLE_SPECS["patches"].partition_fields),
+    }
+    assert "designs" in written
+
+
+def test_write_tables_requires_registry_override_for_skipped_table(tmp_path: Path):
+    with pytest.raises(ValueError, match="missing registry override for skipped table: patches"):
+        table_contract_module.write_tables(tmp_path, {}, skip_tables={"patches"})
+
 def test_large_table_builders_return_lazy_iterables(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     extractor = FoundationExtractor(ws, profile="iccd_full_v1")
@@ -1540,7 +1583,16 @@ def test_iccd_full_v1_extractor_writes_full_contract(tmp_path: Path):
 
 
 
-def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path):
+def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path, monkeypatch):
+    written_tables: list[str] = []
+    original_write_parquet = table_contract_module.write_parquet
+
+    def recording_write_parquet(path: Path, records, *, columns=None, schema=None, batch_size=2048):
+        written_tables.append(path.stem)
+        return original_write_parquet(path, records, columns=columns, schema=schema, batch_size=batch_size)
+
+    monkeypatch.setattr(table_contract_module, "write_parquet", recording_write_parquet)
+
     base_manifest = tmp_path / "design_base" / "bench" / "design" / "foundation_data" / "ecc" / "manifest.json"
     base_manifest.parent.mkdir(parents=True)
     static_tables = {"designs", "tech_layers", "tech_vias", "library_cells", "patches", "patch_neighbors"}
@@ -1579,6 +1631,20 @@ def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path)
     assert manifest["tables"]["run_patch_route_labels"]["sources"] == [
         {"root": "variant_delta", "path": "tables/run_patch_route_labels.parquet"}
     ]
+    assert not (static_tables & set(written_tables))
+
+
+def test_iccd_full_v1_variant_delta_requires_static_tables_in_base_manifest(tmp_path: Path):
+    base_manifest = tmp_path / "design_base" / "foundation_data" / "ecc" / "manifest.json"
+    base_manifest.parent.mkdir(parents=True)
+    base_manifest.write_text(json.dumps({"tables": {"designs": {"path": "tables/designs.parquet"}}}), encoding="utf-8")
+    ws = _make_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="base manifest missing static foundation tables"):
+        FoundationExtractor(ws, profile="iccd_full_v1").extract(
+            scope="variant_delta",
+            base_manifest_path=str(base_manifest),
+        )
 
 
 def test_iccd_full_v1_design_id_is_stable_across_variant_parameters(tmp_path: Path):
@@ -2280,6 +2346,53 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
     assert "route_reconstructed_congestion" not in quality["availability"]["labels"]
     assert "route_reconstructed_demand_capacity" not in quality["availability"]["labels"]
 
+
+
+def test_source_signature_is_cached_until_reset(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    extractor = FoundationExtractor(ws, profile="iccd_full_v1")
+
+    first = extractor._source_signature()
+    new_file = ws / "place_dreamplace" / "output" / "new_after_cache.txt"
+    new_file.write_text("new", encoding="utf-8")
+    second = extractor._source_signature()
+
+    assert second == first
+    extractor._source_signature_cache = None
+    third = extractor._source_signature()
+    assert "place_dreamplace/output/new_after_cache.txt" in third
+
+
+def test_precomputed_timing_electrical_context_matches_legacy_helpers():
+    timing_paths = [
+        {
+            "id": "p0-p1",
+            "path_spatial": {"touched_patch_ids": [0, 1]},
+            "endpoints": {"startpoint": {"patch_id": 0}, "endpoint": {"patch_id": 1}},
+            "path_timing": {"slack": -0.2},
+            "path_electrical": {
+                "max_slew": 0.7,
+                "capacitance_list": [1.0, 2.0],
+                "slew_list": [0.3, 0.7],
+                "resistance_list": [4.0],
+                "incr_delay_list": [0.1, 0.2],
+            },
+        },
+        {
+            "id": "p2",
+            "path_points": [{"patch_id": 2}],
+            "endpoints": {"startpoint": {"patch_id": 2}, "endpoint": {"patch_id": 2}},
+            "slack": 0.1,
+            "path_electrical": {"capacitance_list": [3.0], "slew_list": [0.5]},
+        },
+    ]
+
+    precomputed = extractor_module._timing_electrical_contexts_by_patch(timing_paths, stage="place")
+
+    for patch_id in [0, 1, 2]:
+        timing_context, electrical_context = precomputed[patch_id]
+        assert timing_context == extractor_module._timing_for_patch(timing_paths, patch_id, "place")
+        assert electrical_context == extractor_module._electrical_for_patch(timing_paths, patch_id, "place")
 
 def test_iccd_full_v1_patch_records_follow_vec_patches_schema(tmp_path: Path):
     ws = _make_workspace(tmp_path)

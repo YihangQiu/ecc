@@ -31,6 +31,14 @@ _STAGE_DIR_OVERRIDES = {
 }
 _ENTITY_NAMES = ("instances", "nets", "pins", "wires", "routing_graphs", "timing_paths", "patches")
 _TECH_REQUIRED_TABLES = {"tech_layers": "layers", "tech_vias": "vias", "library_cells": "cells"}
+_BASE_DELTA_STATIC_TABLES = frozenset({
+    "designs",
+    "tech_layers",
+    "tech_vias",
+    "library_cells",
+    "patches",
+    "patch_neighbors",
+})
 _DENSITY_MAP_KEY_ORDER = (
     "allcell_density",
     "macro_density",
@@ -95,6 +103,7 @@ class FoundationExtractor:
         self._lef_layers: dict[str, LefLayer] = {}
         self._lef_vias: dict[str, LefVia] = {}
         self._tech_records: dict[str, list[dict[str, Any]]] = {"layers": [], "vias": [], "cells": []}
+        self._source_signature_cache: list[str] | None = None
 
     def extract(
         self,
@@ -112,6 +121,7 @@ class FoundationExtractor:
             raise ValueError("scope must be one of: full, design_base, variant_delta")
         if scope == "variant_delta" and not base_manifest_path:
             raise ValueError("scope=variant_delta requires base_manifest_path")
+        self._source_signature_cache = None
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
         flow = self._read_json(self.workspace_dir / "home" / "flow.json")
@@ -167,11 +177,24 @@ class FoundationExtractor:
             labels=labels,
             metrics=metrics,
         )
-        table_registry = write_tables(self.foundation_dir, table_rows)
+        base_tables = self._load_base_manifest_tables(base_manifest_path) if scope == "variant_delta" else {}
+        skip_tables = _BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset()
+        missing_static_tables = sorted(skip_tables - base_tables.keys())
+        if missing_static_tables:
+            raise ValueError(
+                "base manifest missing static foundation tables: " + ", ".join(missing_static_tables)
+            )
+        table_registry = write_tables(
+            self.foundation_dir,
+            table_rows,
+            skip_tables=skip_tables,
+            registry_overrides={name: base_tables[name] for name in skip_tables},
+        )
         table_registry = self._with_base_delta_sources(
             table_registry,
             scope=scope,
             base_manifest_path=base_manifest_path,
+            base_tables=base_tables,
         )
         schema = schema_document()
         manifest = self._build_manifest(
@@ -218,40 +241,37 @@ class FoundationExtractor:
             summary=summary,
         )
 
+    def _load_base_manifest_tables(self, base_manifest_path: str | None) -> dict[str, Any]:
+        if not base_manifest_path:
+            return {}
+        path = Path(base_manifest_path)
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"base manifest not found: {path}") from exc
+        tables = manifest.get("tables")
+        if not isinstance(tables, dict):
+            raise ValueError(f"base manifest missing tables object: {path}")
+        return tables
+
     def _with_base_delta_sources(
-        self, table_registry: dict[str, Any], *, scope: str, base_manifest_path: str | None
+        self,
+        table_registry: dict[str, Any],
+        *,
+        scope: str,
+        base_manifest_path: str | None,
+        base_tables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        del base_manifest_path
         if scope == "full":
             return table_registry
-        static_tables = {
-            "designs",
-            "tech_layers",
-            "tech_vias",
-            "library_cells",
-            "patches",
-            "patch_neighbors",
-        }
         updated: dict[str, Any] = {}
-        base_tables: dict[str, Any] = {}
-        if scope == "variant_delta" and base_manifest_path:
-            try:
-                base_manifest = json.loads(Path(base_manifest_path).read_text(encoding="utf-8"))
-                raw_base_tables = base_manifest.get("tables") or {}
-                if isinstance(raw_base_tables, dict):
-                    base_tables = raw_base_tables
-            except FileNotFoundError:
-                base_tables = {}
         for name, meta in table_registry.items():
-            source_root = "design_base" if scope == "design_base" or name in static_tables else "variant_delta"
-            if scope == "variant_delta" and source_root == "design_base" and not base_manifest_path:
-                source_root = "variant_delta"
-            if scope == "variant_delta" and source_root == "design_base" and name in base_tables:
-                local_path = self.foundation_dir / str(meta.get("path") or "")
-                if local_path.exists():
-                    local_path.unlink()
-                meta = dict(base_tables[name])
-            elif scope == "variant_delta" and source_root == "design_base":
-                raise ValueError(f"base manifest missing static foundation table: {name}")
+            if scope == "variant_delta" and name in _BASE_DELTA_STATIC_TABLES:
+                meta = dict((base_tables or {})[name])
+                source_root = "design_base"
+            else:
+                source_root = "design_base" if scope == "design_base" else "variant_delta"
             updated[name] = {
                 **meta,
                 "sources": [{"root": source_root, "path": meta["path"]}],
@@ -1664,6 +1684,7 @@ class FoundationExtractor:
         nets_by_primary = _index_by_primary(nets, lambda item: item.get("patch_anchor", {}).get("primary_patch_id"))
         nets_by_overlap = _index_by_many(nets, lambda item: item.get("geometry_proxy", {}).get("patch_ids") or [])
         timing_by_patch = _index_by_many(timing_paths, _timing_path_patch_ids)
+        timing_electrical_by_patch = _timing_electrical_contexts_by_patch(timing_paths, stage=stage)
 
         for patch in canonical_grid.get("patches", []):
             patch_id = int(patch["patch_id"])
@@ -1727,8 +1748,13 @@ class FoundationExtractor:
                 window_pin_density_values = [_value_from_patch_id(canonical_grid, density_maps, "pin_density", item) for item in neighbor_ids]
             window_rudy_values = [_value_from_patch_id(canonical_grid, rudy_maps, "rudy_union", item) for item in neighbor_ids]
             window_egr_values = [_matrix_value_for_patch_id(canonical_grid, congestion_maps.get("union"), item) for item in neighbor_ids]
-            timing_context = _timing_for_patch(timing_paths, patch_id, stage)
-            electrical_context = _electrical_for_patch(timing_paths, patch_id, stage)
+            timing_context, electrical_context = timing_electrical_by_patch.get(
+                patch_id,
+                (
+                    _timing_for_scoped_patch_paths([], patch_id, stage),
+                    _electrical_for_scoped_patch_paths([], patch_id, stage),
+                ),
+            )
             drc_context = {
                 "feature_role": "route_or_drc_analysis",
                 "available_for_training_input": False,
@@ -3461,7 +3487,7 @@ class FoundationExtractor:
             }
         self._quality["wires"] = wire_quality
 
-    def _source_signature(self) -> list[str]:
+    def _compute_source_signature(self) -> list[str]:
         paths = [self.workspace_dir / "home" / "flow.json", self.workspace_dir / "home" / "parameters.json"]
         for stage_dir in self.workspace_dir.glob("*_*"):
             if not stage_dir.is_dir():
@@ -3471,6 +3497,11 @@ class FoundationExtractor:
                 if root.exists():
                     paths.extend(path for path in root.rglob("*") if path.is_file())
         return [str(path.relative_to(self.workspace_dir)) for path in sorted(set(paths)) if path.exists()]
+
+    def _source_signature(self) -> list[str]:
+        if self._source_signature_cache is None:
+            self._source_signature_cache = self._compute_source_signature()
+        return list(self._source_signature_cache)
 
     def _write_views(self, summary: dict, metrics: dict, stage_index: dict, labels: dict, *, include_raw_refs: bool) -> None:
         write_json(
@@ -5966,8 +5997,9 @@ def _timing_path_patch_ids(record: dict[str, Any]) -> set[int]:
     return out
 
 
-def _timing_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
-    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
+def _timing_for_scoped_patch_paths(
+    scoped_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None
+) -> dict[str, Any]:
     slacks = [
         float(item.get("path_timing", {}).get("slack") if isinstance(item.get("path_timing"), dict) else item.get("slack"))
         for item in scoped_paths
@@ -5995,8 +6027,9 @@ def _timing_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None =
     }
 
 
-def _electrical_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
-    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
+def _electrical_for_scoped_patch_paths(
+    scoped_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None
+) -> dict[str, Any]:
     caps: list[float] = []
     slews: list[float] = []
     resistances: list[float] = []
@@ -6019,6 +6052,32 @@ def _electrical_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | No
         "max_slew": max(slews) if slews else None,
         "scope": "patch" if patch_id is not None else "stage",
         "source": f"vectors/timing_paths/{stage}.jsonl" if stage else None,
+    }
+
+
+def _timing_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
+    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
+    return _timing_for_scoped_patch_paths(scoped_paths, patch_id, stage)
+
+
+def _electrical_for_patch(timing_paths: list[dict[str, Any]], patch_id: int | None = None, stage: str | None = None) -> dict[str, Any]:
+    scoped_paths = timing_paths if patch_id is None else [item for item in timing_paths if patch_id in _timing_path_patch_ids(item)]
+    return _electrical_for_scoped_patch_paths(scoped_paths, patch_id, stage)
+
+
+def _timing_electrical_contexts_by_patch(
+    timing_paths: list[dict[str, Any]], *, stage: str | None
+) -> dict[int, tuple[dict[str, Any], dict[str, Any]]]:
+    by_patch: dict[int, list[dict[str, Any]]] = {}
+    for path in timing_paths:
+        for patch_id in _timing_path_patch_ids(path):
+            by_patch.setdefault(int(patch_id), []).append(path)
+    return {
+        patch_id: (
+            _timing_for_scoped_patch_paths(paths, patch_id, stage),
+            _electrical_for_scoped_patch_paths(paths, patch_id, stage),
+        )
+        for patch_id, paths in by_patch.items()
     }
 
 

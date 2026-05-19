@@ -452,9 +452,33 @@ def schema_document() -> dict[str, Any]:
     }
 
 
-def write_tables(foundation_dir: Path, tables: Mapping[str, Iterable[Mapping[str, Any]]]) -> dict[str, Any]:
+def _registry_entry_from_override(name: str, spec: TableSpec, override: Mapping[str, Any]) -> dict[str, Any]:
+    entry = dict(override)
+    required = {"path", "format", "row_count", "sha256", "size_bytes"}
+    missing = sorted(required - entry.keys())
+    if missing:
+        raise ValueError(f"registry override for skipped table {name} missing: {', '.join(missing)}")
+    entry["primary_key"] = list(spec.primary_key)
+    entry["partition_fields"] = list(spec.partition_fields)
+    return entry
+
+
+def write_tables(
+    foundation_dir: Path,
+    tables: Mapping[str, Iterable[Mapping[str, Any]]],
+    *,
+    skip_tables: set[str] | frozenset[str] | None = None,
+    registry_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    skip = frozenset(skip_tables or ())
+    overrides = registry_overrides or {}
     registry: dict[str, Any] = {}
     for name, spec in TABLE_SPECS.items():
+        if name in skip:
+            if name not in overrides:
+                raise ValueError(f"missing registry override for skipped table: {name}")
+            registry[name] = _registry_entry_from_override(name, spec, overrides[name])
+            continue
         table_path = foundation_dir / "tables" / f"{name}.parquet"
         row_count = write_parquet(table_path, tables.get(name, ()), columns=spec.columns, schema=spec.arrow_schema())
         registry[name] = {
