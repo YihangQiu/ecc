@@ -2127,6 +2127,57 @@ def test_iccd_full_v1_writes_patch_indexed_stage_maps_for_floorplan_place_cts(tm
     assert [item["value"] for item in floorplan_specific["maps"]["physical_only_cell_density"]["values"]] == [0.10416666666666667, 0.0, 0.0, 0.0]
     assert [item["value"] for item in floorplan_specific["maps"]["power_grid_density"]["values"]] == [0.125, 0.125, 0.0, 0.0]
 
+    import pyarrow.parquet as pq
+
+    map_rows = pq.read_table(
+        foundation_dir / "tables" / "run_stage_patch_maps.parquet",
+        columns=["stage_name", "patch_id", "category", "channel", "value"],
+    ).to_pylist()
+    floorplan_map_values = {
+        (row["channel"], row["patch_id"]): row["value"]
+        for row in map_rows
+        if row["stage_name"] == "Floorplan" and row["category"] == "floorplan"
+    }
+    assert set(channel for channel, _ in floorplan_map_values) == {
+        "io_pin_density",
+        "physical_only_cell_density",
+        "power_grid_density",
+        "pg_net_count",
+    }
+    assert [floorplan_map_values[("io_pin_density", patch_id)] for patch_id in range(4)] == [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+    ]
+    assert [
+        floorplan_map_values[("physical_only_cell_density", patch_id)]
+        for patch_id in range(4)
+    ] == [0.10416666666666667, 0.0, 0.0, 0.0]
+    assert [floorplan_map_values[("power_grid_density", patch_id)] for patch_id in range(4)] == [
+        0.125,
+        0.125,
+        0.0,
+        0.0,
+    ]
+    assert [floorplan_map_values[("pg_net_count", patch_id)] for patch_id in range(4)] == [
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+    ]
+
+    feature_rows = pq.read_table(
+        foundation_dir / "tables" / "run_stage_patch_features.parquet",
+        columns=["stage_name", "patch_id", "pg_net_count"],
+    ).to_pylist()
+    floorplan_pg_counts = {
+        row["patch_id"]: row["pg_net_count"]
+        for row in feature_rows
+        if row["stage_name"] == "Floorplan"
+    }
+    assert floorplan_pg_counts == {0: 1, 1: 1, 2: 0, 3: 0}
+
     place_density = json.loads((foundation_dir / "maps" / "place" / "density.json").read_text(encoding="utf-8"))
     assert set(place_density["maps"]) == set(floorplan_density["maps"])
     assert place_density["maps"]["allcell_density"]["values"][0] == {"patch_id": 0, "row": 0, "col": 0, "value": 10.0}

@@ -278,6 +278,7 @@ TABLE_SPECS: dict[str, TableSpec] = {
             "high_fanout_net_count",
             "clock_net_count",
             "reset_net_count",
+            "pg_net_count",
             "local_hpwl_sum",
             "local_hpwl_max",
             "local_hpwl_mean",

@@ -141,9 +141,11 @@ class FoundationExtractor:
         canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
         canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
         self._ensure_floorplan_maps(selected_stages, canonical_grid, canonical_maps, def_data)
+        self._ensure_floorplan_specific_maps(
+            selected_stages, canonical_grid, canonical_maps, def_data
+        )
         if export_legacy_debug:
             self._write_indexed_maps(canonical_maps, canonical_grid)
-            self._write_floorplan_specific_maps(selected_stages, canonical_grid, def_data)
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
         native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
         labels = self._write_labels(native_demand_capacity.get("labels", []), export_legacy_debug=export_legacy_debug)
@@ -598,10 +600,11 @@ class FoundationExtractor:
         ] = "available"
         self._quality.get("null_reason", {}).get("maps", {}).pop("Floorplan", None)
 
-    def _write_floorplan_specific_maps(
+    def _ensure_floorplan_specific_maps(
         self,
         stages: list[StageInfo],
         canonical_grid: dict,
+        canonical_maps: CanonicalMaps,
         def_data: dict[str, DefData],
     ) -> None:
         stage = next((item for item in stages if item.name == "Floorplan"), None)
@@ -612,26 +615,21 @@ class FoundationExtractor:
         maps = _floorplan_specific_patch_maps(parsed_def, canonical_grid, layout_physical_only_cells)
         if not maps:
             return
-        payload = {
-            "stage": "Floorplan",
-            "category": "floorplan",
-            "grid": {
-                "source": canonical_grid.get("grid_source"),
-                "rows": int(canonical_grid.get("rows", 0)),
-                "cols": int(canonical_grid.get("cols", 0)),
-            },
-            "maps": {
-                key: {"values": _matrix_to_patch_values(matrix, canonical_grid)}
-                for key, matrix in maps.items()
-            },
-        }
-        write_json(self.foundation_dir / "maps" / "Floorplan" / "floorplan.json", payload)
+        canonical_maps.setdefault("Floorplan", {})["floorplan"] = maps
         self._record_raw_ref(
             stage,
             parsed_def.path,
             "floorplan_specific_def_maps",
-            {"category": "floorplan", "keys": list(maps), "grid_source": canonical_grid.get("grid_source")},
+            {
+                "category": "floorplan",
+                "keys": list(maps),
+                "grid_source": canonical_grid.get("grid_source"),
+            },
         )
+        self._quality.setdefault("availability", {}).setdefault("maps", {})[
+            "Floorplan"
+        ] = "available"
+        self._quality.get("null_reason", {}).get("maps", {}).pop("Floorplan", None)
 
     def _floorplan_physical_only_cells_from_layout(self, stage: StageInfo) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1613,6 +1611,7 @@ class FoundationExtractor:
     ) -> list[dict[str, Any]]:
         records = []
         density_maps = stage_maps.get("density", {})
+        floorplan_maps = stage_maps.get("floorplan", {})
         congestion_maps = stage_maps.get("congestion", {})
         rudy_maps = stage_maps.get("rudy", {})
         margin_maps = stage_maps.get("margin", {})
@@ -1717,6 +1716,7 @@ class FoundationExtractor:
             net_density = _value_from_named_map(density_maps, "allnet_density", row, col)
             if net_density is None:
                 net_density = _value_from_named_map(density_maps, "net_density", row, col)
+            pg_net_count = _matrix_value(floorplan_maps.get("pg_net_count"), row, col)
             rudy_union = _value_from_named_map(rudy_maps, "rudy_union", row, col)
             egr_horizontal = _matrix_value(congestion_maps.get("horizontal"), row, col)
             egr_vertical = _matrix_value(congestion_maps.get("vertical"), row, col)
@@ -1775,7 +1775,7 @@ class FoundationExtractor:
                 "identity": {"patch_id": patch_id, "row": row, "col": col, "grid_rows": rows, "grid_cols": cols, "grid_source": canonical_grid.get("grid_source"), "grid_patch_count": patch_count},
                 "geometry": {"bbox": bbox, "center": center, "width": float(bbox["urx"]) - float(bbox["llx"]), "height": float(bbox["ury"]) - float(bbox["lly"]), "area": _bbox_area(bbox), "die_bbox": die_bbox, "distance_to_die_boundary": _distance_to_die_boundary(bbox, die_bbox), "edge_position": _edge_position(row, col, rows, cols)},
                 "local_density": {"feature_role": "progressive_input", "available_for_training_input": input_available, "instance_count_center": len(patch_instances), "instance_count_overlap": len(overlap_instances), "stdcell_count_center": sum(1 for item in patch_instances if item.get("identity", {}).get("physical_class") == "stdcell"), "macro_count_overlap": len(macro_instances), "physical_only_count_overlap": len(physical_only_instances), "stdcell_area_overlap": stdcell_area, "macro_area_overlap": macro_area, "instance_area_overlap": instance_area, "cell_density": _value_from_named_map(density_maps, "allcell_density", row, col), "macro_density": _value_from_named_map(density_maps, "macro_density", row, col), "pin_count_anchor": len(patch_pins), "pin_count_overlap": len(overlap_pins), "pin_density": pin_density, "net_density": net_density, "wire_length": wire_length, "wire_length_by_layer": wire_length_by_layer, "via_count": sum(1 for wire in patch_wires if wire.get("identity", {}).get("segment_kind") == "via"), "source": "maps_and_vectors"},
-                "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": input_available, "net_count_anchor": len(patch_nets), "net_count_overlap": len(overlap_nets), "cross_patch_net_count": sum(1 for net in overlap_nets if net.get("connectivity_summary", {}).get("cross_patch")), "entering_net_count": sum(1 for net in overlap_nets if patch_id != net.get("patch_anchor", {}).get("primary_patch_id")), "leaving_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "internal_net_count": sum(1 for net in patch_nets if not net.get("connectivity_summary", {}).get("cross_patch")), "high_fanout_net_count": sum(1 for net in overlap_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "clock_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_clock")), "reset_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_reset")), "pg_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_power_ground")), "signal_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_signal")), "local_hpwl_sum": _sum_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_max": _max_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_mean": _mean_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "source": f"vectors/nets/{stage}.jsonl"},
+                "local_connectivity": {"feature_role": "progressive_input", "available_for_training_input": input_available, "net_count_anchor": len(patch_nets), "net_count_overlap": len(overlap_nets), "cross_patch_net_count": sum(1 for net in overlap_nets if net.get("connectivity_summary", {}).get("cross_patch")), "entering_net_count": sum(1 for net in overlap_nets if patch_id != net.get("patch_anchor", {}).get("primary_patch_id")), "leaving_net_count": sum(1 for net in patch_nets if net.get("connectivity_summary", {}).get("cross_patch")), "internal_net_count": sum(1 for net in patch_nets if not net.get("connectivity_summary", {}).get("cross_patch")), "high_fanout_net_count": sum(1 for net in overlap_nets if int(net.get("connectivity_summary", {}).get("fanout") or 0) >= 8), "clock_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_clock")), "reset_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_reset")), "pg_net_count": _pg_net_count_for_patch(pg_net_count, overlap_nets), "signal_net_count": sum(1 for net in overlap_nets if net.get("identity", {}).get("is_signal")), "local_hpwl_sum": _sum_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_max": _max_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "local_hpwl_mean": _mean_optional(net.get("geometry_proxy", {}).get("hpwl") for net in patch_nets), "source": f"vectors/nets/{stage}.jsonl"},
                 "pre_route_estimators": {"feature_role": "progressive_input", "available_for_training_input": input_available, "rudy_horizontal": _value_from_named_map(rudy_maps, "rudy_horizontal", row, col), "rudy_vertical": _value_from_named_map(rudy_maps, "rudy_vertical", row, col), "rudy_union": rudy_union, "egr_overflow_horizontal": egr_horizontal, "egr_overflow_vertical": egr_vertical, "egr_overflow_union": egr_union, "margin_horizontal": _matrix_value(margin_maps.get("horizontal"), row, col), "margin_vertical": _matrix_value(margin_maps.get("vertical"), row, col), "source": "canonical_maps"},
                 "neighbor_context": {"feature_role": "progressive_input", "available_for_training_input": input_available, "adjacent_patch_ids": adjacent_ids, "window_3x3_patch_ids": neighbor_ids, "window_3x3_valid_count": len(neighbor_ids), "edge_position": _edge_position(row, col, rows, cols), "window_3x3_cell_density_mean": _mean_optional(window_cell_values), "window_3x3_pin_density_sum": _sum_optional(window_pin_density_values), "window_3x3_pin_count_sum": sum(len(pins_by_primary.get(item, [])) for item in neighbor_ids), "window_3x3_rudy_max": _max_optional(window_rudy_values), "window_3x3_egr_overflow_max": _max_optional(window_egr_values), "source": f"vectors/patches/{stage}.jsonl"},
                 "entity_refs": {"anchor_semantics": "primary_patch_or_center", "overlap_semantics": "bbox_or_segment_intersection", "instance_count": len(patch_instances), "instance_overlap_count": len(overlap_instances), "pin_count": len(patch_pins), "pin_overlap_count": len(overlap_pins), "net_count": len(patch_nets), "net_overlap_count": len(overlap_nets), "wire_count": len(patch_wires), "timing_path_count": len(patch_timing_paths), "drc_count": patch_drc.get("count"), "sample_instance_keys": [item.get("identity", {}).get("instance_key") for item in patch_instances[:32]], "sample_pin_keys": [item.get("pin_key") for item in patch_pins[:32]], "sample_net_keys": [item.get("net_key") for item in patch_nets[:32]], "sample_wire_ids": [item.get("wire_key") for item in patch_wires[:32]], "sample_timing_path_ids": [item.get("id") for item in patch_timing_paths[:32]], "sample_drc_ids": [], "refs_truncated": any(count > 32 for count in (len(patch_instances), len(patch_pins), len(patch_nets), len(patch_wires), len(patch_timing_paths))), "ref_limit": 32},
@@ -2302,7 +2302,7 @@ class FoundationExtractor:
         return []
 
     def _map_source_path(self, stage_name: str, category: str, channel: str) -> str | None:
-        preferred_types = ("gcell_patch_map_csv", "egr_demand_capacity_map_csv", "map_csv")
+        preferred_types = ("gcell_patch_map_csv", "egr_demand_capacity_map_csv", "map_csv", "floorplan_specific_def_maps")
         candidate_keys = [channel]
         if category == "congestion" and channel in {"horizontal", "vertical", "union"}:
             candidate_keys.append(f"{channel}_overflow")
@@ -2572,6 +2572,7 @@ class FoundationExtractor:
                     "high_fanout_net_count": connectivity.get("high_fanout_net_count"),
                     "clock_net_count": connectivity.get("clock_net_count"),
                     "reset_net_count": connectivity.get("reset_net_count"),
+                    "pg_net_count": connectivity.get("pg_net_count"),
                     "local_hpwl_sum": connectivity.get("local_hpwl_sum"),
                     "local_hpwl_max": connectivity.get("local_hpwl_max"),
                     "local_hpwl_mean": connectivity.get("local_hpwl_mean"),
@@ -3577,6 +3578,9 @@ def _previous_stage_name(stages: list[StageInfo], stage_name: str) -> str | None
 def _raw_ref_lookup_keys(metadata: dict[str, Any]) -> set[str]:
     keys: set[str] = set()
     for raw_key in (metadata.get("key"), metadata.get("category")):
+        if raw_key:
+            keys.add(str(raw_key))
+    for raw_key in metadata.get("keys") or []:
         if raw_key:
             keys.add(str(raw_key))
     if metadata.get("category") == "congestion":
@@ -5119,10 +5123,12 @@ def _floorplan_specific_patch_maps(
     physical_only_cells = layout_physical_only_cells or _physical_only_cells_from_floorplan_def(parsed_def)
     power_grid_shapes = _power_grid_shapes_from_floorplan_def(parsed_def)
     io_pins = _io_pin_points_from_def(parsed_def)
+    pg_net_shapes = _power_ground_net_shapes_from_floorplan_def(parsed_def)
     return {
         "io_pin_density": _patch_point_density(patches, rows, cols, io_pins),
         "power_grid_density": _patch_shape_density(patches, rows, cols, power_grid_shapes),
         "physical_only_cell_density": _patch_shape_density(patches, rows, cols, physical_only_cells),
+        "pg_net_count": _patch_shape_presence_count(patches, rows, cols, pg_net_shapes),
     }
 
 
@@ -5269,6 +5275,15 @@ def _power_grid_shapes_from_floorplan_def(parsed_def: DefData) -> list[dict[str,
     ]
 
 
+def _power_ground_net_shapes_from_floorplan_def(parsed_def: DefData) -> list[dict[str, Any]]:
+    return [
+        _wire_bbox_with_width(wire)
+        for net in parsed_def.nets
+        if _is_power_or_ground_net(net.name) or str(net.use or "").upper() in {"POWER", "GROUND"}
+        for wire in net.wires
+    ]
+
+
 def _io_pin_points_from_def(parsed_def: DefData) -> list[dict[str, Any]]:
     return [
         {"x": float(pin["origin"]["x"]), "y": float(pin["origin"]["y"])}
@@ -5304,6 +5319,25 @@ def _patch_shape_density(
             continue
         matrix[row][col] = sum(_bbox_overlap_area(shape, bbox) for shape in shapes) / patch_area
     return matrix
+
+
+def _patch_shape_presence_count(
+    patches: list[dict[str, Any]],
+    rows: int,
+    cols: int,
+    shapes: list[dict[str, Any]],
+) -> MapMatrix:
+    matrix = _empty_matrix(rows, cols)
+    for patch in patches:
+        row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+        matrix[row][col] = float(sum(1 for shape in shapes if _bbox_overlap_area(shape, bbox) > 0))
+    return matrix
+
+
+def _pg_net_count_for_patch(pg_net_count: float | None, overlap_nets: list[dict[str, Any]]) -> int:
+    if pg_net_count is not None:
+        return int(pg_net_count)
+    return sum(1 for net in overlap_nets if net.get("identity", {}).get("is_power_ground"))
 
 
 def _is_physical_only_cell_name(name: str, master: str) -> bool:
