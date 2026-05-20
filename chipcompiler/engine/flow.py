@@ -5,6 +5,7 @@ import os
 import time
 import logging
 import traceback
+import signal
 from multiprocessing import Process
 from threading import Thread
 
@@ -14,6 +15,46 @@ from chipcompiler.utility import track_process_memory
 from chipcompiler.utility.log import redirect_stdio_to_file
 
 logger = logging.getLogger(__name__)
+
+
+def _read_process_cpu_jiffies(pid: int | None) -> int | None:
+    if pid is None:
+        return None
+    try:
+        fields = open(f"/proc/{pid}/stat", encoding="utf-8").read().split()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    if len(fields) <= 14:
+        return None
+    try:
+        return int(fields[13]) + int(fields[14])
+    except ValueError:
+        return None
+
+
+def _path_mtime_ns(path: str) -> int | None:
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _terminate_process_tree(process: Process, step_tag: str, reason: str, workspace: Workspace) -> None:
+    workspace.logger.error("[%s] %s terminating pid=%s", reason, step_tag, process.pid)
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        process.terminate()
+    process.join(timeout=10.0)
+    if process.is_alive():
+        workspace.logger.error("[%s] %s still alive; killing pid=%s", reason, step_tag, process.pid)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.join(timeout=5.0)
 
 def _run_step_in_subprocess(workspace: Workspace, workspace_step: WorkspaceStep) -> None:
     """
@@ -338,7 +379,8 @@ class EngineFlow:
     def run_step(self,
                  workspace_step : WorkspaceStep | str,
                  rerun : bool = False,
-                 timeout_seconds : float | None = None) -> StateEnum:
+                 timeout_seconds : float | None = None,
+                 stale_seconds : float | None = None) -> StateEnum:
         """
         run single step
         """
@@ -346,6 +388,10 @@ class EngineFlow:
             timeout_seconds = float(timeout_seconds)
             if timeout_seconds <= 0:
                 raise ValueError("timeout_seconds must be positive")
+        if stale_seconds is not None:
+            stale_seconds = float(stale_seconds)
+            if stale_seconds <= 0:
+                raise ValueError("stale_seconds must be positive")
         if isinstance(workspace_step, str):
             workspace_step = self.get_workspace_step(workspace_step)
         if workspace_step is None:
@@ -381,27 +427,38 @@ class EngineFlow:
         tracker.start()
 
         timed_out = False
-        p.join(timeout=timeout_seconds)
-        if p.is_alive():
-            timed_out = True
-            self.workspace.logger.error(
-                "[TIMEOUT] %s exceeded timeout_seconds=%s; terminating pid=%s",
-                step_tag,
-                timeout_seconds,
-                p.pid,
-            )
-            try:
-                os.killpg(p.pid, 15)
-            except (OSError, ProcessLookupError):
-                p.terminate()
-            p.join(timeout=10.0)
-            if p.is_alive():
-                self.workspace.logger.error("[TIMEOUT] %s still alive; killing pid=%s", step_tag, p.pid)
-                try:
-                    os.killpg(p.pid, 9)
-                except (OSError, ProcessLookupError):
-                    p.kill()
-                p.join(timeout=5.0)
+        stale_timed_out = False
+        last_progress_time = time.time()
+        last_cpu_jiffies = _read_process_cpu_jiffies(p.pid)
+        last_log_mtime_ns = _path_mtime_ns(step_log_file)
+        while p.is_alive():
+            elapsed = time.time() - start_time
+            join_timeout = 1.0
+            if timeout_seconds is not None:
+                join_timeout = max(0.0, min(join_timeout, timeout_seconds - elapsed))
+                if join_timeout <= 0:
+                    timed_out = True
+                    break
+            p.join(timeout=join_timeout)
+            if not p.is_alive():
+                break
+            now = time.time()
+            cpu_jiffies = _read_process_cpu_jiffies(p.pid)
+            log_mtime_ns = _path_mtime_ns(step_log_file)
+            if (
+                (cpu_jiffies is not None and cpu_jiffies != last_cpu_jiffies)
+                or (log_mtime_ns is not None and log_mtime_ns != last_log_mtime_ns)
+            ):
+                last_progress_time = now
+                last_cpu_jiffies = cpu_jiffies
+                last_log_mtime_ns = log_mtime_ns
+            if stale_seconds is not None and now - last_progress_time >= stale_seconds:
+                stale_timed_out = True
+                break
+        if timed_out and p.is_alive():
+            _terminate_process_tree(p, step_tag, "TIMEOUT", self.workspace)
+        elif stale_timed_out and p.is_alive():
+            _terminate_process_tree(p, step_tag, "STALE", self.workspace)
         tracker.join(timeout=1.0)
         
         # compute metrics
@@ -412,7 +469,7 @@ class EngineFlow:
         # determine and save state
         state = (
             StateEnum.Success
-            if not timed_out and self.check_step_result(workspace_step=workspace_step)
+            if not timed_out and not stale_timed_out and self.check_step_result(workspace_step=workspace_step)
             else StateEnum.Imcomplete
         )
         self.set_state(name=workspace_step.name,
@@ -422,9 +479,11 @@ class EngineFlow:
                        peak_memory=peak_memory_mb,
                        runtime_seconds=elapsed,
                        timeout_seconds=timeout_seconds if timed_out else None,
-                       timed_out=timed_out if timed_out else None)
-        self.workspace.logger.info("[RESULT] %s state=%s runtime=%s mem=%sMB exitcode=%s timed_out=%s",
-                    step_tag, state.value, runtime, peak_memory_mb, p.exitcode, timed_out)
+                       timed_out=timed_out if timed_out else None,
+                       stale_seconds=stale_seconds if stale_timed_out else None,
+                       stale_timed_out=stale_timed_out if stale_timed_out else None)
+        self.workspace.logger.info("[RESULT] %s state=%s runtime=%s mem=%sMB exitcode=%s timed_out=%s stale_timed_out=%s",
+                    step_tag, state.value, runtime, peak_memory_mb, p.exitcode, timed_out, stale_timed_out)
 
         # save layout snapshot on success
         if state == StateEnum.Success:
