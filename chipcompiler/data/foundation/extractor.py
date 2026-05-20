@@ -176,6 +176,7 @@ class FoundationExtractor:
             canonical_maps=canonical_maps,
             labels=labels,
             metrics=metrics,
+            skip_tables=_BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset(),
         )
         base_tables = self._load_base_manifest_tables(base_manifest_path) if scope == "variant_delta" else {}
         skip_tables = _BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset()
@@ -2047,7 +2048,9 @@ class FoundationExtractor:
         canonical_maps: CanonicalMaps,
         labels: dict[str, Any],
         metrics: dict[str, Any],
+        skip_tables: frozenset[str] | set[str] | None = None,
     ) -> dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]]:
+        skip = frozenset(skip_tables or ())
         design_name = str(parameters.get("Design") or parameters.get("design") or "unknown")
         top_module = str(parameters.get("Top module") or parameters.get("top_module") or design_name)
         pdk = str(parameters.get("PDK") or parameters.get("pdk") or "unknown")
@@ -2056,18 +2059,21 @@ class FoundationExtractor:
         run_id = _stable_id("run", design_id, parameters, self._source_signature())
         stage_ids = {stage.name: _stage_id(run_id, index, stage.name) for index, stage in enumerate(stages)}
         flow_steps = _stage_flow_step_by_name(flow)
-        tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]] = {
-            "designs": [
-                {
-                    "design_id": design_id,
-                    "pdk": pdk,
-                    "design_name": design_name,
-                    "top_module": top_module,
-                    "logical_source_hash": logical_source_hash,
-                    "tech_profile": str(parameters.get("tech_profile") or pdk),
-                    "created_from_workspace": str(self.workspace_dir),
-                }
-            ],
+        tables: dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]] = {}
+        design_rows = [
+            {
+                "design_id": design_id,
+                "pdk": pdk,
+                "design_name": design_name,
+                "top_module": top_module,
+                "logical_source_hash": logical_source_hash,
+                "tech_profile": str(parameters.get("tech_profile") or pdk),
+                "created_from_workspace": str(self.workspace_dir),
+            }
+        ]
+        if "designs" not in skip:
+            tables["designs"] = design_rows
+        tables.update({
             "runs": [
                 {
                     "design_id": design_id,
@@ -2100,15 +2106,10 @@ class FoundationExtractor:
             "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids, labels, metrics),
             "provenance": [],
             "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
-            "patches": self._patch_table_rows(design_id, canonical_grid),
-            "patch_neighbors": self._patch_neighbor_rows(design_id, canonical_grid),
             "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
             "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
             "run_patch_route_labels": self._route_label_rows(design_id, run_id, labels),
             "run_patch_route_label_layers": self._route_label_layer_rows(design_id, run_id, labels),
-            "tech_layers": list(self._tech_layer_rows(design_id)),
-            "tech_vias": list(self._tech_via_rows(design_id)),
-            "library_cells": list(self._library_cell_rows(design_id)),
             "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
             "instances": self._instance_rows(design_id, stages),
             "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
@@ -2126,15 +2127,29 @@ class FoundationExtractor:
             "timing_wire_path_nodes": self._timing_wire_path_node_rows(design_id, run_id, stages),
             "stage_metrics": self._stage_metric_rows(design_id, run_id, metrics),
             "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
-        }
+        })
+        if "patches" not in skip:
+            tables["patches"] = self._patch_table_rows(design_id, canonical_grid)
+        if "patch_neighbors" not in skip:
+            tables["patch_neighbors"] = self._patch_neighbor_rows(design_id, canonical_grid)
+        if "tech_layers" not in skip:
+            tables["tech_layers"] = list(self._tech_layer_rows(design_id))
+        if "tech_vias" not in skip:
+            tables["tech_vias"] = list(self._tech_via_rows(design_id))
+        if "library_cells" not in skip:
+            tables["library_cells"] = list(self._library_cell_rows(design_id))
+        for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas", "semantic_blocks"):
+            if not isinstance(tables[table_name], list):
+                tables[table_name] = list(tables[table_name])
         tables["provenance"] = self._provenance_rows(
             {
-                "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
-                "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
-                "stage_deltas": self._stage_delta_rows(design_id, run_id, stages),
-                "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
+                "run_stage_patch_maps": tables["run_stage_patch_maps"],
+                "run_stage_patch_features": tables["run_stage_patch_features"],
+                "stage_deltas": tables["stage_deltas"],
+                "semantic_blocks": tables["semantic_blocks"],
             }
         )
+        tables["_manifest_design_row"] = design_rows
         return tables
 
     def _artifact_table_rows(
@@ -3300,7 +3315,7 @@ class FoundationExtractor:
         table_rows: dict[str, list[dict[str, Any]]],
     ) -> dict[str, Any]:
         del stages, raw_maps, summary
-        design_row = (table_rows.get("designs") or [{}])[0]
+        design_row = (table_rows.get("designs") or table_rows.get("_manifest_design_row") or [{}])[0]
         run_row = (table_rows.get("runs") or [{}])[0]
         stage_rows = table_rows.get("stages") or []
         artifacts = {

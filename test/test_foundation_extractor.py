@@ -11,6 +11,9 @@ import pytest
 from chipcompiler.data.foundation import FoundationExtractor
 import chipcompiler.data.foundation.extractor as extractor_module
 from chipcompiler.data.foundation.parsers.def_parser import parse_def
+from chipcompiler.data.foundation.parsers.route_native_demand_capacity import (
+    parse_route_native_demand_capacity_artifacts,
+)
 from chipcompiler.data.foundation.grid.canonical_grid import build_patch_grid
 from chipcompiler.data.foundation.table_contract import TABLE_SPECS, write_tables
 import chipcompiler.data.foundation.table_contract as table_contract_module
@@ -1110,6 +1113,72 @@ def test_provenance_rows_do_not_materialize_large_table_iterables(tmp_path: Path
     assert all(not isinstance(rows, list) for rows in tables.values())
 
 
+def test_build_table_rows_reuses_dynamic_rows_for_provenance(tmp_path: Path, monkeypatch):
+    ws = _make_workspace(tmp_path)
+    extractor = FoundationExtractor(ws, profile="iccd_full_v1")
+    extractor.extract(export_legacy_debug=True)
+    flow = extractor._read_json(ws / "home" / "flow.json")
+    parameters = extractor._read_json(ws / "home" / "parameters.json")
+    stages = extractor._stage_infos(flow)
+    canonical_grid = json.loads((extractor.foundation_dir / "canonical_grid.json").read_text(encoding="utf-8"))
+    canonical_maps = extractor._write_maps(
+        extractor._collect_raw_maps(stages),
+        canonical_grid,
+        stages,
+        extractor._collect_def_data(stages),
+    )
+    route_stage = next((stage for stage in stages if stage.name == "route"), None)
+    labels = extractor._write_labels(
+        parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid)["labels"],
+        export_legacy_debug=True,
+    )
+    metrics = extractor._collect_metrics(stages)
+    call_counts = {"maps": 0, "features": 0, "deltas": 0, "semantic": 0}
+
+    original_maps = FoundationExtractor._patch_map_rows
+    original_features = FoundationExtractor._patch_feature_rows
+    original_deltas = FoundationExtractor._stage_delta_rows
+    original_semantic = FoundationExtractor._semantic_block_rows
+
+    def counted_maps(self, *args, **kwargs):
+        call_counts["maps"] += 1
+        return original_maps(*args, **kwargs)
+
+    def counted_features(self, *args, **kwargs):
+        call_counts["features"] += 1
+        return original_features(self, *args, **kwargs)
+
+    def counted_deltas(self, *args, **kwargs):
+        call_counts["deltas"] += 1
+        return original_deltas(self, *args, **kwargs)
+
+    def counted_semantic(self, *args, **kwargs):
+        call_counts["semantic"] += 1
+        return original_semantic(self, *args, **kwargs)
+
+    monkeypatch.setattr(FoundationExtractor, "_patch_map_rows", counted_maps)
+    monkeypatch.setattr(FoundationExtractor, "_patch_feature_rows", counted_features)
+    monkeypatch.setattr(FoundationExtractor, "_stage_delta_rows", counted_deltas)
+    monkeypatch.setattr(FoundationExtractor, "_semantic_block_rows", counted_semantic)
+
+    table_rows = extractor._build_table_rows(
+        flow=flow,
+        parameters=parameters,
+        stages=stages,
+        canonical_grid=canonical_grid,
+        canonical_maps=canonical_maps,
+        labels=labels,
+        metrics=metrics,
+    )
+
+    assert call_counts == {"maps": 1, "features": 1, "deltas": 1, "semantic": 1}
+    assert table_rows["provenance"]
+    assert isinstance(table_rows["run_stage_patch_maps"], list)
+    assert isinstance(table_rows["run_stage_patch_features"], list)
+    assert isinstance(table_rows["stage_deltas"], list)
+    assert isinstance(table_rows["semantic_blocks"], list)
+
+
 def test_route_native_demand_capacity_jsonl_is_read_streaming(tmp_path: Path, monkeypatch):
     from chipcompiler.data.foundation.parsers import route_native_demand_capacity as parser
 
@@ -1632,6 +1701,49 @@ def test_iccd_full_v1_extractor_records_base_delta_scope_sources(tmp_path: Path,
         {"root": "variant_delta", "path": "tables/run_patch_route_labels.parquet"}
     ]
     assert not (static_tables & set(written_tables))
+
+
+def test_variant_delta_does_not_construct_skipped_static_rows(tmp_path: Path, monkeypatch):
+    base_manifest = tmp_path / "design_base" / "bench" / "design" / "foundation_data" / "ecc" / "manifest.json"
+    base_manifest.parent.mkdir(parents=True)
+    static_tables = {"designs", "tech_layers", "tech_vias", "library_cells", "patches", "patch_neighbors"}
+    base_manifest.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    name: {
+                        "path": f"tables/{name}.parquet",
+                        "format": "parquet",
+                        "row_count": 4,
+                        "sha256": "0" * 64,
+                        "size_bytes": 123,
+                    }
+                    for name in static_tables
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws = _make_workspace(tmp_path)
+
+    def fail_static_builder(*args, **kwargs):
+        raise AssertionError("variant_delta should not construct skipped static table rows")
+
+    monkeypatch.setattr(FoundationExtractor, "_patch_table_rows", fail_static_builder)
+    monkeypatch.setattr(FoundationExtractor, "_patch_neighbor_rows", fail_static_builder)
+    monkeypatch.setattr(FoundationExtractor, "_tech_layer_rows", fail_static_builder)
+    monkeypatch.setattr(FoundationExtractor, "_tech_via_rows", fail_static_builder)
+    monkeypatch.setattr(FoundationExtractor, "_library_cell_rows", fail_static_builder)
+
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(
+        scope="variant_delta",
+        base_manifest_path=str(base_manifest),
+    )
+
+    manifest = json.loads((result.foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["tables"]["patches"]["sources"] == [
+        {"root": "design_base", "path": "tables/patches.parquet"}
+    ]
 
 
 def test_iccd_full_v1_variant_delta_requires_static_tables_in_base_manifest(tmp_path: Path):
