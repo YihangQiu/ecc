@@ -17,19 +17,21 @@ def parse_route_native_demand_capacity_artifacts(
 
 
 def _candidate_paths(stage_dir: Path) -> list[Path]:
-    roots = [
-        stage_dir / "data" / "rt" / "space_router",
-        stage_dir / "data" / "rt",
-        stage_dir / "feature",
-        stage_dir / "analysis",
-    ]
-    names = [
+    root = stage_dir / "data" / "rt" / "space_router"
+    preferred_names = [
         "route_native_demand_capacity_final.jsonl",
         "route_native_demand_capacity.jsonl",
         "route_native_demand_capacity_final.json",
         "route_native_demand_capacity.json",
     ]
-    return [root / name for root in roots for name in names if (root / name).exists()]
+    preferred_paths = [root / name for name in preferred_names]
+    globbed_paths = sorted(
+        [
+            *root.glob("route_native_demand_capacity*.jsonl"),
+            *root.glob("route_native_demand_capacity*.json"),
+        ]
+    )
+    return [path for path in [*preferred_paths, *globbed_paths] if path.exists()]
 
 
 def _iter_records(path: Path) -> Iterable[dict[str, Any]]:

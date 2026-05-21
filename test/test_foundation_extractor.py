@@ -2476,6 +2476,62 @@ def test_iccd_full_v1_keeps_native_missing_without_reconstructed_fallback(tmp_pa
     assert "route_reconstructed_demand_capacity" not in quality["availability"]["labels"]
 
 
+def test_iccd_full_v1_uses_json_native_route_file_under_space_router(tmp_path: Path):
+    ws = _make_workspace(tmp_path, include_native_demand_capacity=False)
+    _write_json(
+        ws / "route_ecc" / "data" / "rt" / "space_router" / "route_native_demand_capacity_final.json",
+        {
+            "records": [
+                {
+                    "row": 0,
+                    "col": 0,
+                    "layer": "MET2",
+                    "direction": "horizontal",
+                    "demand": 6.0,
+                    "capacity": 3.0,
+                }
+            ]
+        },
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert quality["availability"]["labels"]["route_native_demand_capacity"] == "available"
+    assert summary["labels"]["route_native_demand_capacity_count"] == 4
+
+
+def test_iccd_full_v1_ignores_route_native_files_outside_space_router(tmp_path: Path):
+    ws = _make_workspace(tmp_path, include_native_demand_capacity=False)
+    _write_text(
+        ws / "route_ecc" / "data" / "rt" / "route_native_demand_capacity_final.jsonl",
+        json.dumps(
+            {
+                "row": 0,
+                "col": 0,
+                "layer": "MET2",
+                "direction": "horizontal",
+                "demand": 6.0,
+                "capacity": 3.0,
+            }
+        )
+        + "\n",
+    )
+
+    FoundationExtractor(ws, profile="iccd_full_v1").extract(export_legacy_debug=True)
+
+    foundation_dir = ws / "foundation_data" / "ecc"
+    quality = json.loads((foundation_dir / "quality.json").read_text(encoding="utf-8"))
+    summary = json.loads((foundation_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert quality["availability"]["labels"]["route_native_demand_capacity"] == "missing"
+    assert quality["null_reason"]["labels"]["route_native_demand_capacity"] == "missing_irt_space_router_native_demand_capacity_artifact"
+    assert summary["labels"]["route_native_demand_capacity_count"] == 0
+
+
 
 def test_source_signature_is_cached_until_reset(tmp_path: Path):
     ws = _make_workspace(tmp_path)
