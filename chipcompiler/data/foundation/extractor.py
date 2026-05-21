@@ -3,12 +3,15 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import re
 import shutil
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .grid.canonical_grid import build_gcell_patch_grid, build_patch_grid, resize_nearest
 from .parsers.def_parser import DefData, DefNet, DefWire, parse_def
@@ -20,7 +23,14 @@ from .parsers.route_native_demand_capacity import parse_route_native_demand_capa
 from .parsers.rt_log import parse_rt_log
 from .parsers.sta_parser import parse_sta_artifacts
 from .schema import ExtractionResult
-from .table_contract import CONTRACT_NAME, SCHEMA_VERSION, STORAGE_FORMAT, json_value, schema_document, write_tables
+from .table_contract import (
+    CONTRACT_NAME,
+    SCHEMA_VERSION,
+    STORAGE_FORMAT,
+    json_value,
+    schema_document,
+    write_tables,
+)
 from .writers import write_json, write_jsonl
 
 FOUNDATION_REL = Path("foundation_data") / "ecc"
@@ -53,6 +63,8 @@ _DENSITY_MAP_KEY_ORDER = (
 MapMatrix = list[list[float]]
 StageMaps = dict[str, dict[str, MapMatrix]]
 CanonicalMaps = dict[str, StageMaps]
+logger = logging.getLogger("ecos.api.foundation")
+T = TypeVar("T")
 
 
 
@@ -115,6 +127,7 @@ class FoundationExtractor:
         scope: str = "full",
         base_manifest_path: str | None = None,
     ) -> ExtractionResult:
+        extract_start = time.monotonic()
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
         scope = str(scope or "full").strip()
         if scope not in {"full", "design_base", "variant_delta"}:
@@ -124,10 +137,31 @@ class FoundationExtractor:
         self._source_signature_cache = None
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
-        flow = self._read_json(self.workspace_dir / "home" / "flow.json")
-        parameters = self._read_json(self.workspace_dir / "home" / "parameters.json")
-        self._lef_macros = self._load_lef_macros(parameters)
+        logger.info(
+            "foundation_extract start workspace=%s profile=%s scope=%s "
+            "stages=%s include_raw_refs=%s",
+            self.workspace_dir,
+            self.profile,
+            scope,
+            stages,
+            include_raw_refs,
+        )
+        flow = self._run_logged_stage(
+            "read_flow", lambda: self._read_json(self.workspace_dir / "home" / "flow.json")
+        )
+        parameters = self._run_logged_stage(
+            "read_parameters",
+            lambda: self._read_json(self.workspace_dir / "home" / "parameters.json"),
+        )
+        self._lef_macros = self._run_logged_stage(
+            "load_lef", lambda: self._load_lef_macros(parameters)
+        )
         selected_stages = self._filter_stages(self._stage_infos(flow), stages)
+        logger.info(
+            "foundation_extract selected_stages workspace=%s stages=%s",
+            self.workspace_dir,
+            ",".join(stage.name for stage in selected_stages),
+        )
         options = {
             "stages": [stage.name for stage in selected_stages],
             "include_raw_refs": bool(include_raw_refs),
@@ -141,55 +175,151 @@ class FoundationExtractor:
         self._vector_records: dict[str, dict[str, list[dict[str, Any]]]] = {
             entity: {} for entity in _ENTITY_NAMES
         }
-        def_data = self._collect_def_data(selected_stages)
-        rt_logs = self._collect_rt_logs(selected_stages)
-        sta_reports = self._collect_sta_reports(selected_stages)
-        drc_reports = self._collect_drc_reports(selected_stages)
-        raw_maps = self._collect_raw_maps(selected_stages)
-        self._merge_egr_demand_capacity_maps(raw_maps, selected_stages)
-        die_bbox = self._discover_die_bbox(selected_stages) or self._discover_def_die_bbox(def_data)
-        canonical_grid = self._build_canonical_grid(raw_maps, die_bbox, selected_stages)
-        canonical_maps = self._write_maps(raw_maps, canonical_grid, selected_stages, def_data)
-        self._ensure_floorplan_maps(selected_stages, canonical_grid, canonical_maps, def_data)
-        self._ensure_floorplan_specific_maps(
-            selected_stages, canonical_grid, canonical_maps, def_data
+        def_data = self._run_logged_stage(
+            "collect_def_data", lambda: self._collect_def_data(selected_stages)
+        )
+        rt_logs = self._run_logged_stage(
+            "collect_rt_logs", lambda: self._collect_rt_logs(selected_stages)
+        )
+        sta_reports = self._run_logged_stage(
+            "collect_sta_reports", lambda: self._collect_sta_reports(selected_stages)
+        )
+        drc_reports = self._run_logged_stage(
+            "collect_drc_reports", lambda: self._collect_drc_reports(selected_stages)
+        )
+        raw_maps = self._run_logged_stage(
+            "collect_raw_maps", lambda: self._collect_raw_maps(selected_stages)
+        )
+        self._run_logged_stage(
+            "merge_egr_demand_capacity_maps",
+            lambda: self._merge_egr_demand_capacity_maps(raw_maps, selected_stages),
+        )
+        die_bbox = self._run_logged_stage(
+            "discover_die_bbox",
+            lambda: self._discover_die_bbox(selected_stages)
+            or self._discover_def_die_bbox(def_data),
+        )
+        canonical_grid = self._run_logged_stage(
+            "build_canonical_grid",
+            lambda: self._build_canonical_grid(raw_maps, die_bbox, selected_stages),
+        )
+        canonical_maps = self._run_logged_stage(
+            "write_maps",
+            lambda: self._write_maps(raw_maps, canonical_grid, selected_stages, def_data),
+        )
+        self._run_logged_stage(
+            "ensure_floorplan_maps",
+            lambda: self._ensure_floorplan_maps(
+                selected_stages, canonical_grid, canonical_maps, def_data
+            ),
+        )
+        self._run_logged_stage(
+            "ensure_floorplan_specific_maps",
+            lambda: self._ensure_floorplan_specific_maps(
+                selected_stages, canonical_grid, canonical_maps, def_data
+            ),
         )
         if export_legacy_debug:
-            self._write_indexed_maps(canonical_maps, canonical_grid)
+            self._run_logged_stage(
+                "write_indexed_maps",
+                lambda: self._write_indexed_maps(canonical_maps, canonical_grid),
+            )
         route_stage = next((stage for stage in selected_stages if stage.name == "route"), None)
-        native_demand_capacity = parse_route_native_demand_capacity_artifacts(route_stage.directory, canonical_grid) if route_stage else {"available": False, "labels": []}
-        labels = self._write_labels(native_demand_capacity.get("labels", []), export_legacy_debug=export_legacy_debug)
-        self._write_tech(def_data, rt_logs, selected_stages)
-        entity_counts = self._write_vectors(selected_stages, canonical_grid, canonical_maps, def_data, labels, sta_reports, drc_reports, export_legacy_debug=export_legacy_debug)
-        self._record_wire_quality(selected_stages)
-        self._record_patch_quality(selected_stages, canonical_grid)
-        public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
-        stage_index = self._build_stage_index(selected_stages)
-        metrics = self._collect_metrics(selected_stages)
-        summary_parameters = self._build_summary_parameters(parameters, selected_stages, def_data)
-        summary = self._build_summary(flow, summary_parameters, selected_stages, metrics, entity_counts, public_labels, def_data, sta_reports, drc_reports)
-        table_rows = self._build_table_rows(
-            flow=flow,
-            parameters=summary_parameters,
-            stages=selected_stages,
-            canonical_grid=canonical_grid,
-            canonical_maps=canonical_maps,
-            labels=labels,
-            metrics=metrics,
-            skip_tables=_BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset(),
+        native_demand_capacity = self._run_logged_stage(
+            "parse_route_native_demand_capacity",
+            lambda: parse_route_native_demand_capacity_artifacts(
+                route_stage.directory, canonical_grid
+            )
+            if route_stage
+            else {"available": False, "labels": []},
         )
-        base_tables = self._load_base_manifest_tables(base_manifest_path) if scope == "variant_delta" else {}
+        labels = self._run_logged_stage(
+            "write_labels",
+            lambda: self._write_labels(
+                native_demand_capacity.get("labels", []),
+                export_legacy_debug=export_legacy_debug,
+            ),
+        )
+        self._run_logged_stage(
+            "write_tech", lambda: self._write_tech(def_data, rt_logs, selected_stages)
+        )
+        entity_counts = self._run_logged_stage(
+            "write_vectors",
+            lambda: self._write_vectors(
+                selected_stages,
+                canonical_grid,
+                canonical_maps,
+                def_data,
+                labels,
+                sta_reports,
+                drc_reports,
+                export_legacy_debug=export_legacy_debug,
+            ),
+        )
+        self._run_logged_stage(
+            "record_wire_quality", lambda: self._record_wire_quality(selected_stages)
+        )
+        self._run_logged_stage(
+            "record_patch_quality",
+            lambda: self._record_patch_quality(selected_stages, canonical_grid),
+        )
+        public_labels = {key: value for key, value in labels.items() if not key.startswith("_")}
+        stage_index = self._run_logged_stage(
+            "build_stage_index", lambda: self._build_stage_index(selected_stages)
+        )
+        metrics = self._run_logged_stage(
+            "collect_metrics", lambda: self._collect_metrics(selected_stages)
+        )
+        summary_parameters = self._run_logged_stage(
+            "build_summary_parameters",
+            lambda: self._build_summary_parameters(parameters, selected_stages, def_data),
+        )
+        summary = self._run_logged_stage(
+            "build_summary",
+            lambda: self._build_summary(
+                flow,
+                summary_parameters,
+                selected_stages,
+                metrics,
+                entity_counts,
+                public_labels,
+                def_data,
+                sta_reports,
+                drc_reports,
+            ),
+        )
+        table_rows = self._run_logged_stage(
+            "build_table_rows",
+            lambda: self._build_table_rows(
+                flow=flow,
+                parameters=summary_parameters,
+                stages=selected_stages,
+                canonical_grid=canonical_grid,
+                canonical_maps=canonical_maps,
+                labels=labels,
+                metrics=metrics,
+                skip_tables=_BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset(),
+            ),
+        )
+        base_tables = (
+            self._load_base_manifest_tables(base_manifest_path)
+            if scope == "variant_delta"
+            else {}
+        )
         skip_tables = _BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset()
         missing_static_tables = sorted(skip_tables - base_tables.keys())
         if missing_static_tables:
             raise ValueError(
                 "base manifest missing static foundation tables: " + ", ".join(missing_static_tables)
             )
-        table_registry = write_tables(
-            self.foundation_dir,
-            table_rows,
-            skip_tables=skip_tables,
-            registry_overrides={name: base_tables[name] for name in skip_tables},
+        table_registry = self._run_logged_stage(
+            "write_tables",
+            lambda: write_tables(
+                self.foundation_dir,
+                table_rows,
+                skip_tables=skip_tables,
+                registry_overrides={name: base_tables[name] for name in skip_tables},
+            ),
         )
         table_registry = self._with_base_delta_sources(
             table_registry,
@@ -198,41 +328,91 @@ class FoundationExtractor:
             base_tables=base_tables,
         )
         schema = schema_document()
-        manifest = self._build_manifest(
-            selected_stages,
-            raw_maps,
-            summary,
-            options=options,
-            table_registry=table_registry,
-            table_rows=table_rows,
+        manifest = self._run_logged_stage(
+            "build_manifest",
+            lambda: self._build_manifest(
+                selected_stages,
+                raw_maps,
+                summary,
+                options=options,
+                table_registry=table_registry,
+                table_rows=table_rows,
+            ),
         )
         self._quality["tables"] = {
             name: {"row_count": meta["row_count"], "path": meta["path"]}
             for name, meta in table_registry.items()
         }
-        tech_materialization_errors = self._record_tech_materialization_quality(table_registry)
+        tech_materialization_errors = self._run_logged_stage(
+            "record_tech_materialization_quality",
+            lambda: self._record_tech_materialization_quality(table_registry),
+        )
         self._quality["legacy_outputs"] = {
             "vectors_default_enabled": bool(export_legacy_debug),
             "maps_default_enabled": bool(export_legacy_debug),
             "jsonl_export": "explicit_debug_export_only",
         }
 
-        write_json(self.foundation_dir / "canonical_grid.json", canonical_grid)
-        write_json(self.foundation_dir / "stage_index.json", stage_index)
-        write_json(self.foundation_dir / "summary.json", summary)
-        write_json(self.foundation_dir / "schema.json", schema)
-        write_json(self.foundation_dir / "migration_report.json", self._build_migration_report())
+        self._run_logged_stage(
+            "write_canonical_grid",
+            lambda: write_json(self.foundation_dir / "canonical_grid.json", canonical_grid),
+        )
+        self._run_logged_stage(
+            "write_stage_index",
+            lambda: write_json(self.foundation_dir / "stage_index.json", stage_index),
+        )
+        self._run_logged_stage(
+            "write_summary", lambda: write_json(self.foundation_dir / "summary.json", summary)
+        )
+        self._run_logged_stage(
+            "write_schema", lambda: write_json(self.foundation_dir / "schema.json", schema)
+        )
+        self._run_logged_stage(
+            "write_migration_report",
+            lambda: write_json(
+                self.foundation_dir / "migration_report.json", self._build_migration_report()
+            ),
+        )
         if include_raw_refs:
-            write_json(self.foundation_dir / "raw_refs" / "artifacts.json", {"artifacts": self._raw_refs})
-        write_json(self.foundation_dir / "quality.json", self._quality)
+            self._run_logged_stage(
+                "write_raw_refs",
+                lambda: write_json(
+                    self.foundation_dir / "raw_refs" / "artifacts.json",
+                    {"artifacts": self._raw_refs},
+                ),
+            )
+        self._run_logged_stage(
+            "write_quality", lambda: write_json(self.foundation_dir / "quality.json", self._quality)
+        )
         if tech_materialization_errors:
             raise RuntimeError(
                 "foundation tech materialization failed: " + "; ".join(tech_materialization_errors)
             )
-        write_json(self.foundation_dir / "manifest.json", manifest)
-        self._write_views(summary, metrics, stage_index, public_labels, include_raw_refs=bool(include_raw_refs))
+        self._run_logged_stage(
+            "write_manifest", lambda: write_json(self.foundation_dir / "manifest.json", manifest)
+        )
+        self._run_logged_stage(
+            "write_views",
+            lambda: self._write_views(
+                summary,
+                metrics,
+                stage_index,
+                public_labels,
+                include_raw_refs=bool(include_raw_refs),
+            ),
+        )
         if not export_legacy_debug:
-            self._remove_legacy_default_outputs()
+            self._run_logged_stage(
+                "remove_legacy_default_outputs", self._remove_legacy_default_outputs
+            )
+
+        logger.info(
+            "foundation_extract done workspace=%s profile=%s scope=%s elapsed=%.2fs",
+            self.workspace_dir,
+            self.profile,
+            scope,
+            time.monotonic() - extract_start,
+        )
 
         return ExtractionResult(
             workspace_dir=self.workspace_dir,
@@ -241,6 +421,27 @@ class FoundationExtractor:
             manifest=manifest,
             summary=summary,
         )
+
+    def _run_logged_stage(self, name: str, func: Callable[[], T]) -> T:
+        start = time.monotonic()
+        logger.info("foundation_stage start name=%s workspace=%s", name, self.workspace_dir)
+        try:
+            result = func()
+        except Exception:
+            logger.exception(
+                "foundation_stage error name=%s workspace=%s elapsed=%.2fs",
+                name,
+                self.workspace_dir,
+                time.monotonic() - start,
+            )
+            raise
+        logger.info(
+            "foundation_stage done name=%s workspace=%s elapsed=%.2fs",
+            name,
+            self.workspace_dir,
+            time.monotonic() - start,
+        )
+        return result
 
     def _load_base_manifest_tables(self, base_manifest_path: str | None) -> dict[str, Any]:
         if not base_manifest_path:
@@ -1102,14 +1303,33 @@ class FoundationExtractor:
         stage_order = [stage.name for stage in stages]
         instances_by_stage: dict[str, list[dict[str, Any]]] = {}
         for stage in stages:
+            stage_start = time.monotonic()
+            logger.info(
+                "foundation_vectors instances_start stage=%s workspace=%s",
+                stage.name,
+                self.workspace_dir,
+            )
             instances_by_stage[stage.name] = self._parse_instances(
                 stage,
                 def_data.get(stage.name),
                 canonical_grid,
                 canonical_maps.get(stage.name, {}),
             )
+            logger.info(
+                "foundation_vectors instances_done stage=%s count=%d elapsed=%.2fs workspace=%s",
+                stage.name,
+                len(instances_by_stage[stage.name]),
+                time.monotonic() - stage_start,
+                self.workspace_dir,
+            )
         _attach_progressive_metadata(stages, instances_by_stage)
         for stage in stages:
+            stage_start = time.monotonic()
+            logger.info(
+                "foundation_vectors stage_start stage=%s workspace=%s",
+                stage.name,
+                self.workspace_dir,
+            )
             parsed_def = def_data.get(stage.name)
             instances = instances_by_stage.get(stage.name, [])
             pins = self._pin_records(
@@ -1195,6 +1415,21 @@ class FoundationExtractor:
             else:
                 counts["patches"][stage.name] = len(patches)
             self._mark("patches", stage.name, "available" if patches else "missing", "" if patches else "missing_canonical_grid")
+            logger.info(
+                "foundation_vectors stage_done stage=%s instances=%d pins=%d nets=%d "
+                "wires=%d routing_graphs=%d timing_paths=%d patches=%d "
+                "elapsed=%.2fs workspace=%s",
+                stage.name,
+                len(instances),
+                len(pins),
+                len(nets),
+                len(wires),
+                len(routing_graphs),
+                len(timing_paths),
+                len(patches),
+                time.monotonic() - stage_start,
+                self.workspace_dir,
+            )
         if export_legacy_debug:
             _attach_patch_progressive_metadata(stages, self.foundation_dir / "vectors" / "patches")
             _attach_net_progressive_metadata(stages, self.foundation_dir / "vectors" / "nets")

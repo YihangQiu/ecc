@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -10,6 +12,7 @@ from .writers import file_sha256, write_parquet
 SCHEMA_VERSION = "foundation-data-ecc-parquet-v1"
 CONTRACT_NAME = "foundation_data/ecc"
 STORAGE_FORMAT = "parquet+json_views"
+logger = logging.getLogger("ecos.api.foundation")
 
 
 @dataclass(frozen=True)
@@ -478,9 +481,18 @@ def write_tables(
             if name not in overrides:
                 raise ValueError(f"missing registry override for skipped table: {name}")
             registry[name] = _registry_entry_from_override(name, spec, overrides[name])
+            logger.info(
+                "foundation_table skipped name=%s path=%s row_count=%s",
+                name,
+                registry[name].get("path"),
+                registry[name].get("row_count"),
+            )
             continue
         table_path = foundation_dir / "tables" / f"{name}.parquet"
+        start = time.monotonic()
+        logger.info("foundation_table start name=%s path=%s", name, table_path)
         row_count = write_parquet(table_path, tables.get(name, ()), columns=spec.columns, schema=spec.arrow_schema())
+        elapsed = time.monotonic() - start
         registry[name] = {
             "path": f"tables/{name}.parquet",
             "format": "parquet",
@@ -490,6 +502,13 @@ def write_tables(
             "sha256": file_sha256(table_path),
             "size_bytes": table_path.stat().st_size,
         }
+        logger.info(
+            "foundation_table done name=%s row_count=%d size_bytes=%d elapsed=%.2fs",
+            name,
+            row_count,
+            registry[name]["size_bytes"],
+            elapsed,
+        )
     return registry
 
 

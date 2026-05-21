@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import logging
 from pathlib import Path
 from typing import Iterable
 
@@ -583,6 +584,22 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert top_nets
     assert top_patches[0]["provenance"]["query"]["provenance_id"]
     assert top_nets[0]["provenance"]["query"]["provenance_id"]
+
+
+def test_iccd_full_v1_extractor_emits_stage_and_table_progress_logs(tmp_path: Path, caplog):
+    ws = _make_workspace(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="ecos.api.foundation"):
+        FoundationExtractor(ws, profile="iccd_full_v1").extract()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("foundation_extract start" in message for message in messages)
+    assert any("foundation_stage start name=write_vectors" in message for message in messages)
+    assert any("foundation_vectors stage_done stage=route" in message for message in messages)
+    assert any(
+        "foundation_table done name=run_patch_route_labels" in message for message in messages
+    )
+    assert any("foundation_extract done" in message for message in messages)
 
 
 def test_parquet_contract_preserves_all_semantic_blocks_and_auditable_views(tmp_path: Path):
