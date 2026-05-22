@@ -82,6 +82,75 @@ def _write_sample_egr_demand_capacity(stage_dir: Path) -> None:
     _write_csv(early_router / "supply_map_MET3.csv", [[1, 2], [3, 4]])
 
 
+def _regular_test_patches(rows: int, cols: int, *, step: float = 10.0) -> list[dict]:
+    return [
+        {
+            "row": row,
+            "col": col,
+            "bbox": {
+                "llx": col * step,
+                "lly": row * step,
+                "urx": (col + 1) * step,
+                "ury": (row + 1) * step,
+            },
+        }
+        for row in range(rows)
+        for col in range(cols)
+    ]
+
+
+def test_patch_point_density_directly_indexes_regular_grid(monkeypatch: pytest.MonkeyPatch):
+    rows = 10
+    cols = 10
+    patches = _regular_test_patches(rows, cols)
+    calls = {"count": 0}
+    original = extractor_module._point_in_bbox
+
+    def counted_point_in_bbox(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(extractor_module, "_point_in_bbox", counted_point_in_bbox)
+
+    matrix = extractor_module._patch_point_density(
+        patches,
+        rows,
+        cols,
+        [{"x": 25.0, "y": 35.0}, {"x": 25.0, "y": 35.0}, {"x": 95.0, "y": 5.0}],
+    )
+
+    assert matrix[3][2] == 2.0
+    assert matrix[0][9] == 1.0
+    assert sum(sum(row) for row in matrix) == 3.0
+    assert calls["count"] <= 1
+
+
+def test_patch_shape_maps_visit_only_overlapping_regular_grid_cells(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rows = 10
+    cols = 10
+    patches = _regular_test_patches(rows, cols)
+    calls = {"count": 0}
+    original = extractor_module._bbox_overlap_area
+
+    def counted_bbox_overlap_area(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(extractor_module, "_bbox_overlap_area", counted_bbox_overlap_area)
+    shapes = [{"llx": 12.0, "lly": 12.0, "urx": 18.0, "ury": 18.0}]
+
+    density = extractor_module._patch_shape_density(patches, rows, cols, shapes)
+    presence = extractor_module._patch_shape_presence_count(patches, rows, cols, shapes)
+
+    assert density[1][1] == pytest.approx(0.36)
+    assert presence[1][1] == 1.0
+    assert sum(sum(row) for row in density) == pytest.approx(0.36)
+    assert sum(sum(row) for row in presence) == 1.0
+    assert calls["count"] <= 8
+
+
 def _make_workspace(
     tmp_path: Path,
     *,

@@ -91,7 +91,7 @@ class _PatchGridLookup:
     col_step: float | None
 
 
-_PATCH_GRID_LOOKUP_CACHE: dict[tuple[int, int], _PatchGridLookup | None] = {}
+_PATCH_GRID_LOOKUP_CACHE: dict[tuple[int, int, int, int], _PatchGridLookup | None] = {}
 
 
 def _normalize_route_completion_mode(value: object) -> str:
@@ -5196,12 +5196,12 @@ def _patch_grid_lookup(canonical_grid: dict[str, Any] | None) -> _PatchGridLooku
     patches = canonical_grid.get("patches")
     if not isinstance(patches, list) or not patches:
         return None
-    cache_key = (id(canonical_grid), len(patches))
+    rows = int(canonical_grid.get("rows") or 0)
+    cols = int(canonical_grid.get("cols") or 0)
+    cache_key = (id(patches), len(patches), rows, cols)
     if cache_key in _PATCH_GRID_LOOKUP_CACHE:
         return _PATCH_GRID_LOOKUP_CACHE[cache_key]
 
-    rows = int(canonical_grid.get("rows") or 0)
-    cols = int(canonical_grid.get("cols") or 0)
     if rows <= 0 or cols <= 0:
         _PATCH_GRID_LOOKUP_CACHE[cache_key] = None
         return None
@@ -5230,7 +5230,8 @@ def _patch_grid_lookup(canonical_grid: dict[str, Any] | None) -> _PatchGridLooku
         row_bounds_by_row.setdefault(row, row_bounds)
         col_bounds_by_col.setdefault(col, col_bounds)
         patches_by_coord[(row, col)] = patch
-        patches_by_id[int(patch["patch_id"])] = patch
+        if patch.get("patch_id") is not None:
+            patches_by_id[int(patch["patch_id"])] = patch
 
     if len(row_bounds_by_row) != rows or len(col_bounds_by_col) != cols:
         rectangular = False
@@ -5252,11 +5253,27 @@ def _patch_grid_lookup(canonical_grid: dict[str, Any] | None) -> _PatchGridLooku
     return lookup
 
 
+def _patch_grid_lookup_from_patches(
+    patches: list[dict[str, Any]],
+    rows: int,
+    cols: int,
+) -> _PatchGridLookup | None:
+    return _patch_grid_lookup({"patches": patches, "rows": rows, "cols": cols})
+
+
 def _grid_patch_for_point(lookup: _PatchGridLookup | None, point: dict[str, Any]) -> dict[str, Any] | None:
     if lookup is None or not lookup.rectangular or point.get("x") is None or point.get("y") is None:
         return None
-    col = _uniform_bound_index_for_point(lookup, "col", float(point["x"])) if lookup.uniform else None
-    row = _uniform_bound_index_for_point(lookup, "row", float(point["y"])) if lookup.uniform else None
+    col = (
+        _uniform_bound_index_for_point(lookup, "col", float(point["x"]))
+        if lookup.uniform
+        else None
+    )
+    row = (
+        _uniform_bound_index_for_point(lookup, "row", float(point["y"]))
+        if lookup.uniform
+        else None
+    )
     if col is None:
         col = _bound_index_for_point(lookup.col_bounds, float(point["x"]))
     if row is None:
@@ -5610,10 +5627,58 @@ def _patch_point_density(
     points: list[dict[str, Any]],
 ) -> MapMatrix:
     matrix = _empty_matrix(rows, cols)
+    lookup = _patch_grid_lookup_from_patches(patches, rows, cols)
+    if lookup is not None and lookup.rectangular:
+        for point in points:
+            patch = _grid_patch_for_point(lookup, point)
+            if patch is None:
+                continue
+            row, col = int(patch["row"]), int(patch["col"])
+            matrix[row][col] += 1.0
+        return matrix
     for patch in patches:
         row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
-        matrix[row][col] = float(sum(1 for point in points if _point_in_bbox(point.get("x"), point.get("y"), bbox)))
+        matrix[row][col] = float(
+            sum(1 for point in points if _point_in_bbox(point.get("x"), point.get("y"), bbox))
+        )
     return matrix
+
+
+def _overlapping_patch_candidates(
+    lookup: _PatchGridLookup | None,
+    patches: list[dict[str, Any]],
+    shape: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if lookup is None or not lookup.rectangular:
+        return patches
+    col_indexes = (
+        _uniform_bound_indexes_for_range(lookup, "col", float(shape["llx"]), float(shape["urx"]))
+        if lookup.uniform
+        else []
+    )
+    row_indexes = (
+        _uniform_bound_indexes_for_range(lookup, "row", float(shape["lly"]), float(shape["ury"]))
+        if lookup.uniform
+        else []
+    )
+    if not col_indexes:
+        col_indexes = _bound_indexes_for_range(
+            lookup.col_bounds,
+            float(shape["llx"]),
+            float(shape["urx"]),
+        )
+    if not row_indexes:
+        row_indexes = _bound_indexes_for_range(
+            lookup.row_bounds,
+            float(shape["lly"]),
+            float(shape["ury"]),
+        )
+    return [
+        patch
+        for row in row_indexes
+        for col in col_indexes
+        if (patch := lookup.patches_by_coord.get((row, col))) is not None
+    ]
 
 
 def _patch_shape_density(
@@ -5623,6 +5688,16 @@ def _patch_shape_density(
     shapes: list[dict[str, Any]],
 ) -> MapMatrix:
     matrix = _empty_matrix(rows, cols)
+    lookup = _patch_grid_lookup_from_patches(patches, rows, cols)
+    if lookup is not None and lookup.rectangular:
+        for shape in shapes:
+            for patch in _overlapping_patch_candidates(lookup, patches, shape):
+                row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+                patch_area = _bbox_area(bbox)
+                if patch_area <= 0:
+                    continue
+                matrix[row][col] += _bbox_overlap_area(shape, bbox) / patch_area
+        return matrix
     for patch in patches:
         row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
         patch_area = _bbox_area(bbox)
@@ -5639,6 +5714,14 @@ def _patch_shape_presence_count(
     shapes: list[dict[str, Any]],
 ) -> MapMatrix:
     matrix = _empty_matrix(rows, cols)
+    lookup = _patch_grid_lookup_from_patches(patches, rows, cols)
+    if lookup is not None and lookup.rectangular:
+        for shape in shapes:
+            for patch in _overlapping_patch_candidates(lookup, patches, shape):
+                row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
+                if _bbox_overlap_area(shape, bbox) > 0:
+                    matrix[row][col] += 1.0
+        return matrix
     for patch in patches:
         row, col, bbox = int(patch["row"]), int(patch["col"]), patch["bbox"]
         matrix[row][col] = float(sum(1 for shape in shapes if _bbox_overlap_area(shape, bbox) > 0))
