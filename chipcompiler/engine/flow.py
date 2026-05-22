@@ -268,6 +268,22 @@ class EngineFlow:
         """
         import os
         success = False
+
+        route_completion_mode = str(
+            self.workspace.parameters.data.get("route_completion_mode", "full_route")
+            or "full_route"
+        )
+        if (
+            workspace_step.name == StepEnum.ROUTING.value
+            and route_completion_mode == "space_router_label"
+        ):
+            label_path = os.path.join(
+                workspace_step.data.get(StepEnum.ROUTING.value, ""),
+                "space_router",
+                "route_native_demand_capacity_final.jsonl",
+            )
+            return os.path.exists(label_path) and os.path.getsize(label_path) > 0
+
         match workspace_step.name:
             case StepEnum.SYNTHESIS.value:
                 if os.path.exists(workspace_step.output.get("verilog", "")):
@@ -485,8 +501,16 @@ class EngineFlow:
         self.workspace.logger.info("[RESULT] %s state=%s runtime=%s mem=%sMB exitcode=%s timed_out=%s stale_timed_out=%s",
                     step_tag, state.value, runtime, peak_memory_mb, p.exitcode, timed_out, stale_timed_out)
 
-        # save layout snapshot on success
-        if state == StateEnum.Success:
+        # save layout snapshot on success when the step produced a full layout.
+        route_completion_mode = str(
+            self.workspace.parameters.data.get("route_completion_mode", "full_route")
+            or "full_route"
+        )
+        space_router_only = (
+            workspace_step.name == StepEnum.ROUTING.value
+            and route_completion_mode == "space_router_label"
+        )
+        if state == StateEnum.Success and not space_router_only:
             from chipcompiler.tools import save_layout_image
             save_layout_image(workspace=self.workspace, step=workspace_step)
 

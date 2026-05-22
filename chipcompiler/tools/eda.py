@@ -95,6 +95,11 @@ def run_step(workspace: Workspace,
     if eda_module is None:
         return False
     
+    # Recreate generated step directories before rebuilding configs.
+    # Rerun cleanup may remove data/log/output subdirectories while keeping
+    # the WorkspaceStep object alive in memory.
+    eda_module.build_step_space(step)
+
     # update config 
     eda_module.build_step_config(workspace, step)
     

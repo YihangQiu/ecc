@@ -518,6 +518,7 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
 
     assert manifest["contract_name"] == "foundation_data/ecc"
     assert manifest["storage_format"] == "parquet+json_views"
+    assert manifest["route_completion_mode"] == "full_route"
     assert manifest["schema"] == "foundation_data/ecc/schema.json"
     assert manifest["design_id"].startswith("design_")
     assert manifest["run_id"].startswith("run_")
@@ -573,6 +574,7 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert task["input_table"] == "run_stage_patch_features"
     assert task["label_table"] == "run_patch_route_labels"
     assert task["leakage_policy"]["route_truth_as_preroute_input"] == "forbidden"
+    assert task["route_completion_mode"] == "full_route"
 
     assert not (foundation_dir / "vectors").exists()
     assert not (foundation_dir / "maps").exists()
@@ -584,6 +586,32 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert top_nets
     assert top_patches[0]["provenance"]["query"]["provenance_id"]
     assert top_nets[0]["provenance"]["query"]["provenance_id"]
+
+
+def test_iccd_full_v1_extractor_records_space_router_label_completion_mode(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(
+        route_completion_mode="space_router_label"
+    )
+
+    foundation_dir = result.foundation_dir
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    task_views = json.loads((foundation_dir / "views" / "ml" / "task_views.json").read_text(encoding="utf-8"))
+    progressive = json.loads((foundation_dir / "views" / "ml" / "progressive_patch_dataset.json").read_text(encoding="utf-8"))
+
+    assert manifest["route_completion_mode"] == "space_router_label"
+    assert manifest["options"]["route_completion_mode"] == "space_router_label"
+    assert task_views["tasks"]["progressive_patch_route_demand_capacity"]["route_completion_mode"] == "space_router_label"
+    assert progressive["route_completion_mode"] == "space_router_label"
+    assert progressive["label_source"]["completion_mode"] == "space_router_label"
+    assert progressive["leakage_policy"]["route_truth_as_preroute_input"] == "forbidden"
+
+
+def test_iccd_full_v1_extractor_rejects_unknown_route_completion_mode(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="route_completion_mode"):
+        FoundationExtractor(ws, profile="iccd_full_v1").extract(route_completion_mode="early_router")
 
 
 def test_iccd_full_v1_extractor_emits_stage_and_table_progress_logs(tmp_path: Path, caplog):

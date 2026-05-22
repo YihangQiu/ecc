@@ -337,9 +337,17 @@ def build_step_config(workspace: Workspace,
         config = json_read(step.config[f"{StepEnum.ROUTING.value}"])
         
         # parameters
-        config["RT"]["-temp_directory_path"] = step.data.get(f"{StepEnum.ROUTING.value}", "")
-        config["RT"]["-bottom_routing_layer"] = workspace.parameters.data.get("Bottom layer", "")
-        config["RT"]["-top_routing_layer"] = workspace.parameters.data.get("Top layer", "")
+        rt_config = config.setdefault("RT", {})
+        rt_config["-temp_directory_path"] = step.data.get(f"{StepEnum.ROUTING.value}", "")
+        rt_config["-bottom_routing_layer"] = workspace.parameters.data.get("Bottom layer", "")
+        rt_config["-top_routing_layer"] = workspace.parameters.data.get("Top layer", "")
+        route_completion_mode = str(
+            workspace.parameters.data.get("route_completion_mode", "full_route") or "full_route"
+        )
+        if step.name == StepEnum.ROUTING.value and route_completion_mode == "space_router_label":
+            rt_config["-stop_after_stage"] = "space_router"
+        else:
+            rt_config.pop("-stop_after_stage", None)
         
         # write back
         json_write(step.config[f"{StepEnum.ROUTING.value}"], config)

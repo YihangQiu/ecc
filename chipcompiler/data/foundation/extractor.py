@@ -35,6 +35,7 @@ from .writers import write_json, write_jsonl
 
 FOUNDATION_REL = Path("foundation_data") / "ecc"
 _SUPPORTED_PROFILE = "iccd_full_v1"
+_ROUTE_COMPLETION_MODES = {"full_route", "space_router_label"}
 _STAGE_DIR_OVERRIDES = {
     ("place", "dreamplace"): "place_dreamplace",
     ("legalization", "dreamplace"): "legalization_dreamplace",
@@ -93,6 +94,14 @@ class _PatchGridLookup:
 _PATCH_GRID_LOOKUP_CACHE: dict[tuple[int, int], _PatchGridLookup | None] = {}
 
 
+def _normalize_route_completion_mode(value: object) -> str:
+    mode = str(value or "full_route").strip() or "full_route"
+    if mode not in _ROUTE_COMPLETION_MODES:
+        allowed = ", ".join(sorted(_ROUTE_COMPLETION_MODES))
+        raise ValueError(f"route_completion_mode must be one of: {allowed}")
+    return mode
+
+
 class FoundationExtractor:
     """Post-run foundation-data extractor for ECOS/ECC workspaces.
 
@@ -126,6 +135,7 @@ class FoundationExtractor:
         export_legacy_debug: bool = False,
         scope: str = "full",
         base_manifest_path: str | None = None,
+        route_completion_mode: str = "full_route",
     ) -> ExtractionResult:
         extract_start = time.monotonic()
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
@@ -134,6 +144,7 @@ class FoundationExtractor:
             raise ValueError("scope must be one of: full, design_base, variant_delta")
         if scope == "variant_delta" and not base_manifest_path:
             raise ValueError("scope=variant_delta requires base_manifest_path")
+        route_completion_mode = _normalize_route_completion_mode(route_completion_mode)
         self._source_signature_cache = None
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
@@ -166,6 +177,7 @@ class FoundationExtractor:
             "stages": [stage.name for stage in selected_stages],
             "include_raw_refs": bool(include_raw_refs),
             "export_legacy_debug": bool(export_legacy_debug),
+            "route_completion_mode": route_completion_mode,
         }
         if scope != "full":
             options["scope"] = scope
@@ -399,6 +411,7 @@ class FoundationExtractor:
                 stage_index,
                 public_labels,
                 include_raw_refs=bool(include_raw_refs),
+                route_completion_mode=route_completion_mode,
             ),
         )
         if not export_legacy_debug:
@@ -3568,6 +3581,7 @@ class FoundationExtractor:
             "schema_version": SCHEMA_VERSION,
             "contract_name": CONTRACT_NAME,
             "storage_format": STORAGE_FORMAT,
+            "route_completion_mode": options.get("route_completion_mode", "full_route"),
             **(
                 {
                     "storage_layout": "base_delta_v1",
@@ -3753,7 +3767,16 @@ class FoundationExtractor:
             self._source_signature_cache = self._compute_source_signature()
         return list(self._source_signature_cache)
 
-    def _write_views(self, summary: dict, metrics: dict, stage_index: dict, labels: dict, *, include_raw_refs: bool) -> None:
+    def _write_views(
+        self,
+        summary: dict,
+        metrics: dict,
+        stage_index: dict,
+        labels: dict,
+        *,
+        include_raw_refs: bool,
+        route_completion_mode: str,
+    ) -> None:
         write_json(
             self.foundation_dir / "views" / "ml" / "dataset_index.json",
             {
@@ -3776,6 +3799,7 @@ class FoundationExtractor:
                         "P2": ["Floorplan", "place"],
                         "P3": ["Floorplan", "place", "CTS"],
                     },
+                    "route_completion_mode": route_completion_mode,
                     "leakage_policy": {
                         "route_truth_as_preroute_input": "forbidden",
                         "route_only_fields": ["run_patch_route_labels", "run_patch_route_label_layers"],
@@ -3795,7 +3819,13 @@ class FoundationExtractor:
                 "join_keys": progressive_policy["join_keys"],
                 "stage_policy": progressive_policy["stage_policy"],
                 "allowed_input_stages": progressive_policy["stage_policy"],
-                "label_source": {"table": "run_patch_route_labels", "stage": "route", "artifact_table": "artifacts"},
+                "label_source": {
+                    "table": "run_patch_route_labels",
+                    "stage": "route",
+                    "artifact_table": "artifacts",
+                    "completion_mode": route_completion_mode,
+                },
+                "route_completion_mode": route_completion_mode,
                 "forbidden_input_tables": ["run_patch_route_labels", "run_patch_route_label_layers"],
                 "forbidden_input_columns": ["route_oracle", "label_refs", "label_source_artifact_id", "source_artifact_id"],
                 "leakage_policy": progressive_policy["leakage_policy"],

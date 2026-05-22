@@ -420,6 +420,12 @@ def run_routing(workspace: Workspace,
         eda_inst.run_routing(config=step.config[f"{StepEnum.ROUTING.value}"])
         
         sub_flow.update_step(step_name=EccSubFlowEnum.run_routing.value, state=StateEnum.Success)
+
+        route_completion_mode = str(
+            workspace.parameters.data.get("route_completion_mode", "full_route") or "full_route"
+        )
+        if route_completion_mode == "space_router_label":
+            return True
         
         reslut = save_data(workspace=workspace, step=step, ecc_module=eda_inst)
 
