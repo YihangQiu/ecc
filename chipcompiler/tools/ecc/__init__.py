@@ -1,49 +1,36 @@
-from .builder import (
-    build_step, 
-    build_step_space,
-    build_step_config
-)
+"""Lazy public exports for ECC tool integration."""
 
-from .runner import (
-    create_db_engine,
-    run_step
-)
+from __future__ import annotations
 
-from .module import ECCToolsModule
+_EXPORTS = {
+    "builder": ("chipcompiler.tools.ecc.builder", None),
+    "runner": ("chipcompiler.tools.ecc.runner", None),
+    "build_step": ("chipcompiler.tools.ecc.builder", "build_step"),
+    "build_step_space": ("chipcompiler.tools.ecc.builder", "build_step_space"),
+    "build_step_config": ("chipcompiler.tools.ecc.builder", "build_step_config"),
+    "create_db_engine": ("chipcompiler.tools.ecc.runner", "create_db_engine"),
+    "run_step": ("chipcompiler.tools.ecc.runner", "run_step"),
+    "ECCToolsModule": ("chipcompiler.tools.ecc.module", "ECCToolsModule"),
+    "ECCToolsPlot": ("chipcompiler.tools.ecc.plot", "ECCToolsPlot"),
+    "build_step_metrics": ("chipcompiler.tools.ecc.metrics", "build_step_metrics"),
+    "get_step_info": ("chipcompiler.tools.ecc.service", "get_step_info"),
+    "EccSubFlow": ("chipcompiler.tools.ecc.subflow", "EccSubFlow"),
+    "EccSubFlowEnum": ("chipcompiler.tools.ecc.subflow", "EccSubFlowEnum"),
+    "EccChecklist": ("chipcompiler.tools.ecc.checklist", "EccChecklist"),
+    "is_eda_exist": ("chipcompiler.tools.ecc.utility", "is_eda_exist"),
+}
 
-from .plot import ECCToolsPlot
+__all__ = [name for name in _EXPORTS if name not in {"builder", "runner"}]
 
-from .metrics import (
-    build_step_metrics
-)
 
-from .service import(
-    get_step_info
-)
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-from .subflow import (
-    EccSubFlow,
-    EccSubFlowEnum
-)
+    module_name, attr_name = _EXPORTS[name]
+    from importlib import import_module
 
-from .checklist import EccChecklist
-
-from .utility import ( 
-    is_eda_exist
-)
-
-__all__ = [
-    'is_eda_exist',
-    'build_default_flow',
-    'build_step',
-    'build_step_space',
-    'build_step_config',
-    'run_step',
-    'create_db_engine',
-    'ECCToolsModule',
-    'ECCToolsPlot',
-    'build_step_metrics',
-    'get_step_info',
-    'EccSubFlow',
-    'EccSubFlowEnum'
-]
+    module = import_module(module_name)
+    value = module if attr_name is None else getattr(module, attr_name)
+    globals()[name] = value
+    return value
