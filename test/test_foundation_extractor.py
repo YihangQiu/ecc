@@ -657,6 +657,45 @@ def test_iccd_full_v1_extractor_writes_parquet_contract_and_no_legacy_defaults(t
     assert top_nets[0]["provenance"]["query"]["provenance_id"]
 
 
+
+def test_iccd_fast_profile_skips_audit_and_route_detail_tables(tmp_path: Path):
+    import pyarrow.parquet as pq
+
+    ws = _make_workspace(tmp_path)
+    result = FoundationExtractor(ws, profile="iccd_full_v1").extract(
+        route_completion_mode="space_router_label",
+        materialize_audit_tables=False,
+        route_detail_level="labels_only",
+    )
+
+    foundation_dir = result.foundation_dir
+    manifest = json.loads((foundation_dir / "manifest.json").read_text(encoding="utf-8"))
+    progressive = json.loads((foundation_dir / "views" / "ml" / "progressive_patch_dataset.json").read_text(encoding="utf-8"))
+
+    assert manifest["options"]["materialize_audit_tables"] is False
+    assert manifest["options"]["route_detail_level"] == "labels_only"
+    assert progressive["route_detail_level"] == "labels_only"
+    assert manifest["tables"]["run_patch_route_labels"]["row_count"] > 0
+    assert manifest["tables"]["run_patch_route_label_layers"]["row_count"] > 0
+    for table_name in (
+        "provenance",
+        "semantic_blocks",
+        "patch_entity_refs",
+        "wire_segments",
+        "wire_patch_intersections",
+        "routing_vertices",
+        "routing_edges",
+    ):
+        table = pq.read_table(foundation_dir / manifest["tables"][table_name]["path"])
+        assert table.num_rows == 0, table_name
+
+
+def test_iccd_full_v1_extractor_rejects_unknown_route_detail_level(tmp_path: Path):
+    ws = _make_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="route_detail_level"):
+        FoundationExtractor(ws, profile="iccd_full_v1").extract(route_detail_level="wire_heavy")
+
 def test_iccd_full_v1_extractor_records_space_router_label_completion_mode(tmp_path: Path):
     ws = _make_workspace(tmp_path)
     result = FoundationExtractor(ws, profile="iccd_full_v1").extract(

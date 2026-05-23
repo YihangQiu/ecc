@@ -102,6 +102,13 @@ def _normalize_route_completion_mode(value: object) -> str:
     return mode
 
 
+def _normalize_route_detail_level(value: object) -> str:
+    level = str(value or "full").strip() or "full"
+    if level not in {"full", "labels_only"}:
+        raise ValueError("route_detail_level must be one of: full, labels_only")
+    return level
+
+
 class FoundationExtractor:
     """Post-run foundation-data extractor for ECOS/ECC workspaces.
 
@@ -136,6 +143,8 @@ class FoundationExtractor:
         scope: str = "full",
         base_manifest_path: str | None = None,
         route_completion_mode: str = "full_route",
+        materialize_audit_tables: bool = True,
+        route_detail_level: str = "full",
     ) -> ExtractionResult:
         extract_start = time.monotonic()
         del force  # The current post-run extractor is deterministic and always rewrites outputs.
@@ -145,6 +154,8 @@ class FoundationExtractor:
         if scope == "variant_delta" and not base_manifest_path:
             raise ValueError("scope=variant_delta requires base_manifest_path")
         route_completion_mode = _normalize_route_completion_mode(route_completion_mode)
+        materialize_audit_tables = bool(materialize_audit_tables)
+        route_detail_level = _normalize_route_detail_level(route_detail_level)
         self._source_signature_cache = None
         if self.foundation_dir.exists():
             shutil.rmtree(self.foundation_dir)
@@ -178,6 +189,8 @@ class FoundationExtractor:
             "include_raw_refs": bool(include_raw_refs),
             "export_legacy_debug": bool(export_legacy_debug),
             "route_completion_mode": route_completion_mode,
+            "materialize_audit_tables": materialize_audit_tables,
+            "route_detail_level": route_detail_level,
         }
         if scope != "full":
             options["scope"] = scope
@@ -311,6 +324,8 @@ class FoundationExtractor:
                 labels=labels,
                 metrics=metrics,
                 skip_tables=_BASE_DELTA_STATIC_TABLES if scope == "variant_delta" else frozenset(),
+                materialize_audit_tables=materialize_audit_tables,
+                route_detail_level=route_detail_level,
             ),
         )
         base_tables = (
@@ -412,6 +427,7 @@ class FoundationExtractor:
                 public_labels,
                 include_raw_refs=bool(include_raw_refs),
                 route_completion_mode=route_completion_mode,
+                route_detail_level=route_detail_level,
             ),
         )
         if not export_legacy_debug:
@@ -2297,6 +2313,8 @@ class FoundationExtractor:
         labels: dict[str, Any],
         metrics: dict[str, Any],
         skip_tables: frozenset[str] | set[str] | None = None,
+        materialize_audit_tables: bool = True,
+        route_detail_level: str = "full",
     ) -> dict[str, list[dict[str, Any]] | Iterable[dict[str, Any]]]:
         skip = frozenset(skip_tables or ())
         design_name = str(parameters.get("Design") or parameters.get("design") or "unknown")
@@ -2353,22 +2371,28 @@ class FoundationExtractor:
             ],
             "artifacts": self._artifact_table_rows(design_id, run_id, stage_ids, labels, metrics),
             "provenance": [],
-            "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages),
+            "semantic_blocks": self._semantic_block_rows(design_id, run_id, stages) if materialize_audit_tables else [],
             "run_stage_patch_maps": self._patch_map_rows(design_id, run_id, stage_ids, canonical_grid, canonical_maps),
-            "run_stage_patch_features": self._patch_feature_rows(design_id, run_id, stage_ids, stages),
+            "run_stage_patch_features": self._patch_feature_rows(
+                design_id,
+                run_id,
+                stage_ids,
+                stages,
+                route_detail_level=route_detail_level,
+            ),
             "run_patch_route_labels": self._route_label_rows(design_id, run_id, labels),
             "run_patch_route_label_layers": self._route_label_layer_rows(design_id, run_id, labels),
-            "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages),
+            "patch_entity_refs": self._patch_entity_ref_rows(design_id, run_id, stages) if materialize_audit_tables else [],
             "instances": self._instance_rows(design_id, stages),
             "instance_stage_state": self._instance_stage_state_rows(design_id, run_id, stages),
             "pins": self._pin_rows(design_id, stages),
             "pin_stage_state": self._pin_stage_state_rows(design_id, run_id, stages),
             "nets": self._net_rows(design_id, stages),
             "net_terminals": self._net_terminal_rows(design_id, run_id, stages),
-            "wire_segments": self._wire_segment_rows(design_id, run_id, stages),
-            "wire_patch_intersections": self._wire_patch_intersection_rows(design_id, run_id, stages),
-            "routing_vertices": self._routing_vertex_rows(design_id, run_id, stages),
-            "routing_edges": self._routing_edge_rows(design_id, run_id, stages),
+            "wire_segments": [] if route_detail_level == "labels_only" else self._wire_segment_rows(design_id, run_id, stages),
+            "wire_patch_intersections": [] if route_detail_level == "labels_only" else self._wire_patch_intersection_rows(design_id, run_id, stages),
+            "routing_vertices": [] if route_detail_level == "labels_only" else self._routing_vertex_rows(design_id, run_id, stages),
+            "routing_edges": [] if route_detail_level == "labels_only" else self._routing_edge_rows(design_id, run_id, stages),
             "timing_paths": self._timing_path_rows(design_id, run_id, stages),
             "timing_path_points": self._timing_path_point_rows(design_id, run_id, stages),
             "timing_edges": self._timing_edge_rows(design_id, run_id, stages),
@@ -2389,14 +2413,15 @@ class FoundationExtractor:
         for table_name in ("run_stage_patch_maps", "run_stage_patch_features", "stage_deltas", "semantic_blocks"):
             if not isinstance(tables[table_name], list):
                 tables[table_name] = list(tables[table_name])
-        tables["provenance"] = self._provenance_rows(
-            {
-                "run_stage_patch_maps": tables["run_stage_patch_maps"],
-                "run_stage_patch_features": tables["run_stage_patch_features"],
-                "stage_deltas": tables["stage_deltas"],
-                "semantic_blocks": tables["semantic_blocks"],
-            }
-        )
+        if materialize_audit_tables:
+            tables["provenance"] = self._provenance_rows(
+                {
+                    "run_stage_patch_maps": tables["run_stage_patch_maps"],
+                    "run_stage_patch_features": tables["run_stage_patch_features"],
+                    "stage_deltas": tables["stage_deltas"],
+                    "semantic_blocks": tables["semantic_blocks"],
+                }
+            )
         tables["_manifest_design_row"] = design_rows
         return tables
 
@@ -2830,7 +2855,13 @@ class FoundationExtractor:
                         }
 
     def _patch_feature_rows(
-        self, design_id: str, run_id: str, stage_ids: dict[str, str], stages: list[StageInfo]
+        self,
+        design_id: str,
+        run_id: str,
+        stage_ids: dict[str, str],
+        stages: list[StageInfo],
+        *,
+        route_detail_level: str = "full",
     ) -> Iterable[dict[str, Any]]:
         for stage in stages:
             for record in self._records_for_stage("patches", stage.name):
@@ -2840,6 +2871,8 @@ class FoundationExtractor:
                 timing = record.get("timing_context") or {}
                 drc = record.get("drc_context") or {}
                 oracle = record.get("route_oracle") or {}
+                if route_detail_level == "labels_only":
+                    oracle = {}
                 yield {
                     "design_id": design_id,
                     "run_id": run_id,
@@ -3776,6 +3809,7 @@ class FoundationExtractor:
         *,
         include_raw_refs: bool,
         route_completion_mode: str,
+        route_detail_level: str,
     ) -> None:
         write_json(
             self.foundation_dir / "views" / "ml" / "dataset_index.json",
@@ -3826,6 +3860,7 @@ class FoundationExtractor:
                     "completion_mode": route_completion_mode,
                 },
                 "route_completion_mode": route_completion_mode,
+                "route_detail_level": route_detail_level,
                 "forbidden_input_tables": ["run_patch_route_labels", "run_patch_route_label_layers"],
                 "forbidden_input_columns": ["route_oracle", "label_refs", "label_source_artifact_id", "source_artifact_id"],
                 "leakage_policy": progressive_policy["leakage_policy"],
